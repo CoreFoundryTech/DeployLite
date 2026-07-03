@@ -4,11 +4,16 @@
   "private": true,
   "type": "module",
   "scripts": {
+    "dev": "next dev",
     "build": "tsc -p tsconfig.json",
     "typecheck": "tsc -p tsconfig.json --noEmit",
-    "lint": "tsc -p tsconfig.json --noEmit"
+    "lint": "tsc -p tsconfig.json --noEmit",
+    "test": "vitest run --config vitest.config.ts"
   },
   "dependencies": {
-    "@deploylite/contracts": "workspace:*"
+    "@deploylite/contracts": "workspace:*",
+    "next": "^15.1.8",
+    "react": "^19.0.0",
+    "react-dom": "^19.0.0"
   }
 }
