@@ -1,1 +1,1 @@
-export const apiBoundary = "api-control-plane-placeholder";
+export { API_PREFIX, AUTH_HEADER, buildApiApp } from "./app.js";
