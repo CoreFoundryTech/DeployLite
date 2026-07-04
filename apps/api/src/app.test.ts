@@ -113,6 +113,19 @@ describe("DeployLite API scaffold", () => {
     expect(body.data.status).toBe("ok");
   });
 
+  it("allows local web dev credentialed browser requests", async () => {
+    const app = await buildApiApp({ corsOrigin: "http://localhost:3000" });
+    const response = await app.inject({
+      method: "OPTIONS",
+      url: "/api/v1/auth/login",
+      headers: { origin: "http://localhost:3000", "access-control-request-method": "POST" }
+    });
+
+    expect(response.statusCode).toBe(204);
+    expect(response.headers["access-control-allow-origin"]).toBe("http://localhost:3000");
+    expect(response.headers["access-control-allow-credentials"]).toBe("true");
+  });
+
   it("selects DB auth repositories when DATABASE_URL is configured", async () => {
     const repositories = await createRuntimeRepositories(
       { NODE_ENV: "test", DEPLOYLITE_API_URL: "http://localhost:3001", DATABASE_URL: "postgres://user:pass@localhost:5432/deploylite", DEPLOYLITE_SESSION_TTL_SECONDS: 3600, DEPLOYLITE_SESSION_COOKIE_NAME: "dl_test_session", DEPLOYLITE_BCRYPT_COST: 10 },
