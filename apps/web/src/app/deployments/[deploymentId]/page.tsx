@@ -1,5 +1,5 @@
 import Link from "next/link";
-import { createMockPlatformSnapshot } from "../../../lib/scaffold-shell.js";
+import { createMockPlatformSnapshot } from "../../../lib/scaffold-shell";
 
 export default async function DeploymentLogsPage({ params }: { params: Promise<{ deploymentId: string }> }) {
   const { deploymentId } = await params;
