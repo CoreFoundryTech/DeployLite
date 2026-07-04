@@ -1,5 +1,5 @@
 import Link from "next/link";
-import { createMockPlatformSnapshot, formatBytes, resolveDashboardShell } from "../../lib/scaffold-shell.js";
+import { createMockPlatformSnapshot, formatBytes, resolveDashboardShell } from "../../lib/scaffold-shell";
 
 export default function DashboardPage() {
   const snapshot = createMockPlatformSnapshot();
