@@ -33,24 +33,28 @@ The current auth foundation is intentionally narrow: API sessions are opaque Htt
 | PR5 | `feat/auth-postgres-pr5-db-integration-verify` | Corrective runtime PostgreSQL verification for migrations, RBAC constraints, env metadata constraints, and auth/session restart persistence. |
 | PR6 | `feat/auth-postgres-pr6-db-metadata-verify` | Corrective runtime PostgreSQL verification for durable server/agent/project/deployment/log/domain/certificate/env metadata restart persistence. |
 
-### Local DB/auth quick path
+### Local onboarding smoke runbook
 
-1. Start local PostgreSQL only:
+This runbook starts from an empty local PostgreSQL database and ends at the authenticated empty dashboard. It is local-only: it does not deploy, contact VPS/Dokploy, access a server Docker socket, or configure Traefik, ACME, DNS, or domains.
+
+1. Start local PostgreSQL:
 
    ```bash
    docker compose -f infra/local/postgres.yml up -d
    ```
 
-2. Export local auth/database settings:
+2. Export local API, auth, and database settings. Run these exports in every terminal that starts a local command, or source them from your shell profile or a temporary env file:
 
    ```bash
    export DATABASE_URL=postgres://deploylite:deploylite@localhost:55433/deploylite
    export DEPLOYLITE_SESSION_TTL_SECONDS=3600
    export DEPLOYLITE_SESSION_COOKIE_NAME=deploylite_session
    export DEPLOYLITE_SESSION_COOKIE_SECURE=false
-   export DEPLOYLITE_BCRYPT_COST=4
+   export DEPLOYLITE_BCRYPT_COST=10
    export DEPLOYLITE_WEB_API_BASE_URL=http://localhost:3001
    ```
+
+   `DEPLOYLITE_BCRYPT_COST` must be between `10` and `14`; lower values fail configuration parsing. Do not use default credentials for durable local onboarding. The first admin is created from the UI with your own email and password while the user table is empty.
 
 3. Apply and verify the schema:
 
@@ -67,21 +71,39 @@ The current auth foundation is intentionally narrow: API sessions are opaque Htt
 
    This command requires PostgreSQL from `infra/local/postgres.yml` or a compatible `DATABASE_URL`. It is intentionally not part of `pnpm check`, so deterministic workspace checks do not require Docker.
 
-4. Build and run the local web shell:
+4. Start the local API and web app in separate terminals:
 
    ```bash
-   pnpm --filter @deploylite/api build
+   pnpm --filter @deploylite/api dev
+   ```
+
+   ```bash
    pnpm --filter @deploylite/web dev
    ```
 
-The seeded in-memory API admin for local scaffold checks is `admin@example.test` with password `deploylite-admin-password`. Durable first-admin bootstrap remains bounded to the repository/auth foundation and must not be treated as production onboarding.
+   The API listens on `127.0.0.1:3001` by default. Override with `DEPLOYLITE_API_HOST` and `DEPLOYLITE_API_PORT` only for local development.
 
-To reset the local database, stop PostgreSQL with volumes removed and repeat the migration step:
+5. Complete the browser smoke at `http://localhost:3000`:
+
+   - The setup screen should ask you to create the first local admin.
+   - Create a custom admin email/password. The password must be at least 12 characters.
+   - Sign in with that custom admin account.
+   - Confirm the dashboard loads and shows empty local metadata states when no projects, agents, deployments, or logs exist.
+   - Sign out, reload protected content, and confirm you return to the login/setup boundary.
+
+6. Verify restart persistence without resetting PostgreSQL:
+
+   - Stop and restart the API and web processes.
+   - Open `http://localhost:3000` again.
+   - Sign in with the same custom admin credentials.
+   - Confirm no seeded/default account is required and the dashboard still loads.
+
+Optional browser automation is intentionally deferred from the default workflow. If an opt-in smoke command is added later, it must stay outside `pnpm check` and CI unless separately approved.
+
+To tear down the local PostgreSQL database and remove local data after verification:
 
 ```bash
 docker compose -f infra/local/postgres.yml down -v
-docker compose -f infra/local/postgres.yml up -d
-pnpm --filter @deploylite/db db:migrate
 ```
 
 ## Review checklist

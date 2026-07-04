@@ -104,6 +104,7 @@ type ApiRepositories = {
 type BuildApiAppOptions = {
   auth?: Partial<AuthAdapters>;
   authConfig?: Partial<AuthConfig>;
+  corsOrigin?: string | false;
   state?: Partial<PlatformRepositoryOptions>;
   db?: {
     pool?: DbPool;
@@ -445,16 +446,33 @@ function auditMutation(request: FastifyRequest, action: string, targetType: stri
   return createAuditLogRecord({ actorId: request.auth?.user.id ?? SCAFFOLD_ACTOR, action, targetType, targetId, ...request.correlationContext });
 }
 
-function registerCoreHooks(app: FastifyInstance): void {
+function registerCoreHooks(app: FastifyInstance, corsOrigin: string | null): void {
   app.addHook("onRequest", async (request) => {
     const inboundRequestId = getHeaderValue(request, "x-request-id");
     const requestId = inboundRequestId && inboundRequestId.trim().length > 0 ? inboundRequestId : createRequestId();
     request.correlationContext = createCorrelationContext(requestId);
   });
   app.addHook("onSend", async (request, reply) => {
+    if (corsOrigin) {
+      reply.header("access-control-allow-origin", corsOrigin);
+      reply.header("access-control-allow-credentials", "true");
+      reply.header("vary", "Origin");
+    }
     reply.header("x-request-id", request.correlationContext.requestId);
     reply.header("x-correlation-id", request.correlationContext.correlationId);
   });
+  if (corsOrigin) {
+    app.options("/*", async (_request, reply) =>
+      reply
+        .header("access-control-allow-origin", corsOrigin)
+        .header("access-control-allow-credentials", "true")
+        .header("access-control-allow-headers", "content-type,x-request-id")
+        .header("access-control-allow-methods", "GET,POST,OPTIONS")
+        .header("vary", "Origin")
+        .code(204)
+        .send()
+    );
+  }
   app.setErrorHandler((error, request, reply) => {
     const isValidationError = error instanceof z.ZodError;
     void reply
@@ -556,6 +574,7 @@ function registerRoutes(app: FastifyInstance, state: PlatformRepositories, adapt
 export async function buildApiApp(options: BuildApiAppOptions = {}): Promise<FastifyInstance> {
   const env = parseDeployLiteEnv(options.env ?? process.env);
   const app = Fastify({ logger: false });
+  const corsOrigin = options.corsOrigin === false ? null : options.corsOrigin ?? (env.NODE_ENV === "production" ? null : "http://localhost:3000");
   const authConfig: AuthConfig = {
     cookieName: env.DEPLOYLITE_SESSION_COOKIE_NAME ?? defaultSessionCookieName,
     cookieSecure: env.DEPLOYLITE_SESSION_COOKIE_SECURE ?? env.NODE_ENV === "production",
@@ -569,7 +588,7 @@ export async function buildApiApp(options: BuildApiAppOptions = {}): Promise<Fas
   if (repositories.shouldSeedMockData) {
     await seedMockData(repositories.state);
   }
-  registerCoreHooks(app);
+  registerCoreHooks(app, corsOrigin);
   registerRoutes(app, repositories.state, repositories.auth, authConfig);
   return app;
 }
