@@ -8,10 +8,13 @@ This package owns the PostgreSQL schema and migration tooling for the auth/data 
 docker compose -f infra/local/postgres.yml up -d
 export DATABASE_URL=postgres://deploylite:deploylite@localhost:55433/deploylite
 pnpm --filter @deploylite/db db:migrate
+pnpm --filter @deploylite/db db:check
 pnpm --filter @deploylite/db test
 ```
 
 The local compose file starts PostgreSQL only on host port `55433` to avoid common conflicts with an existing local PostgreSQL on `5432`. It does not touch VPS, Docker socket, Traefik, ACME, or deployment infrastructure.
+
+`db:check` is a deterministic offline check for this package's hand-authored SQL migration workflow. It validates that migration files exist, canonical RBAC roles are present and DB-enforced, env variable storage remains metadata-only, required foundation tables/indexes exist, and TypeScript schema exports compile.
 
 ## Secret storage boundary
 
