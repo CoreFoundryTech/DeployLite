@@ -1,12 +1,28 @@
 import { cookies } from "next/headers";
-import { getAuthApiBaseUrl, loadAuthSession } from "./auth-boundary";
+import { getAuthApiBaseUrl, loadAuthSession, loadDashboardMetadata, loadDeploymentLogMetadata } from "./auth-boundary";
 
-export async function loadRequestAuthSession() {
+async function getRequestCookieHeader() {
   const cookieStore = await cookies();
-  const cookieHeader = cookieStore
+  return cookieStore
     .getAll()
     .map((cookie) => `${cookie.name}=${cookie.value}`)
     .join("; ");
+}
+
+export async function loadRequestAuthSession() {
+  const cookieHeader = await getRequestCookieHeader();
 
   return loadAuthSession({ apiBaseUrl: getAuthApiBaseUrl() ?? undefined, cookieHeader });
+}
+
+export async function loadRequestDashboardMetadata() {
+  const cookieHeader = await getRequestCookieHeader();
+
+  return loadDashboardMetadata({ apiBaseUrl: getAuthApiBaseUrl() ?? undefined, cookieHeader });
+}
+
+export async function loadRequestDeploymentLogMetadata(deploymentId: string) {
+  const cookieHeader = await getRequestCookieHeader();
+
+  return loadDeploymentLogMetadata(deploymentId, { apiBaseUrl: getAuthApiBaseUrl() ?? undefined, cookieHeader });
 }
