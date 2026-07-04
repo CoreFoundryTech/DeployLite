@@ -25,12 +25,20 @@ export const authLoginRequestSchema = z.object({
   password: z.string().min(1)
 });
 
-export const scaffoldUserSchema = z.object({
+export const canonicalRoleSchema = z.enum(["admin", "operator", "read-only", "auditor"]);
+
+export const safeAuthUserSchema = z.object({
   id: idSchema,
   email: z.string().email(),
-  role: z.enum(["owner", "operator", "viewer"]),
+  role: canonicalRoleSchema,
   status: z.enum(["active", "disabled"])
 });
+
+export const authResponseSchema = z.object({
+  user: safeAuthUserSchema
+});
+
+export const scaffoldUserSchema = safeAuthUserSchema;
 
 export const resourceSnapshotSchema = z.object({
   cpuLoad: z.number().min(0).max(1),
@@ -108,3 +116,6 @@ export type Deployment = z.infer<typeof deploymentSchema>;
 export type LogEvent = z.infer<typeof logEventSchema>;
 export type Project = z.infer<typeof projectSchema>;
 export type ScaffoldUser = z.infer<typeof scaffoldUserSchema>;
+export type CanonicalRole = z.infer<typeof canonicalRoleSchema>;
+export type SafeAuthUserDto = z.infer<typeof safeAuthUserSchema>;
+export type AuthResponse = z.infer<typeof authResponseSchema>;

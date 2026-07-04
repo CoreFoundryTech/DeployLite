@@ -12,6 +12,7 @@
   "dependencies": {
     "@deploylite/config": "workspace:*",
     "@deploylite/contracts": "workspace:*",
+    "@deploylite/db": "workspace:*",
     "@deploylite/domain": "workspace:*",
     "fastify": "^5.2.1"
   }

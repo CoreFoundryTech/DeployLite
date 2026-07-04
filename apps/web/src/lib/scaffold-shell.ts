@@ -30,7 +30,7 @@ export type DashboardShellState =
 export const scaffoldSession: ScaffoldUser = {
   id: "scaffold-user",
   email: "operator@example.test",
-  role: "owner",
+  role: "operator",
   status: "active"
 };
 
