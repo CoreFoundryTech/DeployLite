@@ -2,7 +2,7 @@
 
 Initial scaffold for DeployLite, a self-hosted deployment platform. This chain establishes TypeScript workspace boundaries, shared contracts, domain foundations, mock API/web/agent surfaces, and read-only MCP tools only.
 
-The current auth foundation is intentionally narrow: API sessions are opaque HttpOnly cookies with canonical roles, while deployment infrastructure remains mock-only and non-mutating.
+The current auth foundation is intentionally narrow: API sessions are opaque HttpOnly cookies with canonical roles. A first VPS runtime slice now provides Docker images and Compose wiring, but the one-command installer, TLS, domains, Traefik, and deployment-agent behavior remain deferred.
 
 ## Scaffold chain
 
@@ -15,12 +15,35 @@ The current auth foundation is intentionally narrow: API sessions are opaque Htt
 
 ## Safety guardrails
 
-- No Docker socket access or host mutation exists in this scaffold.
+- No Docker socket deployment-agent access or host mutation is implemented by the app.
 - Auth is an MVP cookie-session boundary for local administration. It is not a production hardening claim.
 - Secret-like values must pass through shared redaction helpers before leaving a boundary.
-- API, web, agent, and MCP surfaces are mock-only in this scaffold.
+- API, web, agent, and MCP deployment-control surfaces are mock-only in this scaffold.
 - MCP tools are read-only and non-destructive: `deploylite_get_server_status`, `deploylite_list_deployments`, and `deploylite_get_deployment_logs`.
 - Traefik, ACME, production auth claims, real secret storage, and host shell execution are out of scope.
+
+## VPS runtime preview
+
+PR1 of the VPS installer work adds a reviewable runtime contract only. It is useful for local review and future installer integration, but it is not a deploy command and it must not be treated as production hardening.
+
+Included:
+
+- Production-oriented Dockerfiles for the API and Web apps.
+- `infra/vps/compose.yml` with Postgres, one-shot migrations, API, Web, named volumes, an internal network, health checks, and restart policies.
+- Temporary HTTP exposure: Web on host `:80` and API on host `:3001`.
+- Browser-first initial owner creation through the existing setup UI. There are no default admin credentials.
+
+Deferred non-goals:
+
+- One-command installer, Docker installation, host preflight, upgrades, uninstall/reset, backups, firewall mutation, Dokploy access, real VPS deployment, server Docker socket integration, Traefik, ACME, domains, and HTTPS automation.
+
+For review only, copy `infra/vps/.env.example` to a private env file, replace placeholder values, then render the Compose configuration without starting services:
+
+```bash
+docker compose -f infra/vps/compose.yml --env-file /path/to/private.env config
+```
+
+The HTTP-first slice deliberately sets `DEPLOYLITE_SESSION_COOKIE_SECURE=false` and requires `DEPLOYLITE_CORS_ORIGIN` to match the public Web origin. A later TLS/proxy slice must revisit both values.
 
 ## Auth/PostgreSQL chain
 

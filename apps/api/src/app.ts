@@ -446,6 +446,10 @@ function auditMutation(request: FastifyRequest, action: string, targetType: stri
   return createAuditLogRecord({ actorId: request.auth?.user.id ?? SCAFFOLD_ACTOR, action, targetType, targetId, ...request.correlationContext });
 }
 
+function isAllowedCorsRequest(request: FastifyRequest, corsOrigin: string | null): boolean {
+  return Boolean(corsOrigin && getHeaderValue(request, "origin") === corsOrigin);
+}
+
 function registerCoreHooks(app: FastifyInstance, corsOrigin: string | null): void {
   app.addHook("onRequest", async (request) => {
     const inboundRequestId = getHeaderValue(request, "x-request-id");
@@ -453,7 +457,7 @@ function registerCoreHooks(app: FastifyInstance, corsOrigin: string | null): voi
     request.correlationContext = createCorrelationContext(requestId);
   });
   app.addHook("onSend", async (request, reply) => {
-    if (corsOrigin) {
+    if (isAllowedCorsRequest(request, corsOrigin)) {
       reply.header("access-control-allow-origin", corsOrigin);
       reply.header("access-control-allow-credentials", "true");
       reply.header("vary", "Origin");
@@ -462,16 +466,20 @@ function registerCoreHooks(app: FastifyInstance, corsOrigin: string | null): voi
     reply.header("x-correlation-id", request.correlationContext.correlationId);
   });
   if (corsOrigin) {
-    app.options("/*", async (_request, reply) =>
-      reply
+    app.options("/*", async (request, reply) => {
+      if (!isAllowedCorsRequest(request, corsOrigin)) {
+        return reply.header("vary", "Origin").code(204).send();
+      }
+
+      return reply
         .header("access-control-allow-origin", corsOrigin)
         .header("access-control-allow-credentials", "true")
         .header("access-control-allow-headers", "content-type,x-request-id")
         .header("access-control-allow-methods", "GET,POST,OPTIONS")
         .header("vary", "Origin")
         .code(204)
-        .send()
-    );
+        .send();
+    });
   }
   app.setErrorHandler((error, request, reply) => {
     const isValidationError = error instanceof z.ZodError;
@@ -574,7 +582,7 @@ function registerRoutes(app: FastifyInstance, state: PlatformRepositories, adapt
 export async function buildApiApp(options: BuildApiAppOptions = {}): Promise<FastifyInstance> {
   const env = parseDeployLiteEnv(options.env ?? process.env);
   const app = Fastify({ logger: false });
-  const corsOrigin = options.corsOrigin === false ? null : options.corsOrigin ?? (env.NODE_ENV === "production" ? null : "http://localhost:3000");
+  const corsOrigin = options.corsOrigin === false ? null : options.corsOrigin ?? env.DEPLOYLITE_CORS_ORIGIN ?? (env.NODE_ENV === "production" ? null : "http://localhost:3000");
   const authConfig: AuthConfig = {
     cookieName: env.DEPLOYLITE_SESSION_COOKIE_NAME ?? defaultSessionCookieName,
     cookieSecure: env.DEPLOYLITE_SESSION_COOKIE_SECURE ?? env.NODE_ENV === "production",

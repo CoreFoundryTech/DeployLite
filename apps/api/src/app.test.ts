@@ -126,9 +126,38 @@ describe("DeployLite API scaffold", () => {
     expect(response.headers["access-control-allow-credentials"]).toBe("true");
   });
 
+  it("uses the configured production CORS origin only for matching credentialed requests", async () => {
+    const app = await buildApiApp({
+      env: {
+        ...process.env,
+        NODE_ENV: "production",
+        DEPLOYLITE_CORS_ORIGIN: "http://deploylite.example.test",
+        DEPLOYLITE_SESSION_COOKIE_SECURE: "false"
+      }
+    });
+
+    const allowed = await app.inject({
+      method: "OPTIONS",
+      url: "/api/v1/auth/login",
+      headers: { origin: "http://deploylite.example.test", "access-control-request-method": "POST" }
+    });
+    const rejected = await app.inject({
+      method: "OPTIONS",
+      url: "/api/v1/auth/login",
+      headers: { origin: "http://evil.example.test", "access-control-request-method": "POST" }
+    });
+
+    expect(allowed.statusCode).toBe(204);
+    expect(allowed.headers["access-control-allow-origin"]).toBe("http://deploylite.example.test");
+    expect(allowed.headers["access-control-allow-credentials"]).toBe("true");
+    expect(rejected.statusCode).toBe(204);
+    expect(rejected.headers["access-control-allow-origin"]).toBeUndefined();
+    expect(rejected.headers["access-control-allow-credentials"]).toBeUndefined();
+  });
+
   it("selects DB auth repositories when DATABASE_URL is configured", async () => {
     const repositories = await createRuntimeRepositories(
-      { NODE_ENV: "test", DEPLOYLITE_API_URL: "http://localhost:3001", DATABASE_URL: "postgres://user:pass@localhost:5432/deploylite", DEPLOYLITE_SESSION_TTL_SECONDS: 3600, DEPLOYLITE_SESSION_COOKIE_NAME: "dl_test_session", DEPLOYLITE_BCRYPT_COST: 10 },
+      { NODE_ENV: "test", DEPLOYLITE_API_URL: "http://localhost:3001", DEPLOYLITE_API_HOST: "127.0.0.1", DEPLOYLITE_API_PORT: 3001, DATABASE_URL: "postgres://user:pass@localhost:5432/deploylite", DEPLOYLITE_SESSION_TTL_SECONDS: 3600, DEPLOYLITE_SESSION_COOKIE_NAME: "dl_test_session", DEPLOYLITE_BCRYPT_COST: 10 },
       { db: { pool: {} as never, client: {} as never } }
     );
 
@@ -271,6 +300,22 @@ describe("DeployLite API scaffold", () => {
     const response = await app.inject({ method: "POST", url: "/api/v1/auth/login", headers: contentHeaders, payload: { email: "admin@example.test", password } });
 
     expect(response.headers["set-cookie"]).toContain("Secure");
+  });
+
+  it("honors string false for HTTP-first production cookies", async () => {
+    const hasher = new BcryptPasswordHasher(10);
+    const user = { id: "user_http_1", email: "admin@example.test", emailNormalized: "admin@example.test", passwordHash: await hasher.hash(password), role: "admin" as const, status: "active" as const, createdAt: new Date(), updatedAt: new Date() };
+    const app = await buildApiApp({
+      auth: { hasher, users: new InMemoryAuthUserRepository([user]) },
+      env: {
+        ...process.env,
+        NODE_ENV: "production",
+        DEPLOYLITE_SESSION_COOKIE_SECURE: "false"
+      }
+    });
+    const response = await app.inject({ method: "POST", url: "/api/v1/auth/login", headers: contentHeaders, payload: { email: "admin@example.test", password } });
+
+    expect(response.headers["set-cookie"]).not.toContain("Secure");
   });
 
   it("resolves /auth/me from the session cookie and logout revokes it", async () => {

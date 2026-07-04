@@ -1,0 +1,96 @@
+name: deploylite
+
+services:
+  postgres:
+    image: postgres:16-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: ${POSTGRES_DB:-deploylite}
+      POSTGRES_USER: ${POSTGRES_USER:-deploylite}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?POSTGRES_PASSWORD is required}
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+    networks:
+      - deploylite
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U $${POSTGRES_USER:-deploylite} -d $${POSTGRES_DB:-deploylite}"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+
+  migrate:
+    build:
+      context: ../..
+      dockerfile: apps/api/Dockerfile
+    image: deploylite-api:local
+    restart: "no"
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      DATABASE_URL: postgres://${POSTGRES_USER:-deploylite}:${POSTGRES_PASSWORD:?POSTGRES_PASSWORD is required}@postgres:5432/${POSTGRES_DB:-deploylite}
+    command: ["node", "packages/db/scripts/migrate.mjs"]
+    networks:
+      - deploylite
+
+  api:
+    build:
+      context: ../..
+      dockerfile: apps/api/Dockerfile
+    image: deploylite-api:local
+    restart: unless-stopped
+    depends_on:
+      postgres:
+        condition: service_healthy
+      migrate:
+        condition: service_completed_successfully
+    environment:
+      NODE_ENV: production
+      DATABASE_URL: postgres://${POSTGRES_USER:-deploylite}:${POSTGRES_PASSWORD:?POSTGRES_PASSWORD is required}@postgres:5432/${POSTGRES_DB:-deploylite}
+      DEPLOYLITE_API_HOST: 0.0.0.0
+      DEPLOYLITE_API_PORT: 3001
+      DEPLOYLITE_API_URL: http://api:3001
+      DEPLOYLITE_CORS_ORIGIN: ${DEPLOYLITE_PUBLIC_WEB_ORIGIN:?DEPLOYLITE_PUBLIC_WEB_ORIGIN is required}
+      DEPLOYLITE_SESSION_TTL_SECONDS: ${DEPLOYLITE_SESSION_TTL_SECONDS:-28800}
+      DEPLOYLITE_SESSION_COOKIE_NAME: ${DEPLOYLITE_SESSION_COOKIE_NAME:-deploylite_session}
+      DEPLOYLITE_SESSION_COOKIE_SECURE: ${DEPLOYLITE_SESSION_COOKIE_SECURE:-false}
+      DEPLOYLITE_BCRYPT_COST: ${DEPLOYLITE_BCRYPT_COST:-12}
+    ports:
+      - "3001:3001"
+    networks:
+      - deploylite
+    healthcheck:
+      test: ["CMD-SHELL", "wget -qO- http://127.0.0.1:3001/api/v1/health >/dev/null"]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+
+  web:
+    build:
+      context: ../..
+      dockerfile: apps/web/Dockerfile
+    image: deploylite-web:local
+    restart: unless-stopped
+    depends_on:
+      api:
+        condition: service_healthy
+    environment:
+      NODE_ENV: production
+      DEPLOYLITE_WEB_API_BASE_URL: ${DEPLOYLITE_PUBLIC_API_ORIGIN:?DEPLOYLITE_PUBLIC_API_ORIGIN is required}
+      NEXT_PUBLIC_DEPLOYLITE_API_URL: ${DEPLOYLITE_PUBLIC_API_ORIGIN:?DEPLOYLITE_PUBLIC_API_ORIGIN is required}
+    ports:
+      - "80:3000"
+    networks:
+      - deploylite
+    healthcheck:
+      test: ["CMD-SHELL", "wget -qO- http://127.0.0.1:3000/ >/dev/null"]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+
+volumes:
+  postgres-data:
+
+networks:
+  deploylite:
+    driver: bridge

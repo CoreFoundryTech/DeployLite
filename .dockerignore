@@ -1,0 +1,14 @@
+.git
+.gitignore
+.codegraph
+.atl/
+node_modules
+**/node_modules
+**/.next/cache
+**/dist
+coverage
+*.log
+.env
+.env.*
+!.env.example
+PRD - DeployLite.pdf
