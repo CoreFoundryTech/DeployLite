@@ -1,12 +1,18 @@
 import { BcryptPasswordHasher, createOpaqueSessionToken, hashSessionToken } from "@deploylite/db";
-import { InitialAdminAlreadyExistsError, type AuthUser, type AuthUserRepository, type CreateInitialAdminInput } from "@deploylite/domain";
+import { InitialAdminAlreadyExistsError, type AgentRepository, type AuthUser, type AuthUserRepository, type CreateInitialAdminInput, type DeploymentRepository, type ProjectRepository } from "@deploylite/domain";
 import { describe, expect, it } from "vitest";
 import { buildApiApp, createRuntimeRepositories, InMemoryAuditRepository, InMemoryAuthUserRepository, InMemorySessionRepository } from "./app.js";
 
 const contentHeaders = { "content-type": "application/json" };
 const password = "correct horse battery staple";
 
-async function authFixture(overrides: Partial<AuthUser> = {}) {
+type AuthFixtureOptions = {
+  dbMode?: boolean;
+  state?: NonNullable<Parameters<typeof buildApiApp>[0]>["state"];
+  user?: Partial<AuthUser>;
+};
+
+async function authFixture(options: AuthFixtureOptions = {}) {
   const hasher = new BcryptPasswordHasher(10);
   const now = new Date("2026-01-01T00:00:00.000Z");
   const user: AuthUser = {
@@ -18,13 +24,75 @@ async function authFixture(overrides: Partial<AuthUser> = {}) {
     status: "active",
     createdAt: now,
     updatedAt: now,
-    ...overrides
+    ...options.user
   };
   const audit = new InMemoryAuditRepository();
   const sessions = new InMemorySessionRepository();
   const users = new InMemoryAuthUserRepository([user]);
-  const app = await buildApiApp({ auth: { audit, hasher, sessions, users }, authConfig: { cookieName: "dl_test_session", cookieSecure: false, sessionTtlSeconds: 3600 } });
+  const app = await buildApiApp({
+    auth: { audit, hasher, sessions, users },
+    authConfig: { cookieName: "dl_test_session", cookieSecure: false, sessionTtlSeconds: 3600 },
+    db: options.dbMode ? { pool: {} as never, client: {} as never } : undefined,
+    env: options.dbMode ? { ...process.env, NODE_ENV: "test", DATABASE_URL: "postgres://user:pass@localhost:5432/deploylite" } : undefined,
+    state: options.state
+  });
   return { app, audit, sessions, user };
+}
+
+function metadataRepositories() {
+  const calls: string[] = [];
+  const projects: ProjectRepository = {
+    async save() {
+      calls.push("projects.save");
+      throw new Error("metadata read routes must not create projects");
+    },
+    async findById(id) {
+      calls.push("projects.findById");
+      return id === "project-1" ? { id, name: "DeployLite", repoUrl: "https://github.com/CoreFoundryTech/DeployLite", defaultBranch: "main" } : null;
+    },
+    async list() {
+      calls.push("projects.list");
+      return [{ id: "project-1", name: "DeployLite", repoUrl: "https://github.com/CoreFoundryTech/DeployLite", defaultBranch: "main" }];
+    }
+  };
+  const agents: AgentRepository = {
+    async save() {
+      calls.push("agents.save");
+      throw new Error("metadata read routes must not register agents");
+    },
+    async findById(id) {
+      calls.push("agents.findById");
+      return id === "agent-1" ? { id, name: "Local agent", endpoint: "https://agent.example.test", status: "online", lastHeartbeatAt: null, resourceSnapshot: null } : null;
+    },
+    async list() {
+      calls.push("agents.list");
+      return [{ id: "agent-1", name: "Local agent", endpoint: "https://agent.example.test", status: "online", lastHeartbeatAt: null, resourceSnapshot: null }];
+    }
+  };
+  const deployments: DeploymentRepository = {
+    async save() {
+      calls.push("deployments.save");
+      throw new Error("metadata read routes must not create deployments");
+    },
+    async findById(id) {
+      calls.push("deployments.findById");
+      return id === "dep-1" ? { id, projectId: "project-1", agentId: "agent-1", status: "running", commitSha: "abcdef1", startedAt: "2026-01-01T00:00:00.000Z", finishedAt: null } : null;
+    },
+    async list() {
+      calls.push("deployments.list");
+      return [{ id: "dep-1", projectId: "project-1", agentId: "agent-1", status: "running", commitSha: "abcdef1", startedAt: "2026-01-01T00:00:00.000Z", finishedAt: null }];
+    },
+    async appendLog() {
+      calls.push("deployments.appendLog");
+      throw new Error("metadata read routes must not append logs");
+    },
+    async listLogs(deploymentId) {
+      calls.push("deployments.listLogs");
+      return deploymentId === "dep-1" ? [{ id: "log-1", deploymentId, sequence: 1, level: "info", message: "Started", timestamp: "2026-01-01T00:00:00.000Z", redactionApplied: true, requestId: "req-1", correlationId: "req-1" }] : [];
+    }
+  };
+
+  return { calls, state: { agents, deployments, projects } };
 }
 
 async function loginCookie(app: Awaited<ReturnType<typeof buildApiApp>>, email = "admin@example.test") {
@@ -209,7 +277,7 @@ describe("DeployLite API scaffold", () => {
   });
 
   it("rejects disabled users and records a redacted failed-login audit event", async () => {
-    const { app, audit } = await authFixture({ status: "disabled" });
+    const { app, audit } = await authFixture({ user: { status: "disabled" } });
     const response = await app.inject({ method: "POST", url: "/api/v1/auth/login", headers: contentHeaders, payload: { email: "admin@example.test", password } });
 
     expect(response.statusCode).toBe(401);
@@ -239,7 +307,7 @@ describe("DeployLite API scaffold", () => {
   });
 
   it("denies read-only protected mutations and records audit metadata", async () => {
-    const { app, audit } = await authFixture({ role: "read-only" });
+    const { app, audit } = await authFixture({ user: { role: "read-only" } });
     const cookie = await loginCookie(app);
     const response = await app.inject({
       method: "POST",
@@ -287,6 +355,53 @@ describe("DeployLite API scaffold", () => {
     expect(response.body).toContain("[REDACTED]");
     expect(response.body).not.toContain("dl_1234567890abcdef");
     expect(response.body).toContain("req_logs_1");
+  });
+
+  it("returns authenticated metadata list/detail envelopes without infrastructure side effects", async () => {
+    const { calls, state } = metadataRepositories();
+    const { app } = await authFixture({ dbMode: true, state });
+    const cookie = await loginCookie(app);
+
+    const projects = await app.inject({ method: "GET", url: "/api/v1/projects", headers: { cookie, "x-request-id": "req_projects_1" } });
+    const agents = await app.inject({ method: "GET", url: "/api/v1/agents", headers: { cookie } });
+    const deployments = await app.inject({ method: "GET", url: "/api/v1/deployments", headers: { cookie } });
+    const deployment = await app.inject({ method: "GET", url: "/api/v1/deployments/dep-1", headers: { cookie } });
+    const logs = await app.inject({ method: "GET", url: "/api/v1/deployments/dep-1/logs", headers: { cookie } });
+
+    expect(projects.statusCode).toBe(200);
+    expect(projects.json()).toMatchObject({ data: { projects: [expect.objectContaining({ id: "project-1" })] }, error: null, requestId: "req_projects_1" });
+    expect(agents.statusCode).toBe(200);
+    expect(agents.json().data.agents).toEqual([expect.objectContaining({ id: "agent-1" })]);
+    expect(deployments.statusCode).toBe(200);
+    expect(deployments.json().data.deployments).toEqual([expect.objectContaining({ id: "dep-1" })]);
+    expect(deployment.statusCode).toBe(200);
+    expect(deployment.json().data.deployment).toMatchObject({ id: "dep-1" });
+    expect(logs.statusCode).toBe(200);
+    expect(logs.json().data.events).toEqual([expect.objectContaining({ sequence: 1 })]);
+    expect(calls).toEqual(["projects.list", "agents.list", "deployments.list", "deployments.findById", "deployments.listLogs"]);
+    expect(calls).not.toEqual(expect.arrayContaining(["projects.save", "agents.save", "deployments.save", "deployments.appendLog"]));
+  });
+
+  it("protects metadata routes with auth and returns empty states", async () => {
+    const { state } = metadataRepositories();
+    state.projects.list = async () => [];
+    state.agents.list = async () => [];
+    state.deployments.list = async () => [];
+    state.deployments.listLogs = async () => [];
+    const { app } = await authFixture({ dbMode: true, state });
+    const cookie = await loginCookie(app);
+
+    const unauthenticated = await app.inject({ method: "GET", url: "/api/v1/deployments" });
+    const projects = await app.inject({ method: "GET", url: "/api/v1/projects", headers: { cookie } });
+    const agents = await app.inject({ method: "GET", url: "/api/v1/agents", headers: { cookie } });
+    const deployments = await app.inject({ method: "GET", url: "/api/v1/deployments", headers: { cookie } });
+    const logs = await app.inject({ method: "GET", url: "/api/v1/deployments/missing/logs", headers: { cookie } });
+
+    expect(unauthenticated.statusCode).toBe(401);
+    expect(projects.json().data).toEqual({ projects: [] });
+    expect(agents.json().data).toEqual({ agents: [] });
+    expect(deployments.json().data).toEqual({ deployments: [] });
+    expect(logs.json().data).toEqual({ events: [] });
   });
 
   it("rejects unsafe heartbeat payloads without leaking validation details", async () => {
