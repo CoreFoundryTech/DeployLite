@@ -1,0 +1,20 @@
+services:
+  postgres:
+    image: postgres:16-alpine
+    container_name: deploylite-postgres
+    environment:
+      POSTGRES_DB: deploylite
+      POSTGRES_USER: deploylite
+      POSTGRES_PASSWORD: deploylite
+    ports:
+      - "55433:5432"
+    volumes:
+      - deploylite-postgres-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U deploylite -d deploylite"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+volumes:
+  deploylite-postgres-data:
