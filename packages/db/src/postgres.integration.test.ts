@@ -5,7 +5,9 @@ import pg from "pg";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 
 import { createDbClient, createDbPool, closeDbPool, type DeployLiteDb } from "./client.js";
+import { assertEnvMetadataHasNoValueColumns, toEnvVariableMetadataInsert } from "./env-metadata.js";
 import { DbAuthUserRepository, DbRoleRepository, DbSessionRepository } from "./repositories/auth.js";
+import { DbAgentRepository, DbDeploymentRepository, DbProjectRepository } from "./repositories/deployment-data.js";
 
 const { Client } = pg;
 
@@ -120,6 +122,179 @@ describeIntegration("PostgreSQL auth foundation integration", () => {
       tokenHash: "sha256:integration-token-hash"
     });
   });
+
+  it("persists deployment metadata foundations across a new PostgreSQL client lifecycle", async () => {
+    const client = requirePool();
+    const now = new Date().toISOString();
+    const serverId = randomUUID();
+    const agentId = randomUUID();
+    const projectId = randomUUID();
+    const deploymentId = randomUUID();
+    const deploymentLogId = randomUUID();
+    const domainId = randomUUID();
+    const certificateId = randomUUID();
+    const envMetadataId = randomUUID();
+
+    await client.query(
+      "INSERT INTO servers (id, name, endpoint, status, metadata) VALUES ($1, $2, $3, $4, $5::jsonb)",
+      [serverId, "Integration server", "https://server.integration.test", "online", JSON.stringify({ region: "local" })]
+    );
+
+    await requireDbAgentRepository().save({
+      id: agentId,
+      name: "Integration agent",
+      endpoint: "https://agent.integration.test",
+      status: "online",
+      lastHeartbeatAt: now,
+      resourceSnapshot: {
+        cpuLoad: 0.25,
+        memoryUsedBytes: 128,
+        memoryTotalBytes: 1024,
+        diskUsedBytes: 256,
+        diskTotalBytes: 2048
+      }
+    });
+    await client.query("UPDATE agents SET server_id = $1 WHERE id = $2", [serverId, agentId]);
+
+    await requireDbProjectRepository().save({
+      id: projectId,
+      name: "Integration project",
+      repoUrl: "https://github.com/example/deploylite-integration",
+      defaultBranch: "main"
+    });
+
+    await requireDbDeploymentRepository().save({
+      id: deploymentId,
+      projectId,
+      agentId,
+      status: "running",
+      commitSha: "abcdef1234567890",
+      startedAt: now,
+      finishedAt: null
+    });
+    await requireDbDeploymentRepository().appendLog({
+      id: deploymentLogId,
+      deploymentId,
+      sequence: 1,
+      level: "info",
+      message: "Deployment metadata persisted with secret token=plain-text removed",
+      timestamp: now,
+      redactionApplied: false,
+      requestId: "req-integration-metadata",
+      correlationId: "corr-integration-metadata"
+    });
+
+    await client.query(
+      "INSERT INTO domains (id, project_id, hostname, status, metadata) VALUES ($1, $2, $3, $4, $5::jsonb)",
+      [domainId, projectId, "integration.deploylite.test", "active", JSON.stringify({ source: "integration-test" })]
+    );
+    await client.query(
+      "INSERT INTO certificates (id, domain_id, provider, status, not_before, not_after, metadata) VALUES ($1, $2, $3, $4, $5, $6, $7::jsonb)",
+      [
+        certificateId,
+        domainId,
+        "acme-metadata-only",
+        "issued",
+        new Date(Date.now() - 60_000),
+        new Date(Date.now() + 86_400_000),
+        JSON.stringify({ issuer: "metadata-only" })
+      ]
+    );
+    await client.query(
+      "INSERT INTO env_variable_metadata (id, project_id, key, scope, value_present, value_fingerprint, metadata) VALUES ($1, $2, $3, $4, $5, $6, $7::jsonb)",
+      [
+        envMetadataId,
+        projectId,
+        "DEPLOYLITE_TOKEN",
+        "project",
+        false,
+        null,
+        JSON.stringify({ description: "metadata only" })
+      ]
+    );
+
+    await closeDbPool(requirePool());
+    pool = createDbPool(databaseUrl, { max: 1 });
+    db = createDbClient(pool);
+
+    await expect(requireDbAgentRepository().findById(agentId)).resolves.toMatchObject({
+      id: agentId,
+      name: "Integration agent",
+      endpoint: "https://agent.integration.test",
+      status: "online"
+    });
+    await expect(requireDbProjectRepository().list()).resolves.toContainEqual({
+      id: projectId,
+      name: "Integration project",
+      repoUrl: "https://github.com/example/deploylite-integration",
+      defaultBranch: "main"
+    });
+    await expect(requireDbDeploymentRepository().findById(deploymentId)).resolves.toMatchObject({
+      id: deploymentId,
+      projectId,
+      agentId,
+      status: "running",
+      commitSha: "abcdef1234567890"
+    });
+    await expect(requireDbDeploymentRepository().listLogs(deploymentId)).resolves.toEqual([
+      expect.objectContaining({
+        id: deploymentLogId,
+        deploymentId,
+        sequence: 1,
+        level: "info",
+        redactionApplied: true
+      })
+    ]);
+
+    const reopenedClient = requirePool();
+    await expect(reopenedClient.query("SELECT id, name, status, metadata FROM servers WHERE id = $1", [serverId])).resolves.toMatchObject({
+      rows: [expect.objectContaining({ id: serverId, name: "Integration server", status: "online", metadata: { region: "local" } })]
+    });
+    await expect(reopenedClient.query("SELECT id, hostname, status, metadata FROM domains WHERE id = $1", [domainId])).resolves.toMatchObject({
+      rows: [expect.objectContaining({ id: domainId, hostname: "integration.deploylite.test", status: "active", metadata: { source: "integration-test" } })]
+    });
+    await expect(reopenedClient.query("SELECT id, provider, status, metadata FROM certificates WHERE id = $1", [certificateId])).resolves.toMatchObject({
+      rows: [expect.objectContaining({ id: certificateId, provider: "acme-metadata-only", status: "issued", metadata: { issuer: "metadata-only" } })]
+    });
+    await expect(
+      reopenedClient.query("SELECT id, key, scope, value_present, value_fingerprint, metadata FROM env_variable_metadata WHERE id = $1", [
+        envMetadataId
+      ])
+    ).resolves.toMatchObject({
+      rows: [
+        expect.objectContaining({
+          id: envMetadataId,
+          key: "DEPLOYLITE_TOKEN",
+          scope: "project",
+          value_present: false,
+          value_fingerprint: null,
+          metadata: { description: "metadata only" }
+        })
+      ]
+    });
+  });
+
+  it("keeps env metadata value-free at helper and PostgreSQL column boundaries", async () => {
+    const client = requirePool();
+    const columns = (
+      await client.query<{ column_name: string }>(
+        "SELECT column_name FROM information_schema.columns WHERE table_name = 'env_variable_metadata' ORDER BY ordinal_position"
+      )
+    ).rows.map((row) => row.column_name);
+
+    expect(assertEnvMetadataHasNoValueColumns(columns)).toBe(true);
+    expect(columns).not.toContain("value");
+    expect(columns).not.toContain("secret");
+    expect(columns).not.toContain("encrypted_value");
+    expect(() =>
+      toEnvVariableMetadataInsert({
+        projectId: randomUUID(),
+        key: "TOKEN",
+        scope: "project",
+        value: "plain-text-secret"
+      } as Parameters<typeof toEnvVariableMetadataInsert>[0])
+    ).toThrow("Environment variable metadata cannot include secret value field");
+  });
 });
 
 function requirePool(): pg.Pool {
@@ -148,6 +323,18 @@ function requireDbAuthUserRepository(): DbAuthUserRepository {
 
 function requireDbSessionRepository(): DbSessionRepository {
   return new DbSessionRepository(requireDb());
+}
+
+function requireDbAgentRepository(): DbAgentRepository {
+  return new DbAgentRepository(requireDb());
+}
+
+function requireDbProjectRepository(): DbProjectRepository {
+  return new DbProjectRepository(requireDb());
+}
+
+function requireDbDeploymentRepository(): DbDeploymentRepository {
+  return new DbDeploymentRepository(requireDb());
 }
 
 async function applyMigrations(connectionString: string): Promise<void> {

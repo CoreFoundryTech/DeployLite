@@ -30,6 +30,8 @@ The current auth foundation is intentionally narrow: API sessions are opaque Htt
 | PR2 | `feat/auth-postgres-pr2-auth-primitives` | Auth/domain ports, repositories, bcrypt hashing, server-side session tokens, revocation, and redaction tests. |
 | PR3 | `feat/auth-postgres-pr3-api-auth` | `/api/v1/auth/login`, `/api/v1/auth/me`, `/api/v1/auth/logout`, API session cookies, RBAC guards, and audit events. |
 | PR4 | `feat/auth-postgres-pr4-web-docs` | Web auth boundary, local workflow docs, and final cross-surface checks. |
+| PR5 | `feat/auth-postgres-pr5-db-integration-verify` | Corrective runtime PostgreSQL verification for migrations, RBAC constraints, env metadata constraints, and auth/session restart persistence. |
+| PR6 | `feat/auth-postgres-pr6-db-metadata-verify` | Corrective runtime PostgreSQL verification for durable server/agent/project/deployment/log/domain/certificate/env metadata restart persistence. |
 
 ### Local DB/auth quick path
 
@@ -57,7 +59,7 @@ The current auth foundation is intentionally narrow: API sessions are opaque Htt
    pnpm --filter @deploylite/db db:check
    ```
 
-   For opt-in runtime verification against local PostgreSQL, run the integration check. It creates and drops a disposable database on the configured server, applies migrations to that empty database, checks role seeds and database constraint rejection, and verifies auth/session repository persistence across a new client lifecycle:
+   For opt-in runtime verification against local PostgreSQL, run the integration check. It creates and drops a disposable database on the configured server, applies migrations to that empty database, checks role seeds and database constraint rejection, verifies auth/session repository persistence across a new client lifecycle, and proves deployment metadata foundations survive a recreated DB client lifecycle:
 
    ```bash
    pnpm --filter @deploylite/db db:verify:integration
