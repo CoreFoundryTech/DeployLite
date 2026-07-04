@@ -8,6 +8,7 @@
   --border: #d8d0c3;
   --accent: #184c3f;
   --danger: #8a2d22;
+  --success: #245c3a;
 }
 
 * { box-sizing: border-box; }
@@ -20,6 +21,11 @@ body {
 }
 
 a { color: inherit; }
+
+:focus-visible {
+  outline: 3px solid color-mix(in srgb, var(--accent) 76%, white);
+  outline-offset: 3px;
+}
 
 .shell {
   width: min(1120px, calc(100% - 32px));
@@ -41,17 +47,28 @@ a { color: inherit; }
 
 .grid { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 16px; }
 .stack { display: grid; gap: 16px; }
-.field { display: grid; gap: 6px; }
-.field input { border: 1px solid var(--border); background: var(--surface); color: var(--text); padding: 10px 12px; font: inherit; }
+.field { display: grid; gap: 6px; font-weight: 700; }
+.field input { border: 1px solid var(--border); background: var(--surface); color: var(--text); padding: 10px 12px; font: inherit; font-weight: 400; }
+.field input:disabled { cursor: not-allowed; background: var(--surface-muted); color: var(--muted); }
 .card, .banner { padding: 20px; }
 .muted { color: var(--muted); }
 .pill { display: inline-flex; border: 1px solid var(--border); padding: 4px 8px; font-size: 12px; text-transform: uppercase; letter-spacing: .08em; }
-.button { display: inline-flex; border: 0; background: var(--accent); color: white; padding: 10px 14px; text-decoration: none; font: inherit; }
+.button { display: inline-flex; justify-content: center; border: 0; background: var(--accent); color: white; padding: 10px 14px; text-decoration: none; font: inherit; cursor: pointer; }
+.button:disabled { cursor: not-allowed; opacity: .62; }
 .nav-actions { display: flex; gap: 14px; align-items: center; }
-.link-button { border: 0; padding: 0; background: transparent; color: inherit; text-decoration: underline; font: inherit; }
+.link-button { border: 0; padding: 0; background: transparent; color: inherit; text-decoration: underline; font: inherit; cursor: pointer; }
 .danger { color: var(--danger); }
+.status-message, .alert-message {
+  border-inline-start: 4px solid var(--success);
+  margin: 0;
+  padding: 10px 12px;
+  background: var(--surface-muted);
+}
+.alert-message { border-inline-start-color: var(--danger); color: var(--danger); }
 .log { margin: 0; overflow: auto; white-space: pre-wrap; font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 13px; }
 
 @media (max-width: 760px) {
   .grid, .topbar { grid-template-columns: 1fr; display: grid; }
+  .nav-actions { align-items: flex-start; flex-direction: column; }
+  .button { width: 100%; }
 }

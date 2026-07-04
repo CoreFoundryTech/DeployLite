@@ -1,7 +1,19 @@
 import { describe, expect, it } from "vitest";
 import { projectSchema } from "@deploylite/contracts";
 import { z } from "zod";
-import { authApiPaths, createAuthApiRequest, fetchMetadataEnvelope, hasSessionCookie, loadAuthSession, metadataApiPaths, resolveAuthBoundary } from "./auth-boundary.js";
+import {
+  authApiPaths,
+  bootstrapApiPaths,
+  createAuthApiRequest,
+  createInitialAdmin,
+  createInitialAdminApiRequest,
+  fetchMetadataEnvelope,
+  hasSessionCookie,
+  loadAuthSession,
+  loadBootstrapStatus,
+  metadataApiPaths,
+  resolveAuthBoundary
+} from "./auth-boundary.js";
 import { createMockPlatformSnapshot, formatBytes, resolveDashboardShell } from "./scaffold-shell.js";
 
 describe("web scaffold shell state", () => {
@@ -111,5 +123,54 @@ describe("web metadata API boundary", () => {
 
     expect(invalidPayload).toEqual({ kind: "error", reason: "invalid-payload" });
     expect(apiFailure).toEqual({ kind: "error", reason: "api-rejected", status: 503 });
+  });
+});
+
+describe("web bootstrap API boundary", () => {
+  it("loads bootstrap status through the typed API envelope", async () => {
+    const calls: Array<{ url: string; init?: RequestInit }> = [];
+    const result = await loadBootstrapStatus({
+      apiBaseUrl: "https://api.example.test",
+      cookieHeader: "deploylite_session=opaque",
+      fetchImpl: async (url: string | URL | Request, init?: RequestInit) => {
+        calls.push({ url: String(url), init });
+        return new Response(JSON.stringify({ data: { setupRequired: true }, error: null, requestId: "req_bootstrap_1" }), { status: 200 });
+      }
+    });
+
+    expect(result).toEqual({ kind: "ready", data: { setupRequired: true }, requestId: "req_bootstrap_1" });
+    expect(calls[0]).toMatchObject({ url: `https://api.example.test${bootstrapApiPaths.status}` });
+  });
+
+  it("returns explicit bootstrap rejected, invalid, unreachable, and unconfigured states", async () => {
+    await expect(loadBootstrapStatus({ cookieHeader: "deploylite_session=opaque" })).resolves.toEqual({ kind: "error", reason: "api-unconfigured" });
+    await expect(loadBootstrapStatus({ apiBaseUrl: "https://api.example.test", fetchImpl: async () => new Response("{}", { status: 503 }) })).resolves.toEqual({ kind: "error", reason: "api-rejected", status: 503 });
+    await expect(loadBootstrapStatus({ apiBaseUrl: "https://api.example.test", fetchImpl: async () => new Response(JSON.stringify({ data: { setupRequired: "yes" }, error: null, requestId: "req_bad" }), { status: 200 }) })).resolves.toEqual({ kind: "error", reason: "invalid-payload" });
+    await expect(loadBootstrapStatus({ apiBaseUrl: "https://api.example.test", fetchImpl: async () => { throw new Error("offline"); } })).resolves.toEqual({ kind: "error", reason: "api-unreachable" });
+  });
+
+  it("creates initial-admin requests without leaking passwords into URLs or headers", async () => {
+    const request = createInitialAdminApiRequest({ email: "admin@example.test", password: "very-secret-admin-password" });
+
+    expect(request.method).toBe("POST");
+    expect(request.credentials).toBe("include");
+    expect(request.headers).toEqual({ "content-type": "application/json" });
+    expect(JSON.stringify(request.headers)).not.toContain("very-secret-admin-password");
+  });
+
+  it("maps initial-admin success and locked setup submissions", async () => {
+    const success = await createInitialAdmin({
+      apiBaseUrl: "https://api.example.test",
+      input: { email: "admin@example.test", password: "very-secret-admin-password" },
+      fetchImpl: async () => new Response(JSON.stringify({ data: { user: { id: "user_1", email: "admin@example.test", role: "admin", status: "active" } }, error: null, requestId: "req_admin_1" }), { status: 200 })
+    });
+    const locked = await createInitialAdmin({
+      apiBaseUrl: "https://api.example.test",
+      input: { email: "admin@example.test", password: "very-secret-admin-password" },
+      fetchImpl: async () => new Response(JSON.stringify({ data: null, error: { code: "BOOTSTRAP_LOCKED", message: "Locked", correlationId: "req_locked" }, requestId: "req_locked" }), { status: 409 })
+    });
+
+    expect(success).toMatchObject({ kind: "ready", data: { user: { role: "admin" } } });
+    expect(locked).toEqual({ kind: "error", reason: "api-rejected", status: 409 });
   });
 });

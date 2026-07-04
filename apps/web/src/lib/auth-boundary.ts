@@ -1,12 +1,16 @@
 import {
   agentSchema,
   authResponseSchema,
+  bootstrapInitialAdminRequestSchema,
+  bootstrapStatusSchema,
   deploymentSchema,
   logEventSchema,
   projectSchema,
   responseEnvelopeSchema,
   type Agent,
   type AuthResponse,
+  type BootstrapInitialAdminRequest,
+  type BootstrapStatus,
   type Deployment,
   type LogEvent,
   type Project,
@@ -18,6 +22,11 @@ export const authApiPaths = {
   login: "/api/v1/auth/login",
   me: "/api/v1/auth/me",
   logout: "/api/v1/auth/logout"
+} as const;
+
+export const bootstrapApiPaths = {
+  status: "/api/v1/bootstrap/status",
+  initialAdmin: "/api/v1/bootstrap/initial-admin"
 } as const;
 
 export const metadataApiPaths = {
@@ -41,6 +50,9 @@ export type MetadataApiFailureReason = "api-unconfigured" | "api-rejected" | "ap
 export type MetadataApiResult<Data> =
   | { kind: "ready"; data: Data; requestId: string }
   | { kind: "error"; reason: MetadataApiFailureReason; status?: number };
+
+export type BootstrapApiResult = MetadataApiResult<BootstrapStatus>;
+export type InitialAdminApiResult = MetadataApiResult<AuthResponse>;
 
 export type DashboardMetadata = {
   agents: Agent[];
@@ -92,6 +104,13 @@ export function createAuthApiRequest(options: AuthApiRequestOptions): RequestIni
   };
 }
 
+export function createInitialAdminApiRequest(input: BootstrapInitialAdminRequest): RequestInit {
+  return createAuthApiRequest({
+    method: "POST",
+    body: bootstrapInitialAdminRequestSchema.parse(input)
+  });
+}
+
 export async function fetchMetadataEnvelope<Data>(options: MetadataApiFetchOptions): Promise<MetadataApiResult<Data>> {
   if (!options.apiBaseUrl) {
     return { kind: "error", reason: "api-unconfigured" };
@@ -114,6 +133,51 @@ export async function fetchMetadataEnvelope<Data>(options: MetadataApiFetchOptio
 
     return { kind: "ready", data: envelope.data.data as Data, requestId: envelope.data.requestId };
   } catch {
+    return { kind: "error", reason: "api-unreachable" };
+  }
+}
+
+export function parseApiEnvelope<Data>(payload: unknown, schema: z.ZodType<Data>): MetadataApiResult<Data> {
+  const envelope = responseEnvelopeSchema(schema).safeParse(payload) as
+    | { success: false }
+    | { success: true; data: { data: Data | null; requestId: string } };
+  if (!envelope.success) {
+    return { kind: "error", reason: "invalid-payload" };
+  }
+
+  const data = envelope.data.data as Data | null;
+  if (!data) {
+    return { kind: "error", reason: "invalid-payload" };
+  }
+
+  return { kind: "ready", data, requestId: envelope.data.requestId };
+}
+
+export async function loadBootstrapStatus(options: LoadAuthSessionOptions): Promise<BootstrapApiResult> {
+  return fetchMetadataEnvelope<BootstrapStatus>({
+    ...options,
+    path: bootstrapApiPaths.status,
+    schema: bootstrapStatusSchema
+  });
+}
+
+export async function createInitialAdmin(options: LoadAuthSessionOptions & { input: BootstrapInitialAdminRequest }): Promise<InitialAdminApiResult> {
+  if (!options.apiBaseUrl) {
+    return { kind: "error", reason: "api-unconfigured" };
+  }
+
+  try {
+    const response = await (options.fetchImpl ?? fetch)(createAuthApiUrl(bootstrapApiPaths.initialAdmin, options.apiBaseUrl), createInitialAdminApiRequest(options.input));
+    if (!response.ok) {
+      return { kind: "error", reason: "api-rejected", status: response.status };
+    }
+
+    return parseApiEnvelope(await response.json(), authResponseSchema);
+  } catch (error) {
+    if (error instanceof z.ZodError) {
+      return { kind: "error", reason: "invalid-payload" };
+    }
+
     return { kind: "error", reason: "api-unreachable" };
   }
 }

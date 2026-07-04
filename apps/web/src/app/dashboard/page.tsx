@@ -11,13 +11,15 @@ export default async function DashboardPage() {
   const auth = await loadRequestAuthSession();
 
   if (auth.kind !== "authenticated") {
-    return <main className="shell"><section className="banner stack"><h1>Sign in required</h1><p className="muted">The dashboard needs a valid API session before platform metadata can be loaded.</p><Link className="button" href="/">Return to sign in</Link></section></main>;
+    return <main className="shell"><section className="banner stack" aria-labelledby="dashboard-title"><h1 id="dashboard-title">Sign in required</h1><p className="muted">The dashboard needs a valid local API session before metadata can be loaded. Complete first-admin setup if prompted, then sign in.</p><Link className="button" href="/">Return to sign in</Link></section></main>;
   }
+
+  const loadingCopy = "Loading authenticated local metadata from the API. This check does not start Docker, VPS, Dokploy, Traefik, ACME, DNS, domain, or deployment work.";
 
   const metadata = await loadRequestDashboardMetadata();
 
   if (metadata.kind === "error") {
-    return <main className="shell"><section className="banner stack"><h1>Unable to load platform data</h1><p className="muted">The API rejected or could not provide dashboard metadata. Reason: {metadata.reason}.</p><Link className="button" href="/dashboard">Retry dashboard</Link></section></main>;
+    return <main className="shell"><section className="banner stack" aria-labelledby="dashboard-title"><span className="pill">Local metadata</span><h1 id="dashboard-title">Unable to load platform data</h1><p className="alert-message" role="alert">The API rejected or could not provide dashboard metadata. Reason: {metadata.reason}.</p><p className="muted">Retry after the local API is running and the session is valid. Do not start Docker, VPS, Dokploy, Traefik, ACME, DNS, domain, or deployment work for this state.</p><Link className="button" href="/dashboard">Retry dashboard</Link></section></main>;
   }
 
   const { agents, deployments, projects } = metadata.data;
@@ -35,7 +37,8 @@ export default async function DashboardPage() {
         <section className="banner stack" aria-labelledby="dashboard-title">
           <span className="pill">cookie-session</span>
           <h1 id="dashboard-title">No platform metadata yet</h1>
-          <p className="muted">Signed in as {auth.user.email}. Create projects, agents, or deployments through the API before dashboard data appears.</p>
+          <p className="muted">Signed in as {auth.user.email}. Create local projects, agents, or deployment records through the existing authenticated API paths before dashboard data appears.</p>
+          <p className="status-message" role="status">Deployment execution, VPS, Dokploy, Docker socket, Traefik, ACME, DNS, and domain work are intentionally out of scope for this local MVP screen.</p>
         </section>
       </main>
     );
@@ -54,6 +57,7 @@ export default async function DashboardPage() {
         <span className="pill">cookie-session</span>
         <h1 id="dashboard-title">Platform status</h1>
         <p className="muted">Signed in as {auth.user.email}. Request {metadata.requestId}. Data is loaded from authenticated API metadata endpoints.</p>
+        <p className="status-message" role="status">{loadingCopy}</p>
       </section>
       <section className="grid" aria-label="Server status summary">
         <article className="card"><h2>Agent</h2><p>{agent?.name ?? "No agent"}</p><p className="muted">Status: {agent?.status ?? "empty"}</p></article>
