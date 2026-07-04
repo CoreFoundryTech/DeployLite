@@ -41,10 +41,14 @@ a { color: inherit; }
 
 .grid { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 16px; }
 .stack { display: grid; gap: 16px; }
+.field { display: grid; gap: 6px; }
+.field input { border: 1px solid var(--border); background: var(--surface); color: var(--text); padding: 10px 12px; font: inherit; }
 .card, .banner { padding: 20px; }
 .muted { color: var(--muted); }
 .pill { display: inline-flex; border: 1px solid var(--border); padding: 4px 8px; font-size: 12px; text-transform: uppercase; letter-spacing: .08em; }
-.button { display: inline-flex; background: var(--accent); color: white; padding: 10px 14px; text-decoration: none; }
+.button { display: inline-flex; border: 0; background: var(--accent); color: white; padding: 10px 14px; text-decoration: none; font: inherit; }
+.nav-actions { display: flex; gap: 14px; align-items: center; }
+.link-button { border: 0; padding: 0; background: transparent; color: inherit; text-decoration: underline; font: inherit; }
 .danger { color: var(--danger); }
 .log { margin: 0; overflow: auto; white-space: pre-wrap; font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 13px; }
 
