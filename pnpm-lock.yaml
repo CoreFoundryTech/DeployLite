@@ -63,6 +63,9 @@ importers:
 
   apps/mcp:
     dependencies:
+      '@deploylite/config':
+        specifier: workspace:*
+        version: link:../../packages/config
       '@deploylite/contracts':
         specifier: workspace:*
         version: link:../../packages/contracts
