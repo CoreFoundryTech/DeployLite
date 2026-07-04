@@ -1,9 +1,19 @@
 import Link from "next/link";
-import { createMockPlatformSnapshot } from "../../../lib/scaffold-shell";
+import { createMockPlatformSnapshot, resolveDashboardShell } from "../../../lib/scaffold-shell";
+import { loadRequestAuthSession } from "../../../lib/server-auth";
+
+export const dynamic = "force-dynamic";
 
 export default async function DeploymentLogsPage({ params }: { params: Promise<{ deploymentId: string }> }) {
   const { deploymentId } = await params;
-  const snapshot = createMockPlatformSnapshot();
+  const auth = await loadRequestAuthSession();
+  const snapshot = createMockPlatformSnapshot({ session: auth.kind === "authenticated" ? auth.user : null });
+  const state = resolveDashboardShell(snapshot);
+
+  if (state.kind !== "ready") {
+    return <main className="shell"><section className="banner stack"><h1>{state.title}</h1><p className="muted">{state.description}</p><Link className="button" href="/">Return to sign in</Link></section></main>;
+  }
+
   const { logView } = snapshot;
 
   return (

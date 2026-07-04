@@ -1,4 +1,4 @@
-import type { Agent, Deployment, LogEvent, Project, ScaffoldUser } from "@deploylite/contracts";
+import type { Agent, Deployment, LogEvent, Project, SafeAuthUserDto } from "@deploylite/contracts";
 
 export type ConnectionState = "loading" | "ready" | "empty" | "disconnected";
 
@@ -10,14 +10,14 @@ export type DeploymentLogView = {
 };
 
 export type PlatformSnapshot = {
-  session: ScaffoldUser | null;
+  session: SafeAuthUserDto | null;
   agents: Agent[];
   projects: Project[];
   deployments: Deployment[];
   logView: DeploymentLogView;
   state: ConnectionState;
   requestId: string;
-  authMode: "scaffold-only";
+  authMode: "cookie-session";
 };
 
 export type DashboardShellState =
@@ -27,7 +27,7 @@ export type DashboardShellState =
   | { kind: "disconnected"; title: string; description: string; lastEventId: number | null }
   | { kind: "ready"; snapshot: PlatformSnapshot };
 
-export const scaffoldSession: ScaffoldUser = {
+export const scaffoldSession: SafeAuthUserDto = {
   id: "scaffold-user",
   email: "operator@example.test",
   role: "operator",
@@ -107,7 +107,7 @@ export function createMockPlatformSnapshot(overrides: Partial<PlatformSnapshot> 
     logView,
     state: "ready",
     requestId: "web_mock_req_1",
-    authMode: "scaffold-only",
+    authMode: "cookie-session",
     ...overrides
   };
 }
@@ -116,13 +116,13 @@ export function resolveDashboardShell(snapshot: PlatformSnapshot): DashboardShel
   if (!snapshot.session) {
     return {
       kind: "blocked",
-      title: "Scaffold sign-in required",
-      description: "This boundary only models protected access. It is not production authentication."
+      title: "Sign in required",
+      description: "This shell requires the cookie-backed API session from /auth/me. It is still an MVP boundary, not a production auth claim."
     };
   }
 
   if (snapshot.state === "loading") {
-    return { kind: "loading", title: "Loading platform status", description: "Fetching the mock control-plane status." };
+    return { kind: "loading", title: "Loading platform status", description: "Fetching the mock control-plane status after session validation." };
   }
 
   if (snapshot.state === "disconnected") {
