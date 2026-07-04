@@ -1,6 +1,7 @@
-import { createAuditLogRecord, createCorrelationContext, createRequestId } from "@deploylite/config";
+import { createAuditLogRecord, createCorrelationContext, createRequestId, parseDeployLiteEnv } from "@deploylite/config";
 import {
   agentRegistrationSchema,
+  authLoginRequestSchema,
   deploymentSchema,
   projectSchema,
   resourceSnapshotSchema,
@@ -8,20 +9,41 @@ import {
   type Deployment,
   type Project
 } from "@deploylite/contracts";
-import { AgentStatusService, InMemoryAgentRepository, InMemoryDeploymentRepository } from "@deploylite/domain";
+import { BcryptPasswordHasher, createOpaqueSessionToken, hashSessionToken } from "@deploylite/db";
+import {
+  AgentStatusService,
+  authenticateLocalUser,
+  InMemoryAgentRepository,
+  InMemoryDeploymentRepository,
+  toSafeAuthUser,
+  type AuditEvent,
+  type AuditEventInput,
+  type AuditRepository,
+  type AuthSession,
+  type AuthUser,
+  type AuthUserRepository,
+  type CanonicalRoleName,
+  type CreateInitialAdminInput,
+  type CreateSessionInput,
+  type PasswordHasher,
+  type SafeAuthUser,
+  type SessionRepository
+} from "@deploylite/domain";
 import Fastify, { type FastifyInstance, type FastifyReply, type FastifyRequest } from "fastify";
 import { z } from "zod";
 
 declare module "fastify" {
   interface FastifyRequest {
     correlationContext: { requestId: string; correlationId: string };
+    auth?: AuthContext;
   }
 }
 
 const API_PREFIX = "/api/v1";
 const AUTH_HEADER = "x-scaffold-auth";
 const SCAFFOLD_ACTOR = "scaffold-user";
-const protectedAuthMessage = "Scaffold-only auth required; this is not production authentication.";
+const defaultSessionCookieName = "deploylite_session";
+const authRequiredMessage = "Authentication required.";
 
 type ApiEnvelope<Data> = {
   data: Data | null;
@@ -42,6 +64,132 @@ class InMemoryProjectRepository {
   }
 }
 
+type AuthContext = {
+  user: SafeAuthUser;
+  session: AuthSession;
+};
+
+type AuthConfig = {
+  cookieName: string;
+  cookieSecure: boolean;
+  sessionTtlSeconds: number;
+};
+
+type AuthAdapters = {
+  audit: AuditRepository;
+  hasher: PasswordHasher;
+  sessions: SessionRepository;
+  users: AuthUserRepository;
+};
+
+type BuildApiAppOptions = {
+  auth?: Partial<AuthAdapters>;
+  authConfig?: Partial<AuthConfig>;
+};
+
+class InMemoryAuthUserRepository implements AuthUserRepository {
+  readonly #users = new Map<string, AuthUser>();
+
+  constructor(seed: AuthUser[] = []) {
+    for (const user of seed) {
+      this.#users.set(user.id, structuredClone(user));
+    }
+  }
+
+  async findByEmail(email: string): Promise<AuthUser | null> {
+    const normalized = normalizeEmail(email);
+    return [...this.#users.values()].find((user) => user.emailNormalized === normalized) ?? null;
+  }
+
+  async findById(id: string): Promise<AuthUser | null> {
+    return this.#users.get(id) ?? null;
+  }
+
+  async createInitialAdmin(input: CreateInitialAdminInput): Promise<AuthUser> {
+    if (this.#users.size > 0) {
+      throw new Error("Initial admin already exists");
+    }
+    const now = new Date();
+    const user: AuthUser = {
+      id: `user_${createRequestId()}`,
+      email: input.email,
+      emailNormalized: normalizeEmail(input.email),
+      passwordHash: input.passwordHash,
+      role: "admin",
+      status: "active",
+      createdAt: now,
+      updatedAt: now
+    };
+    this.#users.set(user.id, structuredClone(user));
+    return user;
+  }
+}
+
+class InMemorySessionRepository implements SessionRepository {
+  readonly #sessions = new Map<string, AuthSession>();
+
+  async create(input: CreateSessionInput): Promise<AuthSession> {
+    const now = new Date();
+    const session: AuthSession = {
+      id: `session_${createRequestId()}`,
+      userId: input.userId,
+      tokenHash: input.tokenHash,
+      expiresAt: input.expiresAt,
+      revokedAt: null,
+      ipHash: input.ipHash ?? null,
+      userAgent: input.userAgent ?? null,
+      createdAt: now,
+      lastSeenAt: now
+    };
+    this.#sessions.set(session.id, structuredClone(session));
+    return session;
+  }
+
+  async findValidByTokenHash(tokenHash: string, now = new Date()): Promise<AuthSession | null> {
+    return [...this.#sessions.values()].find((session) => session.tokenHash === tokenHash && session.revokedAt === null && session.expiresAt.getTime() > now.getTime()) ?? null;
+  }
+
+  async revoke(sessionId: string, now = new Date()): Promise<AuthSession | null> {
+    const session = this.#sessions.get(sessionId);
+    if (!session) {
+      return null;
+    }
+    const revoked = { ...session, revokedAt: now };
+    this.#sessions.set(sessionId, revoked);
+    return revoked;
+  }
+}
+
+class InMemoryAuditRepository implements AuditRepository {
+  readonly events: AuditEvent[] = [];
+  readonly inputs: AuditEventInput[] = [];
+
+  async append(input: AuditEventInput): Promise<AuditEvent> {
+    const safe = createAuditLogRecord({
+      actorId: input.actorUserId ?? "system",
+      action: input.action,
+      targetType: input.targetType,
+      targetId: input.targetId,
+      requestId: input.requestId,
+      correlationId: input.correlationId,
+      metadata: input.metadata
+    });
+    const event: AuditEvent = {
+      id: `audit_${createRequestId()}`,
+      actorId: safe.actorId,
+      action: safe.action,
+      targetType: safe.targetType,
+      targetId: safe.targetId,
+      requestId: safe.requestId,
+      correlationId: safe.correlationId,
+      timestamp: safe.timestamp
+    };
+    this.inputs.push({ ...input, metadata: safe.metadata });
+    this.events.push(event);
+    return event;
+  }
+}
+
 function ok<Data>(request: FastifyRequest, data: Data): ApiEnvelope<Data> {
   return { data, error: null, requestId: request.correlationContext.requestId };
 }
@@ -59,10 +207,79 @@ function getHeaderValue(request: FastifyRequest, name: string): string | undefin
   return Array.isArray(value) ? value[0] : value;
 }
 
-async function requireScaffoldAuth(request: FastifyRequest, reply: FastifyReply): Promise<void> {
-  if (getHeaderValue(request, AUTH_HEADER) !== "scaffold-dev") {
-    void reply.code(401).send(errorEnvelope(request, "UNAUTHENTICATED", protectedAuthMessage));
+function normalizeEmail(email: string): string {
+  return email.trim().toLowerCase();
+}
+
+function toSafeAuthDto(user: SafeAuthUser) {
+  return { id: user.id, email: user.email, role: user.role, status: user.status };
+}
+
+function parseCookies(header: string | undefined): Record<string, string> {
+  if (!header) {
+    return {};
   }
+  return Object.fromEntries(
+    header
+      .split(";")
+      .map((part) => part.trim().split("="))
+      .filter(([name, value]) => name && value)
+      .map(([name, value]) => [name, decodeURIComponent(value ?? "")])
+  );
+}
+
+function sessionCookie(config: AuthConfig, token: string, maxAge: number): string {
+  const secure = config.cookieSecure ? "; Secure" : "";
+  return `${config.cookieName}=${encodeURIComponent(token)}; Max-Age=${maxAge}; Path=/; HttpOnly; SameSite=Lax${secure}`;
+}
+
+async function appendAudit(audit: AuditRepository, request: FastifyRequest, input: Omit<AuditEventInput, "requestId" | "correlationId">): Promise<AuditEvent> {
+  return audit.append({ ...input, ...request.correlationContext });
+}
+
+function createAuthPreHandler(adapters: AuthAdapters, config: AuthConfig) {
+  return async function requireAuth(request: FastifyRequest, reply: FastifyReply): Promise<void> {
+    const token = parseCookies(getHeaderValue(request, "cookie"))[config.cookieName];
+    if (!token) {
+      await appendAudit(adapters.audit, request, { action: "protected.denied", targetType: "route", targetId: request.url, metadata: { reason: "missing-session" } });
+      void reply.code(401).send(errorEnvelope(request, "UNAUTHENTICATED", authRequiredMessage));
+      return;
+    }
+
+    const session = await adapters.sessions.findValidByTokenHash(hashSessionToken(token));
+    const user = session ? await adapters.users.findById(session.userId) : null;
+    if (!session || !user || user.status !== "active") {
+      await appendAudit(adapters.audit, request, {
+        actorUserId: user?.id ?? null,
+        action: "protected.denied",
+        targetType: "route",
+        targetId: request.url,
+        metadata: { reason: !session ? "invalid-session" : "disabled-user" }
+      });
+      void reply.code(401).send(errorEnvelope(request, "UNAUTHENTICATED", authRequiredMessage));
+      return;
+    }
+
+    request.auth = { user: toSafeAuthUser(user), session };
+  };
+}
+
+function createRolePreHandler(adapters: AuthAdapters, roles: readonly CanonicalRoleName[]) {
+  return async function requireRole(request: FastifyRequest, reply: FastifyReply): Promise<void> {
+    if (!request.auth) {
+      return;
+    }
+    if (!roles.includes(request.auth.user.role)) {
+      await appendAudit(adapters.audit, request, {
+        actorUserId: request.auth.user.id,
+        action: "protected.denied",
+        targetType: "route",
+        targetId: request.url,
+        metadata: { reason: "insufficient-role", role: request.auth.user.role, allowedRoles: [...roles] }
+      });
+      void reply.code(403).send(errorEnvelope(request, "FORBIDDEN", "Insufficient role for this action."));
+    }
+  };
 }
 
 function createApiState() {
@@ -129,7 +346,7 @@ function parseBody<T>(schema: z.ZodType<T>, body: unknown): T {
 }
 
 function auditMutation(request: FastifyRequest, action: string, targetType: string, targetId: string) {
-  return createAuditLogRecord({ actorId: SCAFFOLD_ACTOR, action, targetType, targetId, ...request.correlationContext });
+  return createAuditLogRecord({ actorId: request.auth?.user.id ?? SCAFFOLD_ACTOR, action, targetType, targetId, ...request.correlationContext });
 }
 
 function registerCoreHooks(app: FastifyInstance): void {
@@ -150,42 +367,58 @@ function registerCoreHooks(app: FastifyInstance): void {
   });
 }
 
-function registerRoutes(app: FastifyInstance, state: ApiState): void {
-  app.get(`${API_PREFIX}/health`, async (request) => ok(request, { status: "ok", service: "deploylite-api", auth: "scaffold-only" }));
-  app.post(`${API_PREFIX}/auth/login`, async (request) =>
-    ok(request, { actorId: SCAFFOLD_ACTOR, mode: "scaffold-only", message: "Use x-scaffold-auth: scaffold-dev for protected mock routes. Not production auth." })
-  );
-  app.get(`${API_PREFIX}/auth/me`, { preHandler: requireScaffoldAuth }, async (request) =>
-    ok(request, { id: SCAFFOLD_ACTOR, email: "operator@example.test", role: "owner", status: "active" })
-  );
-  app.post(`${API_PREFIX}/agents/register`, { preHandler: requireScaffoldAuth }, async (request) => {
+function registerRoutes(app: FastifyInstance, state: ApiState, adapters: AuthAdapters, authConfig: AuthConfig): void {
+  const requireAuth = createAuthPreHandler(adapters, authConfig);
+  const requireMutationRole = createRolePreHandler(adapters, ["admin", "operator"]);
+
+  app.get(`${API_PREFIX}/health`, async (request) => ok(request, { status: "ok", service: "deploylite-api", auth: "cookie-session" }));
+  app.post(`${API_PREFIX}/auth/login`, async (request, reply) => {
+    const body = parseBody(authLoginRequestSchema, request.body);
+    const user = await authenticateLocalUser(adapters.users, adapters.hasher, body.email, body.password);
+    if (!user) {
+      await appendAudit(adapters.audit, request, { action: "auth.login.failed", targetType: "user", targetId: normalizeEmail(body.email), metadata: { email: normalizeEmail(body.email), password: body.password } });
+      return reply.code(401).send(errorEnvelope(request, "UNAUTHENTICATED", "Invalid email or password."));
+    }
+
+    const token = createOpaqueSessionToken(authConfig.sessionTtlSeconds);
+    const session = await adapters.sessions.create({ userId: user.id, tokenHash: token.tokenHash, expiresAt: token.expiresAt, userAgent: getHeaderValue(request, "user-agent") ?? null });
+    await appendAudit(adapters.audit, request, { actorUserId: user.id, action: "auth.login.succeeded", targetType: "session", targetId: session.id, metadata: { role: user.role } });
+    return reply.header("set-cookie", sessionCookie(authConfig, token.token, authConfig.sessionTtlSeconds)).send(ok(request, { user: toSafeAuthDto(user) }));
+  });
+  app.get(`${API_PREFIX}/auth/me`, { preHandler: requireAuth }, async (request) => ok(request, { user: toSafeAuthDto(request.auth!.user) }));
+  app.post(`${API_PREFIX}/auth/logout`, { preHandler: requireAuth }, async (request, reply) => {
+    await adapters.sessions.revoke(request.auth!.session.id);
+    await appendAudit(adapters.audit, request, { actorUserId: request.auth!.user.id, action: "auth.logout", targetType: "session", targetId: request.auth!.session.id });
+    return reply.header("set-cookie", sessionCookie(authConfig, "", 0)).send(ok(request, { loggedOut: true }));
+  });
+  app.post(`${API_PREFIX}/agents/register`, { preHandler: [requireAuth, requireMutationRole] }, async (request) => {
     const body = parseBody(agentRegistrationSchema, request.body);
     const agent: Agent = { id: `agent_${createRequestId()}`, name: body.name, endpoint: body.endpoint, status: "offline", lastHeartbeatAt: null, resourceSnapshot: null };
     await state.agents.save(agent);
     return ok(request, { agent, audit: auditMutation(request, "agent.register", "agent", agent.id) });
   });
-  app.post(`${API_PREFIX}/agents/:agentId/heartbeat`, { preHandler: requireScaffoldAuth }, async (request) => {
+  app.post(`${API_PREFIX}/agents/:agentId/heartbeat`, { preHandler: [requireAuth, requireMutationRole] }, async (request) => {
     const params = z.object({ agentId: z.string().min(1) }).parse(request.params);
     const body = z.object({ observedAt: z.string().datetime({ offset: true }), resourceSnapshot: resourceSnapshotSchema }).parse(request.body);
     const agent = await state.agentStatus.recordHeartbeat({ agentId: params.agentId, observedAt: body.observedAt, resourceSnapshot: body.resourceSnapshot, ...request.correlationContext });
     return ok(request, { agent, audit: auditMutation(request, "agent.heartbeat", "agent", agent.id) });
   });
-  app.get(`${API_PREFIX}/agents`, { preHandler: requireScaffoldAuth }, async (request) => {
+  app.get(`${API_PREFIX}/agents`, { preHandler: requireAuth }, async (request) => {
     const agents = (await state.agents.list()).map((agent) => state.agentStatus.markStale(agent));
     return ok(request, { agents });
   });
-  app.get(`${API_PREFIX}/projects`, { preHandler: requireScaffoldAuth }, async (request) => ok(request, { projects: await state.projects.list() }));
-  app.post(`${API_PREFIX}/projects`, { preHandler: requireScaffoldAuth }, async (request) => {
+  app.get(`${API_PREFIX}/projects`, { preHandler: requireAuth }, async (request) => ok(request, { projects: await state.projects.list() }));
+  app.post(`${API_PREFIX}/projects`, { preHandler: [requireAuth, requireMutationRole] }, async (request) => {
     const body = parseBody(projectSchema.omit({ id: true }), request.body);
     const project = await state.projects.save({ id: `project_${createRequestId()}`, ...body });
     return ok(request, { project, audit: auditMutation(request, "project.create", "project", project.id) });
   });
-  app.get(`${API_PREFIX}/deployments/:deploymentId`, { preHandler: requireScaffoldAuth }, async (request, reply) => {
+  app.get(`${API_PREFIX}/deployments/:deploymentId`, { preHandler: requireAuth }, async (request, reply) => {
     const params = z.object({ deploymentId: z.string().min(1) }).parse(request.params);
     const deployment = await state.deployments.findById(params.deploymentId);
     return deployment ? ok(request, { deployment }) : reply.code(404).send(errorEnvelope(request, "NOT_FOUND", "Deployment not found."));
   });
-  app.get(`${API_PREFIX}/deployments/:deploymentId/logs/stream`, { preHandler: requireScaffoldAuth }, async (request, reply) => {
+  app.get(`${API_PREFIX}/deployments/:deploymentId/logs/stream`, { preHandler: requireAuth }, async (request, reply) => {
     const params = z.object({ deploymentId: z.string().min(1) }).parse(request.params);
     const lastEventId = Number.parseInt(getHeaderValue(request, "last-event-id") ?? "-1", 10);
     const logs = await state.deployments.listLogs(params.deploymentId, Number.isFinite(lastEventId) ? lastEventId : -1);
@@ -194,7 +427,7 @@ function registerRoutes(app: FastifyInstance, state: ApiState): void {
       .join("\n");
     return reply.header("content-type", "text/event-stream; charset=utf-8").header("cache-control", "no-cache").send(body.length > 0 ? `${body}\n` : "");
   });
-  app.post(`${API_PREFIX}/deployments`, { preHandler: requireScaffoldAuth }, async (request) => {
+  app.post(`${API_PREFIX}/deployments`, { preHandler: [requireAuth, requireMutationRole] }, async (request) => {
     const body = parseBody(deploymentSchema.omit({ id: true, startedAt: true, finishedAt: true }), request.body);
     const deployment: Deployment = { id: `dep_${createRequestId()}`, startedAt: new Date().toISOString(), finishedAt: null, ...body };
     await state.deployments.save(deployment);
@@ -202,13 +435,40 @@ function registerRoutes(app: FastifyInstance, state: ApiState): void {
   });
 }
 
-export async function buildApiApp(): Promise<FastifyInstance> {
+export async function buildApiApp(options: BuildApiAppOptions = {}): Promise<FastifyInstance> {
+  const env = parseDeployLiteEnv(process.env);
   const app = Fastify({ logger: false });
   const state = createApiState();
+  const defaultAudit = new InMemoryAuditRepository();
+  const authConfig: AuthConfig = {
+    cookieName: env.DEPLOYLITE_SESSION_COOKIE_NAME ?? defaultSessionCookieName,
+    cookieSecure: env.DEPLOYLITE_SESSION_COOKIE_SECURE ?? env.NODE_ENV === "production",
+    sessionTtlSeconds: env.DEPLOYLITE_SESSION_TTL_SECONDS,
+    ...options.authConfig
+  };
+  const adminHash = await new BcryptPasswordHasher(env.DEPLOYLITE_BCRYPT_COST).hash("deploylite-admin-password");
+  const adapters: AuthAdapters = {
+    audit: defaultAudit,
+    hasher: new BcryptPasswordHasher(env.DEPLOYLITE_BCRYPT_COST),
+    sessions: new InMemorySessionRepository(),
+    users: new InMemoryAuthUserRepository([
+      {
+        id: "user_admin_1",
+        email: "admin@example.test",
+        emailNormalized: "admin@example.test",
+        passwordHash: adminHash,
+        role: "admin",
+        status: "active",
+        createdAt: new Date("2026-01-01T00:00:00.000Z"),
+        updatedAt: new Date("2026-01-01T00:00:00.000Z")
+      }
+    ]),
+    ...options.auth
+  };
   await seedMockData(state);
   registerCoreHooks(app);
-  registerRoutes(app, state);
+  registerRoutes(app, state, adapters, authConfig);
   return app;
 }
 
-export { API_PREFIX, AUTH_HEADER };
+export { API_PREFIX, AUTH_HEADER, InMemoryAuditRepository, InMemoryAuthUserRepository, InMemorySessionRepository, type BuildApiAppOptions };

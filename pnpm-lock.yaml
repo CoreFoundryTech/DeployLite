@@ -54,6 +54,9 @@ importers:
       '@deploylite/contracts':
         specifier: workspace:*
         version: link:../../packages/contracts
+      '@deploylite/db':
+        specifier: workspace:*
+        version: link:../../packages/db
       '@deploylite/domain':
         specifier: workspace:*
         version: link:../../packages/domain
