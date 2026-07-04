@@ -96,8 +96,16 @@ export type UserRepository = {
 export type AuthUserRepository = {
   findByEmail(email: string): Promise<AuthUser | null>;
   findById(id: string): Promise<AuthUser | null>;
+  count(): Promise<number>;
   createInitialAdmin(input: CreateInitialAdminInput): Promise<AuthUser>;
 };
+
+export class InitialAdminAlreadyExistsError extends Error {
+  constructor() {
+    super("Initial admin already exists");
+    this.name = "InitialAdminAlreadyExistsError";
+  }
+}
 
 export type RoleRepository = {
   findByName(name: CanonicalRoleName): Promise<AuthRole | null>;
@@ -145,6 +153,10 @@ export async function authenticateLocalUser(
 
   const passwordMatches = await hasher.verify(password, user.passwordHash);
   return passwordMatches ? toSafeAuthUser(user) : null;
+}
+
+export async function getBootstrapStatus(users: AuthUserRepository): Promise<{ setupRequired: boolean }> {
+  return { setupRequired: (await users.count()) === 0 };
 }
 
 const STALE_AFTER_MS = 60_000;

@@ -1,7 +1,8 @@
-import { createAuditLogRecord, createCorrelationContext, createRequestId, parseDeployLiteEnv } from "@deploylite/config";
+import { createAuditLogRecord, createCorrelationContext, createRequestId, parseDeployLiteEnv, type DeployLiteEnv } from "@deploylite/config";
 import {
   agentRegistrationSchema,
   authLoginRequestSchema,
+  bootstrapInitialAdminRequestSchema,
   deploymentSchema,
   projectSchema,
   resourceSnapshotSchema,
@@ -9,12 +10,14 @@ import {
   type Deployment,
   type Project
 } from "@deploylite/contracts";
-import { BcryptPasswordHasher, createOpaqueSessionToken, hashSessionToken } from "@deploylite/db";
+import { BcryptPasswordHasher, bootstrapInitialAdmin, closeDbPool, createDbClient, createDbPool, createOpaqueSessionToken, DbAuditRepository, DbAuthUserRepository, DbSessionRepository, hashSessionToken, type DeployLiteDb } from "@deploylite/db";
 import {
   AgentStatusService,
   authenticateLocalUser,
+  getBootstrapStatus,
   InMemoryAgentRepository,
   InMemoryDeploymentRepository,
+  InitialAdminAlreadyExistsError,
   toSafeAuthUser,
   type AuditEvent,
   type AuditEventInput,
@@ -82,9 +85,25 @@ type AuthAdapters = {
   users: AuthUserRepository;
 };
 
+type DbPool = Parameters<typeof closeDbPool>[0];
+
+type ApiRepositories = {
+  auth: AuthAdapters;
+  state: ApiState;
+  shouldSeedMockData: boolean;
+  close?: () => Promise<void>;
+};
+
 type BuildApiAppOptions = {
   auth?: Partial<AuthAdapters>;
   authConfig?: Partial<AuthConfig>;
+  db?: {
+    pool?: DbPool;
+    client?: DeployLiteDb;
+    createPool?: (connectionString: string) => DbPool;
+    closePool?: (pool: DbPool) => Promise<void>;
+  };
+  env?: NodeJS.ProcessEnv;
 };
 
 class InMemoryAuthUserRepository implements AuthUserRepository {
@@ -105,9 +124,13 @@ class InMemoryAuthUserRepository implements AuthUserRepository {
     return this.#users.get(id) ?? null;
   }
 
+  async count(): Promise<number> {
+    return this.#users.size;
+  }
+
   async createInitialAdmin(input: CreateInitialAdminInput): Promise<AuthUser> {
     if (this.#users.size > 0) {
-      throw new Error("Initial admin already exists");
+      throw new InitialAdminAlreadyExistsError();
     }
     const now = new Date();
     const user: AuthUser = {
@@ -292,6 +315,59 @@ function createApiState() {
 
 type ApiState = ReturnType<typeof createApiState>;
 
+async function createSeededInMemoryAuthAdapters(env: DeployLiteEnv): Promise<AuthAdapters> {
+  const hasher = new BcryptPasswordHasher(env.DEPLOYLITE_BCRYPT_COST);
+  const adminHash = await hasher.hash("deploylite-admin-password");
+  return {
+    audit: new InMemoryAuditRepository(),
+    hasher,
+    sessions: new InMemorySessionRepository(),
+    users: new InMemoryAuthUserRepository([
+      {
+        id: "user_admin_1",
+        email: "admin@example.test",
+        emailNormalized: "admin@example.test",
+        passwordHash: adminHash,
+        role: "admin",
+        status: "active",
+        createdAt: new Date("2026-01-01T00:00:00.000Z"),
+        updatedAt: new Date("2026-01-01T00:00:00.000Z")
+      }
+    ])
+  };
+}
+
+function createDbAuthAdapters(env: DeployLiteEnv, options: BuildApiAppOptions): ApiRepositories {
+  const pool = options.db?.pool ?? (options.db?.createPool ?? createDbPool)(env.DATABASE_URL!);
+  const db = options.db?.client ?? createDbClient(pool);
+  const closePool = options.db?.closePool ?? closeDbPool;
+
+  return {
+    auth: {
+      audit: new DbAuditRepository(db),
+      hasher: new BcryptPasswordHasher(env.DEPLOYLITE_BCRYPT_COST),
+      sessions: new DbSessionRepository(db),
+      users: new DbAuthUserRepository(db)
+    },
+    close: options.db?.pool ? undefined : () => closePool(pool),
+    shouldSeedMockData: false,
+    state: createApiState()
+  };
+}
+
+async function createRuntimeRepositories(env: DeployLiteEnv, options: BuildApiAppOptions = {}): Promise<ApiRepositories> {
+  if (env.DATABASE_URL) {
+    const repositories = createDbAuthAdapters(env, options);
+    return { ...repositories, auth: { ...repositories.auth, ...options.auth } };
+  }
+
+  return {
+    auth: { ...(await createSeededInMemoryAuthAdapters(env)), ...options.auth },
+    shouldSeedMockData: true,
+    state: createApiState()
+  };
+}
+
 async function seedMockData(state: ApiState): Promise<void> {
   const startedAt = "2026-01-01T00:00:00.000Z";
   await state.agents.save({
@@ -372,6 +448,23 @@ function registerRoutes(app: FastifyInstance, state: ApiState, adapters: AuthAda
   const requireMutationRole = createRolePreHandler(adapters, ["admin", "operator"]);
 
   app.get(`${API_PREFIX}/health`, async (request) => ok(request, { status: "ok", service: "deploylite-api", auth: "cookie-session" }));
+  app.get(`${API_PREFIX}/bootstrap/status`, async (request) => ok(request, await getBootstrapStatus(adapters.users)));
+  app.post(`${API_PREFIX}/bootstrap/initial-admin`, async (request, reply) => {
+    const parsed = bootstrapInitialAdminRequestSchema.safeParse(request.body);
+    if (!parsed.success) {
+      await appendAudit(adapters.audit, request, { action: "bootstrap.initial-admin.rejected", targetType: "user", targetId: "initial-admin", metadata: { reason: "invalid-input" } });
+      return reply.code(400).send(errorEnvelope(request, "VALIDATION_ERROR", "Request validation failed."));
+    }
+
+    const result = await bootstrapInitialAdmin(adapters.users, adapters.hasher, parsed.data);
+    if (!result.created || !result.user) {
+      await appendAudit(adapters.audit, request, { action: "bootstrap.initial-admin.rejected", targetType: "user", targetId: "initial-admin", metadata: { reason: "locked" } });
+      return reply.code(409).send(errorEnvelope(request, "BOOTSTRAP_LOCKED", "Initial admin setup is no longer available."));
+    }
+
+    await appendAudit(adapters.audit, request, { actorUserId: result.user.id, action: "bootstrap.initial-admin.created", targetType: "user", targetId: result.user.id });
+    return ok(request, { user: toSafeAuthDto(result.user) });
+  });
   app.post(`${API_PREFIX}/auth/login`, async (request, reply) => {
     const body = parseBody(authLoginRequestSchema, request.body);
     const user = await authenticateLocalUser(adapters.users, adapters.hasher, body.email, body.password);
@@ -436,39 +529,24 @@ function registerRoutes(app: FastifyInstance, state: ApiState, adapters: AuthAda
 }
 
 export async function buildApiApp(options: BuildApiAppOptions = {}): Promise<FastifyInstance> {
-  const env = parseDeployLiteEnv(process.env);
+  const env = parseDeployLiteEnv(options.env ?? process.env);
   const app = Fastify({ logger: false });
-  const state = createApiState();
-  const defaultAudit = new InMemoryAuditRepository();
   const authConfig: AuthConfig = {
     cookieName: env.DEPLOYLITE_SESSION_COOKIE_NAME ?? defaultSessionCookieName,
     cookieSecure: env.DEPLOYLITE_SESSION_COOKIE_SECURE ?? env.NODE_ENV === "production",
     sessionTtlSeconds: env.DEPLOYLITE_SESSION_TTL_SECONDS,
     ...options.authConfig
   };
-  const adminHash = await new BcryptPasswordHasher(env.DEPLOYLITE_BCRYPT_COST).hash("deploylite-admin-password");
-  const adapters: AuthAdapters = {
-    audit: defaultAudit,
-    hasher: new BcryptPasswordHasher(env.DEPLOYLITE_BCRYPT_COST),
-    sessions: new InMemorySessionRepository(),
-    users: new InMemoryAuthUserRepository([
-      {
-        id: "user_admin_1",
-        email: "admin@example.test",
-        emailNormalized: "admin@example.test",
-        passwordHash: adminHash,
-        role: "admin",
-        status: "active",
-        createdAt: new Date("2026-01-01T00:00:00.000Z"),
-        updatedAt: new Date("2026-01-01T00:00:00.000Z")
-      }
-    ]),
-    ...options.auth
-  };
-  await seedMockData(state);
+  const repositories = await createRuntimeRepositories(env, options);
+  if (repositories.close) {
+    app.addHook("onClose", repositories.close);
+  }
+  if (repositories.shouldSeedMockData) {
+    await seedMockData(repositories.state);
+  }
   registerCoreHooks(app);
-  registerRoutes(app, state, adapters, authConfig);
+  registerRoutes(app, repositories.state, repositories.auth, authConfig);
   return app;
 }
 
-export { API_PREFIX, AUTH_HEADER, InMemoryAuditRepository, InMemoryAuthUserRepository, InMemorySessionRepository, type BuildApiAppOptions };
+export { API_PREFIX, AUTH_HEADER, InMemoryAuditRepository, InMemoryAuthUserRepository, InMemorySessionRepository, createRuntimeRepositories, type ApiRepositories, type BuildApiAppOptions };

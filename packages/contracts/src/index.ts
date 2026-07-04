@@ -25,6 +25,15 @@ export const authLoginRequestSchema = z.object({
   password: z.string().min(1)
 });
 
+export const bootstrapStatusSchema = z.object({
+  setupRequired: z.boolean()
+});
+
+export const bootstrapInitialAdminRequestSchema = z.object({
+  email: z.string().email(),
+  password: z.string().min(12)
+});
+
 export const canonicalRoleSchema = z.enum(["admin", "operator", "read-only", "auditor"]);
 
 export const safeAuthUserSchema = z.object({
@@ -119,3 +128,5 @@ export type ScaffoldUser = z.infer<typeof scaffoldUserSchema>;
 export type CanonicalRole = z.infer<typeof canonicalRoleSchema>;
 export type SafeAuthUserDto = z.infer<typeof safeAuthUserSchema>;
 export type AuthResponse = z.infer<typeof authResponseSchema>;
+export type BootstrapStatus = z.infer<typeof bootstrapStatusSchema>;
+export type BootstrapInitialAdminRequest = z.infer<typeof bootstrapInitialAdminRequestSchema>;
