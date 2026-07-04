@@ -15,7 +15,8 @@
     "test": "vitest run --config vitest.config.ts",
     "db:generate": "drizzle-kit generate --config drizzle.config.ts",
     "db:migrate": "node scripts/migrate.mjs",
-    "db:check": "node scripts/check.mjs"
+    "db:check": "node scripts/check.mjs",
+    "db:verify:integration": "DEPLOYLITE_DB_INTEGRATION=1 vitest run --config vitest.config.ts src/postgres.integration.test.ts"
   },
   "dependencies": {
     "@deploylite/config": "workspace:*",
