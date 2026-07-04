@@ -1,5 +1,5 @@
 import { cookies } from "next/headers";
-import { getAuthApiBaseUrl, loadAuthSession, loadDashboardMetadata, loadDeploymentLogMetadata } from "./auth-boundary";
+import { getAuthApiBaseUrl, loadAuthSession, loadBootstrapStatus, loadDashboardMetadata, loadDeploymentLogMetadata } from "./auth-boundary";
 
 async function getRequestCookieHeader() {
   const cookieStore = await cookies();
@@ -13,6 +13,12 @@ export async function loadRequestAuthSession() {
   const cookieHeader = await getRequestCookieHeader();
 
   return loadAuthSession({ apiBaseUrl: getAuthApiBaseUrl() ?? undefined, cookieHeader });
+}
+
+export async function loadRequestBootstrapStatus() {
+  const cookieHeader = await getRequestCookieHeader();
+
+  return loadBootstrapStatus({ apiBaseUrl: getAuthApiBaseUrl() ?? undefined, cookieHeader });
 }
 
 export async function loadRequestDashboardMetadata() {

@@ -1,8 +1,11 @@
 import { renderToStaticMarkup } from "react-dom/server";
+import React from "react";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { cookies } from "next/headers";
+import { InitialAdminSetupPanel, submitInitialAdminSetup } from "./auth-controls.js";
 import DashboardPage from "./dashboard/page.js";
 import DeploymentLogsPage from "./deployments/[deploymentId]/page.js";
+import LoginPage from "./page.js";
 
 vi.mock("next/headers", () => ({
   cookies: vi.fn()
@@ -13,6 +16,132 @@ vi.mock("next/navigation", () => ({
 }));
 
 const apiBaseUrl = "https://api.example.test";
+
+describe("local first-admin login rendering", () => {
+  afterEach(() => {
+    vi.restoreAllMocks();
+    vi.unstubAllGlobals();
+    delete process.env.DEPLOYLITE_WEB_API_BASE_URL;
+  });
+
+  it("renders setup-required guidance before normal sign in", async () => {
+    mockCookies();
+    process.env.DEPLOYLITE_WEB_API_BASE_URL = apiBaseUrl;
+    mockFetch({
+      "/api/v1/bootstrap/status": { data: { setupRequired: true }, error: null, requestId: "req_bootstrap_1" }
+    });
+
+    const html = renderToStaticMarkup(await LoginPage());
+
+    expect(html).toContain("Create the first local admin");
+    expect(html).toContain("Normal sign-in stays unavailable until setup creates the first local admin");
+    expect(html).toContain("Create first admin");
+    expect(html).not.toContain("Sign in with API cookie");
+    expect(html).not.toContain("very-secret-admin-password");
+  });
+
+  it("renders setup-complete sign-in guidance", async () => {
+    mockCookies();
+    process.env.DEPLOYLITE_WEB_API_BASE_URL = apiBaseUrl;
+    mockFetch({
+      "/api/v1/bootstrap/status": { data: { setupRequired: false }, error: null, requestId: "req_bootstrap_1" }
+    });
+
+    const html = renderToStaticMarkup(await LoginPage());
+
+    expect(html).toContain("Setup complete");
+    expect(html).toContain("Sign in with API cookie");
+    expect(html).not.toContain("Create first admin");
+  });
+
+  it("renders safe bootstrap API error guidance", async () => {
+    mockCookies();
+    process.env.DEPLOYLITE_WEB_API_BASE_URL = apiBaseUrl;
+    mockFetch({
+      "/api/v1/bootstrap/status": { data: null, error: { code: "FAIL", message: "Failed", correlationId: "req_fail" }, requestId: "req_fail", status: 503 }
+    });
+
+    const html = renderToStaticMarkup(await LoginPage());
+
+    expect(html).toContain("Bootstrap status unavailable");
+    expect(html).toContain("The local API rejected bootstrap status with status 503");
+    expect(html).not.toContain("very-secret-admin-password");
+  });
+
+  it("renders authenticated dashboard guidance when a session exists", async () => {
+    mockCookies("deploylite_session", "opaque");
+    process.env.DEPLOYLITE_WEB_API_BASE_URL = apiBaseUrl;
+    mockFetch({
+      "/api/v1/auth/me": { data: { user: userFixture }, error: null, requestId: "req_auth_1" },
+      "/api/v1/bootstrap/status": { data: { setupRequired: false }, error: null, requestId: "req_bootstrap_1" }
+    });
+
+    const html = renderToStaticMarkup(await LoginPage());
+
+    expect(html).toContain("Cookie session active");
+    expect(html).toContain("Open dashboard");
+  });
+});
+
+describe("initial admin setup client interactions", () => {
+  it("submits first-admin credentials and reports success without echoing the password", async () => {
+    const calls: Array<{ url: string; init?: RequestInit }> = [];
+    const result = await submitInitialAdminSetup({
+      apiBaseUrl,
+      email: "admin@example.test",
+      password: "very-secret-admin-password",
+      fetchImpl: async (url: string | URL | Request, init?: RequestInit) => {
+        calls.push({ url: String(url), init });
+        return new Response(JSON.stringify({ data: { user: userFixture }, error: null, requestId: "req_admin_1" }), { status: 200 });
+      }
+    });
+
+    expect(result).toEqual({ kind: "success", message: "First admin created. Sign in with the new local admin account." });
+    expect(new URL(calls[0]?.url ?? "").pathname).toBe("/api/v1/bootstrap/initial-admin");
+    expect(JSON.stringify(result)).not.toContain("very-secret-admin-password");
+  });
+
+  it("reports validation/rejection failures without rendering submitted passwords", async () => {
+    const result = await submitInitialAdminSetup({
+      apiBaseUrl,
+      email: "admin@example.test",
+      password: "very-secret-admin-password",
+      fetchImpl: async () => new Response(JSON.stringify({ data: null, error: { code: "VALIDATION_ERROR", message: "Invalid", correlationId: "req_invalid" }, requestId: "req_invalid" }), { status: 422 })
+    });
+
+    expect(result).toEqual({ kind: "rejected", error: "Initial admin setup failed. Use a valid email and a password with at least 12 characters." });
+    expect(JSON.stringify(result)).not.toContain("very-secret-admin-password");
+  });
+
+  it("reports locked setup submissions as sign-in guidance", async () => {
+    const result = await submitInitialAdminSetup({
+      apiBaseUrl,
+      email: "admin@example.test",
+      password: "very-secret-admin-password",
+      fetchImpl: async () => new Response(JSON.stringify({ data: null, error: { code: "BOOTSTRAP_LOCKED", message: "Locked", correlationId: "req_locked" }, requestId: "req_locked" }), { status: 409 })
+    });
+
+    expect(result).toEqual({ kind: "locked", error: "Initial admin setup is locked because an admin already exists. Sign in instead." });
+  });
+
+  it("renders pending controls as disabled with a discoverable status", () => {
+    const html = renderToStaticMarkup(React.createElement(InitialAdminSetupPanel, {
+      apiBaseUrl,
+      state: {
+        message: "Creating the first local admin account.",
+        error: "",
+        created: false,
+        pending: true
+      },
+      onSubmit: vi.fn()
+    }));
+
+    expect(html).toContain("Creating admin...");
+    expect(html).toContain("role=\"status\"");
+    expect(html).toContain("aria-live=\"polite\"");
+    expect(html).toContain("disabled=\"\"");
+  });
+});
 
 describe("dashboard real API rendering", () => {
   afterEach(() => {
@@ -53,6 +182,7 @@ describe("dashboard real API rendering", () => {
       "/api/v1/deployments": { data: { deployments: [] }, error: null, requestId: "req_deployments_1" }
     });
     expect(renderToStaticMarkup(await DashboardPage())).toContain("No platform metadata yet");
+    expect(renderToStaticMarkup(await DashboardPage())).toContain("intentionally out of scope");
 
     mockFetch({
       "/api/v1/auth/me": { data: { user: userFixture }, error: null, requestId: "req_auth_1" },
@@ -60,7 +190,10 @@ describe("dashboard real API rendering", () => {
       "/api/v1/agents": { data: { agents: [] }, error: null, requestId: "req_agents_1" },
       "/api/v1/deployments": { data: { deployments: [] }, error: null, requestId: "req_deployments_1" }
     });
-    expect(renderToStaticMarkup(await DashboardPage())).toContain("Unable to load platform data");
+    const errorHtml = renderToStaticMarkup(await DashboardPage());
+    expect(errorHtml).toContain("Unable to load platform data");
+    expect(errorHtml).not.toContain("suggest Docker");
+    expect(errorHtml).toContain("Do not start Docker, VPS, Dokploy, Traefik, ACME, DNS, domain, or deployment work");
   });
 });
 
