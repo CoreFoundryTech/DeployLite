@@ -1,4 +1,4 @@
-import { eq } from "drizzle-orm";
+import { asc, eq, isNotNull } from "drizzle-orm";
 import { redactLogMessage } from "@deploylite/config";
 import type { Agent, Deployment, LogEvent, Project } from "@deploylite/contracts";
 import type { AgentRepository, DeploymentRepository, ProjectRepository } from "@deploylite/domain";
@@ -69,6 +69,11 @@ export class DbProjectRepository implements ProjectRepository {
     const rows = await this.db.select().from(projects);
     return rows.map((row) => ({ id: row.id, name: row.name, repoUrl: row.repoUrl, defaultBranch: row.defaultBranch }));
   }
+
+  async findById(id: string): Promise<Project | null> {
+    const [row] = await this.db.select().from(projects).where(eq(projects.id, id)).limit(1);
+    return row ? { id: row.id, name: row.name, repoUrl: row.repoUrl, defaultBranch: row.defaultBranch } : null;
+  }
 }
 
 export class DbDeploymentRepository implements DeploymentRepository {
@@ -89,12 +94,19 @@ export class DbDeploymentRepository implements DeploymentRepository {
       .returning();
 
     if (!row) throw new Error("Failed to save deployment");
-    return toDeployment(row);
+    const saved = toDeployment(row);
+    if (!saved) throw new Error("Failed to save attached deployment");
+    return saved;
   }
 
   async findById(id: string): Promise<Deployment | null> {
     const [row] = await this.db.select().from(deployments).where(eq(deployments.id, id)).limit(1);
     return row ? toDeployment(row) : null;
+  }
+
+  async list(): Promise<Deployment[]> {
+    const rows = await this.db.select().from(deployments).where(isNotNull(deployments.agentId)).orderBy(asc(deployments.startedAt), asc(deployments.createdAt));
+    return rows.map(toDeployment).filter((deployment): deployment is Deployment => deployment !== null);
   }
 
   async appendLog(event: LogEvent): Promise<LogEvent> {
@@ -117,8 +129,8 @@ export class DbDeploymentRepository implements DeploymentRepository {
   }
 
   async listLogs(deploymentId: string, afterSequence = -1): Promise<LogEvent[]> {
-    const rows = await this.db.select().from(deploymentLogs).where(eq(deploymentLogs.deploymentId, deploymentId));
-    return rows.filter((row) => row.sequence > afterSequence).map(toLogEvent);
+    const rows = await this.db.select().from(deploymentLogs).where(eq(deploymentLogs.deploymentId, deploymentId)).orderBy(asc(deploymentLogs.sequence));
+    return toOrderedLogEvents(rows.filter((row) => row.sequence > afterSequence));
   }
 }
 
@@ -150,11 +162,15 @@ function toResourceSnapshot(value: Record<string, unknown> | null): Agent["resou
   return null;
 }
 
-function toDeployment(row: typeof deployments.$inferSelect): Deployment {
+export function toDeployment(row: typeof deployments.$inferSelect): Deployment | null {
+  if (!row.agentId) {
+    return null;
+  }
+
   return {
     id: row.id,
     projectId: row.projectId,
-    agentId: row.agentId ?? "",
+    agentId: row.agentId,
     status: row.status === "running" || row.status === "succeeded" || row.status === "failed" || row.status === "canceled" ? row.status : "queued",
     commitSha: row.commitSha,
     startedAt: row.startedAt?.toISOString() ?? row.createdAt.toISOString(),
@@ -162,7 +178,7 @@ function toDeployment(row: typeof deployments.$inferSelect): Deployment {
   };
 }
 
-function toLogEvent(row: typeof deploymentLogs.$inferSelect): LogEvent {
+export function toLogEvent(row: typeof deploymentLogs.$inferSelect): LogEvent {
   return {
     id: row.id,
     deploymentId: row.deploymentId,
@@ -174,4 +190,8 @@ function toLogEvent(row: typeof deploymentLogs.$inferSelect): LogEvent {
     requestId: row.requestId,
     correlationId: row.correlationId
   };
+}
+
+export function toOrderedLogEvents(rows: Array<typeof deploymentLogs.$inferSelect>): LogEvent[] {
+  return [...rows].sort((left, right) => left.sequence - right.sequence).map(toLogEvent);
 }

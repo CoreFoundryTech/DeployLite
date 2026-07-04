@@ -80,12 +80,14 @@ export type AgentRepository = {
 export type DeploymentRepository = {
   save(deployment: Deployment): Promise<Deployment>;
   findById(id: string): Promise<Deployment | null>;
+  list(): Promise<Deployment[]>;
   appendLog(event: LogEvent): Promise<LogEvent>;
   listLogs(deploymentId: string, afterSequence?: number): Promise<LogEvent[]>;
 };
 
 export type ProjectRepository = {
   save(project: Project): Promise<Project>;
+  findById(id: string): Promise<Project | null>;
   list(): Promise<Project[]>;
 };
 
@@ -221,6 +223,10 @@ export class InMemoryDeploymentRepository implements DeploymentRepository {
 
   async findById(id: string): Promise<Deployment | null> {
     return this.#deployments.get(id) ?? null;
+  }
+
+  async list(): Promise<Deployment[]> {
+    return [...this.#deployments.values()];
   }
 
   async appendLog(event: LogEvent): Promise<LogEvent> {

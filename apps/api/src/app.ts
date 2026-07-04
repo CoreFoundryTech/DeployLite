@@ -10,7 +10,7 @@ import {
   type Deployment,
   type Project
 } from "@deploylite/contracts";
-import { BcryptPasswordHasher, bootstrapInitialAdmin, closeDbPool, createDbClient, createDbPool, createOpaqueSessionToken, DbAuditRepository, DbAuthUserRepository, DbSessionRepository, hashSessionToken, type DeployLiteDb } from "@deploylite/db";
+import { BcryptPasswordHasher, bootstrapInitialAdmin, closeDbPool, createDbClient, createDbPool, createOpaqueSessionToken, DbAgentRepository, DbAuditRepository, DbAuthUserRepository, DbDeploymentRepository, DbProjectRepository, DbSessionRepository, hashSessionToken, type DeployLiteDb } from "@deploylite/db";
 import {
   AgentStatusService,
   authenticateLocalUser,
@@ -29,6 +29,9 @@ import {
   type CreateInitialAdminInput,
   type CreateSessionInput,
   type PasswordHasher,
+  type AgentRepository,
+  type DeploymentRepository,
+  type ProjectRepository,
   type SafeAuthUser,
   type SessionRepository
 } from "@deploylite/domain";
@@ -54,12 +57,16 @@ type ApiEnvelope<Data> = {
   requestId: string;
 };
 
-class InMemoryProjectRepository {
+class InMemoryProjectRepository implements ProjectRepository {
   readonly #projects = new Map<string, Project>();
 
   async save(project: Project): Promise<Project> {
     this.#projects.set(project.id, structuredClone(project));
     return project;
+  }
+
+  async findById(id: string): Promise<Project | null> {
+    return this.#projects.get(id) ?? null;
   }
 
   async list(): Promise<Project[]> {
@@ -89,7 +96,7 @@ type DbPool = Parameters<typeof closeDbPool>[0];
 
 type ApiRepositories = {
   auth: AuthAdapters;
-  state: ApiState;
+  state: PlatformRepositories;
   shouldSeedMockData: boolean;
   close?: () => Promise<void>;
 };
@@ -97,6 +104,7 @@ type ApiRepositories = {
 type BuildApiAppOptions = {
   auth?: Partial<AuthAdapters>;
   authConfig?: Partial<AuthConfig>;
+  state?: Partial<PlatformRepositoryOptions>;
   db?: {
     pool?: DbPool;
     client?: DeployLiteDb;
@@ -305,15 +313,23 @@ function createRolePreHandler(adapters: AuthAdapters, roles: readonly CanonicalR
   };
 }
 
-function createApiState() {
-  const agents = new InMemoryAgentRepository();
-  const deployments = new InMemoryDeploymentRepository();
-  const projects = new InMemoryProjectRepository();
+type PlatformRepositoryOptions = {
+  agents: AgentRepository;
+  deployments: DeploymentRepository;
+  projects: ProjectRepository;
+};
+
+type PlatformRepositories = PlatformRepositoryOptions & {
+  agentStatus: AgentStatusService;
+};
+
+function createApiState(overrides: Partial<PlatformRepositoryOptions> = {}): PlatformRepositories {
+  const agents = overrides.agents ?? new InMemoryAgentRepository();
+  const deployments = overrides.deployments ?? new InMemoryDeploymentRepository();
+  const projects = overrides.projects ?? new InMemoryProjectRepository();
   const agentStatus = new AgentStatusService(agents);
   return { agents, deployments, projects, agentStatus };
 }
-
-type ApiState = ReturnType<typeof createApiState>;
 
 async function createSeededInMemoryAuthAdapters(env: DeployLiteEnv): Promise<AuthAdapters> {
   const hasher = new BcryptPasswordHasher(env.DEPLOYLITE_BCRYPT_COST);
@@ -351,7 +367,11 @@ function createDbAuthAdapters(env: DeployLiteEnv, options: BuildApiAppOptions): 
     },
     close: options.db?.pool ? undefined : () => closePool(pool),
     shouldSeedMockData: false,
-    state: createApiState()
+    state: createApiState({
+      agents: options.state?.agents ?? new DbAgentRepository(db),
+      deployments: options.state?.deployments ?? new DbDeploymentRepository(db),
+      projects: options.state?.projects ?? new DbProjectRepository(db)
+    })
   };
 }
 
@@ -364,11 +384,11 @@ async function createRuntimeRepositories(env: DeployLiteEnv, options: BuildApiAp
   return {
     auth: { ...(await createSeededInMemoryAuthAdapters(env)), ...options.auth },
     shouldSeedMockData: true,
-    state: createApiState()
+    state: createApiState(options.state)
   };
 }
 
-async function seedMockData(state: ApiState): Promise<void> {
+async function seedMockData(state: PlatformRepositories): Promise<void> {
   const startedAt = "2026-01-01T00:00:00.000Z";
   await state.agents.save({
     id: "agent_mock_1",
@@ -443,7 +463,7 @@ function registerCoreHooks(app: FastifyInstance): void {
   });
 }
 
-function registerRoutes(app: FastifyInstance, state: ApiState, adapters: AuthAdapters, authConfig: AuthConfig): void {
+function registerRoutes(app: FastifyInstance, state: PlatformRepositories, adapters: AuthAdapters, authConfig: AuthConfig): void {
   const requireAuth = createAuthPreHandler(adapters, authConfig);
   const requireMutationRole = createRolePreHandler(adapters, ["admin", "operator"]);
 
@@ -510,6 +530,11 @@ function registerRoutes(app: FastifyInstance, state: ApiState, adapters: AuthAda
     const params = z.object({ deploymentId: z.string().min(1) }).parse(request.params);
     const deployment = await state.deployments.findById(params.deploymentId);
     return deployment ? ok(request, { deployment }) : reply.code(404).send(errorEnvelope(request, "NOT_FOUND", "Deployment not found."));
+  });
+  app.get(`${API_PREFIX}/deployments`, { preHandler: requireAuth }, async (request) => ok(request, { deployments: await state.deployments.list() }));
+  app.get(`${API_PREFIX}/deployments/:deploymentId/logs`, { preHandler: requireAuth }, async (request) => {
+    const params = z.object({ deploymentId: z.string().min(1) }).parse(request.params);
+    return ok(request, { events: await state.deployments.listLogs(params.deploymentId) });
   });
   app.get(`${API_PREFIX}/deployments/:deploymentId/logs/stream`, { preHandler: requireAuth }, async (request, reply) => {
     const params = z.object({ deploymentId: z.string().min(1) }).parse(request.params);
