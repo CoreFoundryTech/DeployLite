@@ -1,6 +1,65 @@
 import type { Agent, AgentHeartbeat, Deployment, LogEvent, Project, ScaffoldUser } from "@deploylite/contracts";
 import { redactLogMessage } from "@deploylite/config";
 
+export const canonicalRoleNames = ["admin", "operator", "read-only", "auditor"] as const;
+export type CanonicalRoleName = (typeof canonicalRoleNames)[number];
+export type AuthUserStatus = "active" | "disabled";
+
+export type AuthUser = {
+  id: string;
+  email: string;
+  emailNormalized: string;
+  passwordHash: string;
+  role: CanonicalRoleName;
+  status: AuthUserStatus;
+  createdAt: Date;
+  updatedAt: Date;
+};
+
+export type SafeAuthUser = Omit<AuthUser, "passwordHash">;
+
+export type AuthRole = {
+  id: string;
+  name: CanonicalRoleName;
+  description: string;
+  createdAt: Date;
+};
+
+export type AuthSession = {
+  id: string;
+  userId: string;
+  tokenHash: string;
+  expiresAt: Date;
+  revokedAt: Date | null;
+  ipHash: string | null;
+  userAgent: string | null;
+  createdAt: Date;
+  lastSeenAt: Date | null;
+};
+
+export type CreateInitialAdminInput = {
+  email: string;
+  passwordHash: string;
+};
+
+export type CreateSessionInput = {
+  userId: string;
+  tokenHash: string;
+  expiresAt: Date;
+  ipHash?: string | null;
+  userAgent?: string | null;
+};
+
+export type AuditEventInput = {
+  actorUserId?: string | null;
+  action: string;
+  targetType: string;
+  targetId: string;
+  requestId: string;
+  correlationId: string;
+  metadata?: Record<string, unknown>;
+};
+
 export type AuditEvent = {
   id: string;
   actorId: string;
@@ -33,6 +92,60 @@ export type ProjectRepository = {
 export type UserRepository = {
   findByEmail(email: string): Promise<ScaffoldUser | null>;
 };
+
+export type AuthUserRepository = {
+  findByEmail(email: string): Promise<AuthUser | null>;
+  findById(id: string): Promise<AuthUser | null>;
+  createInitialAdmin(input: CreateInitialAdminInput): Promise<AuthUser>;
+};
+
+export type RoleRepository = {
+  findByName(name: CanonicalRoleName): Promise<AuthRole | null>;
+  list(): Promise<AuthRole[]>;
+};
+
+export type SessionRepository = {
+  create(input: CreateSessionInput): Promise<AuthSession>;
+  findValidByTokenHash(tokenHash: string, now?: Date): Promise<AuthSession | null>;
+  revoke(sessionId: string, now?: Date): Promise<AuthSession | null>;
+};
+
+export type AuditRepository = {
+  append(input: AuditEventInput): Promise<AuditEvent>;
+};
+
+export type PasswordHasher = {
+  hash(password: string): Promise<string>;
+  verify(password: string, hash: string): Promise<boolean>;
+};
+
+export function assertCanonicalRole(role: string): asserts role is CanonicalRoleName {
+  if (!canonicalRoleNames.includes(role as CanonicalRoleName)) {
+    throw new Error("Unsupported canonical role");
+  }
+}
+
+export function toSafeAuthUser(user: AuthUser): SafeAuthUser {
+  const { passwordHash: _passwordHash, ...safeUser } = user;
+  return safeUser;
+}
+
+export async function authenticateLocalUser(
+  users: AuthUserRepository,
+  hasher: PasswordHasher,
+  email: string,
+  password: string
+): Promise<SafeAuthUser | null> {
+  const user = await users.findByEmail(email);
+  if (!user || user.status !== "active") {
+    return null;
+  }
+
+  assertCanonicalRole(user.role);
+
+  const passwordMatches = await hasher.verify(password, user.passwordHash);
+  return passwordMatches ? toSafeAuthUser(user) : null;
+}
 
 const STALE_AFTER_MS = 60_000;
 

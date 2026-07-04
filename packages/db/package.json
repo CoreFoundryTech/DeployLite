@@ -18,7 +18,10 @@
     "db:check": "node scripts/check.mjs"
   },
   "dependencies": {
+    "@deploylite/config": "workspace:*",
+    "@deploylite/contracts": "workspace:*",
     "@deploylite/domain": "workspace:*",
+    "bcryptjs": "^3.0.3",
     "drizzle-orm": "^0.38.4",
     "pg": "^8.13.1"
   },
