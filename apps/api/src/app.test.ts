@@ -1,7 +1,7 @@
 import { BcryptPasswordHasher, createOpaqueSessionToken, hashSessionToken } from "@deploylite/db";
-import type { AuthUser } from "@deploylite/domain";
+import { InitialAdminAlreadyExistsError, type AuthUser, type AuthUserRepository, type CreateInitialAdminInput } from "@deploylite/domain";
 import { describe, expect, it } from "vitest";
-import { buildApiApp, InMemoryAuditRepository, InMemoryAuthUserRepository, InMemorySessionRepository } from "./app.js";
+import { buildApiApp, createRuntimeRepositories, InMemoryAuditRepository, InMemoryAuthUserRepository, InMemorySessionRepository } from "./app.js";
 
 const contentHeaders = { "content-type": "application/json" };
 const password = "correct horse battery staple";
@@ -43,6 +43,119 @@ describe("DeployLite API scaffold", () => {
     expect(body.requestId).toBe(response.headers["x-request-id"]);
     expect(body.error).toBeNull();
     expect(body.data.status).toBe("ok");
+  });
+
+  it("selects DB auth repositories when DATABASE_URL is configured", async () => {
+    const repositories = await createRuntimeRepositories(
+      { NODE_ENV: "test", DEPLOYLITE_API_URL: "http://localhost:3001", DATABASE_URL: "postgres://user:pass@localhost:5432/deploylite", DEPLOYLITE_SESSION_TTL_SECONDS: 3600, DEPLOYLITE_SESSION_COOKIE_NAME: "dl_test_session", DEPLOYLITE_BCRYPT_COST: 10 },
+      { db: { pool: {} as never, client: {} as never } }
+    );
+
+    expect(repositories.auth.users.constructor.name).toBe("DbAuthUserRepository");
+    expect(repositories.shouldSeedMockData).toBe(false);
+  });
+
+  it("closes owned DB pools when the app closes", async () => {
+    let closed = false;
+    const app = await buildApiApp({
+      env: { ...process.env, NODE_ENV: "test", DATABASE_URL: "postgres://user:pass@localhost:5432/deploylite" },
+      db: {
+        createPool: () => ({}) as never,
+        client: {} as never,
+        closePool: async () => {
+          closed = true;
+        }
+      }
+    });
+
+    await app.close();
+
+    expect(closed).toBe(true);
+  });
+
+  it("does not seed mock auth or mock data in DB mode", async () => {
+    const audit = new InMemoryAuditRepository();
+    const users = new InMemoryAuthUserRepository();
+    const app = await buildApiApp({
+      auth: { audit, users, sessions: new InMemorySessionRepository(), hasher: new BcryptPasswordHasher(10) },
+      env: { ...process.env, NODE_ENV: "test", DATABASE_URL: "postgres://user:pass@localhost:5432/deploylite" },
+      db: { pool: {} as never, client: {} as never }
+    });
+
+    const login = await app.inject({ method: "POST", url: "/api/v1/auth/login", headers: contentHeaders, payload: { email: "admin@example.test", password: "deploylite-admin-password" } });
+    const projects = await app.inject({ method: "GET", url: "/api/v1/projects" });
+
+    expect(login.statusCode).toBe(401);
+    expect(projects.statusCode).toBe(401);
+  });
+
+  it("reports bootstrap status from user count", async () => {
+    const app = await buildApiApp({ auth: { users: new InMemoryAuthUserRepository() } });
+    const response = await app.inject({ method: "GET", url: "/api/v1/bootstrap/status" });
+
+    expect(response.statusCode).toBe(200);
+    expect(response.json().data).toEqual({ setupRequired: true });
+  });
+
+  it("creates the first admin and records an audit event", async () => {
+    const audit = new InMemoryAuditRepository();
+    const app = await buildApiApp({ auth: { audit, users: new InMemoryAuthUserRepository() } });
+    const response = await app.inject({ method: "POST", url: "/api/v1/bootstrap/initial-admin", headers: { ...contentHeaders, "x-request-id": "req_bootstrap_1" }, payload: { email: "first@example.test", password: "long-enough-password" } });
+
+    expect(response.statusCode).toBe(200);
+    expect(response.json().data.user).toEqual(expect.objectContaining({ email: "first@example.test", role: "admin", status: "active" }));
+    expect(audit.inputs.some((event) => event.action === "bootstrap.initial-admin.created" && event.requestId === "req_bootstrap_1")).toBe(true);
+  });
+
+  it("rejects invalid bootstrap input and audits the rejection", async () => {
+    const audit = new InMemoryAuditRepository();
+    const app = await buildApiApp({ auth: { audit, users: new InMemoryAuthUserRepository() } });
+    const response = await app.inject({ method: "POST", url: "/api/v1/bootstrap/initial-admin", headers: contentHeaders, payload: { email: "bad", password: "short" } });
+
+    expect(response.statusCode).toBe(400);
+    expect(audit.inputs.some((event) => event.action === "bootstrap.initial-admin.rejected" && event.metadata?.["reason"] === "invalid-input")).toBe(true);
+  });
+
+  it("rejects bootstrap after setup is locked and audits the rejection", async () => {
+    const { app, audit } = await authFixture();
+    const response = await app.inject({ method: "POST", url: "/api/v1/bootstrap/initial-admin", headers: contentHeaders, payload: { email: "second@example.test", password: "long-enough-password" } });
+
+    expect(response.statusCode).toBe(409);
+    expect(audit.inputs.some((event) => event.action === "bootstrap.initial-admin.rejected" && event.metadata?.["reason"] === "locked")).toBe(true);
+  });
+
+  it("maps concurrent atomic bootstrap conflicts to locked without creating a second admin", async () => {
+    const audit = new InMemoryAuditRepository();
+    const createdUsers: AuthUser[] = [];
+    const users: AuthUserRepository = {
+      async findByEmail() {
+        return null;
+      },
+      async findById() {
+        return null;
+      },
+      async count() {
+        return 0;
+      },
+      async createInitialAdmin(input: CreateInitialAdminInput) {
+        if (createdUsers.length > 0) {
+          throw new InitialAdminAlreadyExistsError();
+        }
+        const user: AuthUser = { id: `user_${createdUsers.length + 1}`, email: input.email, emailNormalized: input.email.toLowerCase(), passwordHash: input.passwordHash, role: "admin", status: "active", createdAt: new Date(), updatedAt: new Date() };
+        createdUsers.push(user);
+        return user;
+      }
+    };
+    const app = await buildApiApp({ auth: { audit, users, hasher: new BcryptPasswordHasher(10) } });
+
+    const [first, second] = await Promise.all([
+      app.inject({ method: "POST", url: "/api/v1/bootstrap/initial-admin", headers: contentHeaders, payload: { email: "first@example.test", password: "long-enough-password" } }),
+      app.inject({ method: "POST", url: "/api/v1/bootstrap/initial-admin", headers: contentHeaders, payload: { email: "second@example.test", password: "long-enough-password" } })
+    ]);
+
+    expect([first.statusCode, second.statusCode].sort()).toEqual([200, 409]);
+    expect(createdUsers).toHaveLength(1);
+    expect(audit.inputs.some((event) => event.action === "bootstrap.initial-admin.rejected" && event.metadata?.["reason"] === "locked")).toBe(true);
   });
 
   it("returns a safe auth error envelope for protected routes", async () => {

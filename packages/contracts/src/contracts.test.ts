@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { agentHeartbeatSchema, logEventSchema, sseEventSchema } from "./index.js";
+import { agentHeartbeatSchema, bootstrapInitialAdminRequestSchema, bootstrapStatusSchema, logEventSchema, sseEventSchema } from "./index.js";
 
 const now = new Date().toISOString();
 
@@ -40,5 +40,16 @@ describe("contracts", () => {
 
   it("rejects non-monotonic SSE event identifiers", () => {
     expect(sseEventSchema.safeParse({ id: -1, event: "deployment.log", data: {} }).success).toBe(false);
+  });
+
+  it("parses bootstrap status without exposing user details", () => {
+    const result = bootstrapStatusSchema.parse({ setupRequired: true });
+
+    expect(result).toEqual({ setupRequired: true });
+  });
+
+  it("validates initial admin bootstrap payloads", () => {
+    expect(bootstrapInitialAdminRequestSchema.safeParse({ email: "admin@example.test", password: "long-enough-password" }).success).toBe(true);
+    expect(bootstrapInitialAdminRequestSchema.safeParse({ email: "not-email", password: "short" }).success).toBe(false);
   });
 });

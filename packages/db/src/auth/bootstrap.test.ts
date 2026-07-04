@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import type { AuthUser, AuthUserRepository } from "@deploylite/domain";
+import { InitialAdminAlreadyExistsError, type AuthUser, type AuthUserRepository } from "@deploylite/domain";
 
 import { bootstrapInitialAdmin } from "./bootstrap.js";
 
@@ -15,13 +15,16 @@ const existingAdmin: AuthUser = {
 };
 
 describe("bootstrapInitialAdmin", () => {
-  it("is idempotent when the admin email already exists", async () => {
+  it("locks bootstrap when any user already exists", async () => {
     const repo: AuthUserRepository = {
       async findByEmail() {
-        return existingAdmin;
+        return null;
       },
       async findById() {
         return existingAdmin;
+      },
+      async count() {
+        return 1;
       },
       async createInitialAdmin() {
         throw new Error("should not create duplicate admin");
@@ -31,7 +34,7 @@ describe("bootstrapInitialAdmin", () => {
     const result = await bootstrapInitialAdmin(repo, { hash: async () => "new-hash", verify: async () => true }, { email: existingAdmin.email, password: "unused" });
 
     expect(result.created).toBe(false);
-    expect(result.user).not.toHaveProperty("passwordHash");
+    expect(result.user).toBeNull();
   });
 
   it("creates a first admin with a hashed password", async () => {
@@ -42,6 +45,9 @@ describe("bootstrapInitialAdmin", () => {
       },
       async findById() {
         return null;
+      },
+      async count() {
+        return 0;
       },
       async createInitialAdmin(input) {
         createdWithHash = input.passwordHash;
@@ -54,5 +60,26 @@ describe("bootstrapInitialAdmin", () => {
     expect(createdWithHash).toBe("hashed-password");
     expect(result).toMatchObject({ created: true, user: { email: "new@example.test", role: "admin" } });
     expect(result.user).not.toHaveProperty("passwordHash");
+  });
+
+  it("maps an atomic repository bootstrap conflict to locked", async () => {
+    const repo: AuthUserRepository = {
+      async findByEmail() {
+        return null;
+      },
+      async findById() {
+        return null;
+      },
+      async count() {
+        return 0;
+      },
+      async createInitialAdmin() {
+        throw new InitialAdminAlreadyExistsError();
+      }
+    };
+
+    const result = await bootstrapInitialAdmin(repo, { hash: async () => "hashed-password", verify: async () => true }, { email: "race@example.test", password: "plain-password" });
+
+    expect(result).toEqual({ user: null, created: false });
   });
 });

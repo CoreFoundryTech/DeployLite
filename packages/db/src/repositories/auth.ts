@@ -1,4 +1,4 @@
-import { and, eq, gt, isNull } from "drizzle-orm";
+import { and, count as sqlCount, eq, gt, isNull, sql } from "drizzle-orm";
 import { redactSecrets } from "@deploylite/config";
 import type {
   AuditEvent,
@@ -14,7 +14,7 @@ import type {
   RoleRepository,
   SessionRepository
 } from "@deploylite/domain";
-import { assertCanonicalRole } from "@deploylite/domain";
+import { assertCanonicalRole, InitialAdminAlreadyExistsError } from "@deploylite/domain";
 
 import type { DeployLiteDb } from "../client.js";
 import { auditEvents, roles, userSessions, users, type AuditEventRow, type Role, type User, type UserSession } from "../schema.js";
@@ -58,33 +58,42 @@ export class DbAuthUserRepository implements AuthUserRepository {
     return row ? toAuthUser(row.user, row.role) : null;
   }
 
+  async count(): Promise<number> {
+    const [row] = await this.db.select({ count: sqlCount() }).from(users);
+    return row?.count ?? 0;
+  }
+
   async createInitialAdmin(input: CreateInitialAdminInput): Promise<AuthUser> {
-    const [existingUser] = await this.db.select({ id: users.id }).from(users).limit(1);
-    if (existingUser) {
-      throw new Error("Initial admin already exists");
-    }
+    return this.db.transaction(async (tx) => {
+      await tx.execute(sql`select pg_advisory_xact_lock(hashtext('deploylite.initial_admin_bootstrap'))`);
 
-    const [adminRole] = await this.db.select().from(roles).where(eq(roles.name, "admin")).limit(1);
-    if (!adminRole) {
-      throw new Error("Canonical admin role is missing");
-    }
+      const [countRow] = await tx.select({ count: sqlCount() }).from(users);
+      if ((countRow?.count ?? 0) > 0) {
+        throw new InitialAdminAlreadyExistsError();
+      }
 
-    const [created] = await this.db
-      .insert(users)
-      .values({
-        email: input.email,
-        emailNormalized: normalizeEmail(input.email),
-        passwordHash: input.passwordHash,
-        roleId: adminRole.id,
-        status: "active"
-      })
-      .returning();
+      const [adminRole] = await tx.select().from(roles).where(eq(roles.name, "admin")).limit(1);
+      if (!adminRole) {
+        throw new Error("Canonical admin role is missing");
+      }
 
-    if (!created) {
-      throw new Error("Failed to create initial admin");
-    }
+      const [created] = await tx
+        .insert(users)
+        .values({
+          email: input.email,
+          emailNormalized: normalizeEmail(input.email),
+          passwordHash: input.passwordHash,
+          roleId: adminRole.id,
+          status: "active"
+        })
+        .returning();
 
-    return toAuthUser(created, adminRole);
+      if (!created) {
+        throw new Error("Failed to create initial admin");
+      }
+
+      return toAuthUser(created, adminRole);
+    });
   }
 }
 

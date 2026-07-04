@@ -21,6 +21,9 @@ function users(user: AuthUser | null): AuthUserRepository {
     async findById() {
       return user;
     },
+    async count() {
+      return user ? 1 : 0;
+    },
     async createInitialAdmin() {
       throw new Error("not used");
     }
@@ -68,5 +71,19 @@ describe("authenticateLocalUser", () => {
     await expect(
       authenticateLocalUser(users({ ...activeUser, role: "owner" as "admin" }), hasher(true), "admin@example.test", "valid-password")
     ).rejects.toThrow("Unsupported canonical role");
+  });
+});
+
+describe("getBootstrapStatus", () => {
+  it("reports setup required when no users exist", async () => {
+    const { getBootstrapStatus } = await import("./index.js");
+
+    await expect(getBootstrapStatus(users(null))).resolves.toEqual({ setupRequired: true });
+  });
+
+  it("locks setup when users already exist", async () => {
+    const { getBootstrapStatus } = await import("./index.js");
+
+    await expect(getBootstrapStatus(users(activeUser))).resolves.toEqual({ setupRequired: false });
   });
 });
