@@ -26,7 +26,7 @@ The current auth foundation is intentionally narrow: API sessions are opaque Htt
 
 | Slice | Branch | Scope |
 |---|---|---|
-| PR1 | `feat/auth-postgres-pr1-db-foundation` | PostgreSQL schema, hand-authored SQL migration, local DB tooling, and deterministic DB checks. |
+| PR1 | `feat/auth-postgres-pr1-db-schema` | PostgreSQL schema, hand-authored SQL migration, local DB tooling, and deterministic DB checks. |
 | PR2 | `feat/auth-postgres-pr2-auth-primitives` | Auth/domain ports, repositories, bcrypt hashing, server-side session tokens, revocation, and redaction tests. |
 | PR3 | `feat/auth-postgres-pr3-api-auth` | `/api/v1/auth/login`, `/api/v1/auth/me`, `/api/v1/auth/logout`, API session cookies, RBAC guards, and audit events. |
 | PR4 | `feat/auth-postgres-pr4-web-docs` | Web auth boundary, local workflow docs, and final cross-surface checks. |
@@ -56,6 +56,14 @@ The current auth foundation is intentionally narrow: API sessions are opaque Htt
    pnpm --filter @deploylite/db db:migrate
    pnpm --filter @deploylite/db db:check
    ```
+
+   For opt-in runtime verification against local PostgreSQL, run the integration check. It creates and drops a disposable database on the configured server, applies migrations to that empty database, checks role seeds and database constraint rejection, and verifies auth/session repository persistence across a new client lifecycle:
+
+   ```bash
+   pnpm --filter @deploylite/db db:verify:integration
+   ```
+
+   This command requires PostgreSQL from `infra/local/postgres.yml` or a compatible `DATABASE_URL`. It is intentionally not part of `pnpm check`, so deterministic workspace checks do not require Docker.
 
 4. Build and run the local web shell:
 
