@@ -1,5 +1,6 @@
 "use client";
 
+import React from "react";
 import { useRouter } from "next/navigation";
 import { useState, type FormEvent } from "react";
 import { authApiPaths, createAuthApiRequest, createAuthApiUrl, type AuthBoundaryReason } from "../lib/auth-boundary";

@@ -1,5 +1,7 @@
 import { describe, expect, it } from "vitest";
-import { authApiPaths, createAuthApiRequest, hasSessionCookie, loadAuthSession, resolveAuthBoundary } from "./auth-boundary.js";
+import { projectSchema } from "@deploylite/contracts";
+import { z } from "zod";
+import { authApiPaths, createAuthApiRequest, fetchMetadataEnvelope, hasSessionCookie, loadAuthSession, metadataApiPaths, resolveAuthBoundary } from "./auth-boundary.js";
 import { createMockPlatformSnapshot, formatBytes, resolveDashboardShell } from "./scaffold-shell.js";
 
 describe("web scaffold shell state", () => {
@@ -66,5 +68,48 @@ describe("web auth boundary", () => {
   it("keeps unauthenticated reasons explicit", async () => {
     await expect(loadAuthSession({ apiBaseUrl: "https://api.example.test", cookieHeader: "" })).resolves.toEqual({ kind: "unauthenticated", reason: "missing-cookie" });
     await expect(loadAuthSession({ cookieHeader: "deploylite_session=opaque" })).resolves.toEqual({ kind: "unauthenticated", reason: "api-unconfigured" });
+  });
+});
+
+describe("web metadata API boundary", () => {
+  it("forwards request cookies to metadata endpoints", async () => {
+    const calls: Array<{ url: string; init?: RequestInit }> = [];
+    const fetchImpl = async (url: string | URL | Request, init?: RequestInit) => {
+      calls.push({ url: String(url), init });
+      return new Response(JSON.stringify({ data: { projects: [] }, error: null, requestId: "req_projects_1" }), { status: 200 });
+    };
+
+    const result = await fetchMetadataEnvelope({
+      apiBaseUrl: "https://api.example.test",
+      cookieHeader: "deploylite_session=opaque",
+      fetchImpl,
+      path: metadataApiPaths.projects,
+      schema: z.object({ projects: z.array(projectSchema) })
+    });
+
+    expect(result).toMatchObject({ kind: "ready", data: { projects: [] } });
+    expect(calls[0]).toMatchObject({ url: "https://api.example.test/api/v1/projects" });
+    expect(calls[0]?.init?.headers).toEqual({ cookie: "deploylite_session=opaque" });
+  });
+
+  it("returns explicit parse and API failure states", async () => {
+    const invalidPayload = await fetchMetadataEnvelope({
+      apiBaseUrl: "https://api.example.test",
+      cookieHeader: "deploylite_session=opaque",
+      fetchImpl: async () => new Response(JSON.stringify({ data: { projects: [{ id: "missing-fields" }] }, error: null, requestId: "req_bad_1" }), { status: 200 }),
+      path: metadataApiPaths.projects,
+      schema: z.object({ projects: z.array(projectSchema) })
+    });
+
+    const apiFailure = await fetchMetadataEnvelope({
+      apiBaseUrl: "https://api.example.test",
+      cookieHeader: "deploylite_session=opaque",
+      fetchImpl: async () => new Response(JSON.stringify({ data: null, error: { code: "NOPE", message: "Nope", correlationId: "req_fail_1" }, requestId: "req_fail_1" }), { status: 503 }),
+      path: metadataApiPaths.projects,
+      schema: z.object({ projects: z.array(projectSchema) })
+    });
+
+    expect(invalidPayload).toEqual({ kind: "error", reason: "invalid-payload" });
+    expect(apiFailure).toEqual({ kind: "error", reason: "api-rejected", status: 503 });
   });
 });
