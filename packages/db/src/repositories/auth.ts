@@ -194,7 +194,7 @@ function toAuthSession(session: UserSession): AuthSession {
 function toAuditEvent(row: AuditEventRow): AuditEvent {
   return {
     id: row.id,
-    actorId: row.actorUserId ?? "system",
+    actorId: row.actorUserId === null ? "anonymous" : row.actorUserId ?? "system",
     action: row.action,
     targetType: row.targetType,
     targetId: row.targetId,
