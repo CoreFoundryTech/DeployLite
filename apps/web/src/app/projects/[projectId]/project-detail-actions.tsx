@@ -201,4 +201,3 @@ export function ProjectDetailActions({ project, apiBaseUrl, cookieHeader, envVar
 }
 
 // Suppress unused-import linting for Select; shadcn select is fine to ship even if not used here.
-
