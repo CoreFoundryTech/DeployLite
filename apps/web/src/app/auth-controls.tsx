@@ -4,6 +4,9 @@ import React from "react";
 import { useRouter } from "next/navigation";
 import { useState, type FormEvent } from "react";
 import { authApiPaths, bootstrapApiPaths, createAuthApiRequest, createAuthApiUrl, createInitialAdminApiRequest, type AuthBoundaryReason } from "../lib/auth-boundary";
+import { Button } from "@/components/ui/button";
+import { Field, FieldDescription, FieldGroup, FieldLabel } from "@/components/ui/field";
+import { Input } from "@/components/ui/input";
 
 type AuthControlsProps = {
   apiBaseUrl: string | null;
@@ -83,17 +86,19 @@ export function LoginForm({ apiBaseUrl, reason }: AuthControlsProps & { reason: 
   }
 
   return (
-    <form className="stack" aria-label="Admin sign in" data-auth-endpoint={endpoint(authApiPaths.login, apiBaseUrl)} onSubmit={onSubmit}>
-      <label className="field">
-        <span>Email</span>
-        <input name="email" type="email" autoComplete="email" placeholder="admin@example.test" required disabled={pending} />
-      </label>
-      <label className="field">
-        <span>Password</span>
-        <input name="password" type="password" autoComplete="current-password" required disabled={pending} />
-      </label>
-      <button className="button" type="submit" disabled={pending}>{pending ? "Signing in..." : "Sign in with API cookie"}</button>
-      {message ? <p className="status-message" role="status" aria-live="polite">{message}</p> : null}
+    <form className="flex flex-col gap-4" aria-label="Admin sign in" data-auth-endpoint={endpoint(authApiPaths.login, apiBaseUrl)} onSubmit={onSubmit}>
+      <FieldGroup>
+        <Field>
+          <FieldLabel htmlFor="email">Email</FieldLabel>
+          <Input id="email" name="email" type="email" autoComplete="email" placeholder="admin@example.test" required disabled={pending} />
+        </Field>
+        <Field>
+          <FieldLabel htmlFor="password">Password</FieldLabel>
+          <Input id="password" name="password" type="password" autoComplete="current-password" required disabled={pending} />
+        </Field>
+      </FieldGroup>
+      <Button type="submit" disabled={pending}>{pending ? "Signing in..." : "Sign in with API cookie"}</Button>
+      {message ? <p className="text-sm text-muted-foreground" role="status" aria-live="polite">{message}</p> : null}
     </form>
   );
 }
@@ -161,20 +166,24 @@ export function InitialAdminSetupPanel({ apiBaseUrl, state, onSubmit }: AuthCont
   const { message, error, created, pending } = state;
 
   return (
-    <div className="stack" aria-label="First admin setup panel">
-      <form className="stack" aria-label="Create first admin" data-bootstrap-endpoint={endpoint(bootstrapApiPaths.initialAdmin, apiBaseUrl)} onSubmit={onSubmit}>
-        <label className="field">
-          <span>Admin email</span>
-          <input name="email" type="email" autoComplete="email" placeholder="admin@example.test" required disabled={pending || created} />
-        </label>
-        <label className="field">
-          <span>Admin password</span>
-          <input name="password" type="password" autoComplete="new-password" minLength={12} required disabled={pending || created} />
-        </label>
-        <button className="button" type="submit" disabled={pending || created}>{pending ? "Creating admin..." : "Create first admin"}</button>
+    <div className="flex flex-col gap-4" aria-label="First admin setup panel">
+      <form className="flex flex-col gap-4" aria-label="Create first admin" data-bootstrap-endpoint={endpoint(bootstrapApiPaths.initialAdmin, apiBaseUrl)} onSubmit={onSubmit}>
+        <FieldGroup>
+          <Field>
+            <FieldLabel htmlFor="admin-email">Admin email</FieldLabel>
+            <Input id="admin-email" name="email" type="email" autoComplete="email" placeholder="admin@example.test" required disabled={pending || created} />
+            <FieldDescription>Use a real local-only email; it never leaves the DeployLite database.</FieldDescription>
+          </Field>
+          <Field>
+            <FieldLabel htmlFor="admin-password">Admin password</FieldLabel>
+            <Input id="admin-password" name="password" type="password" autoComplete="new-password" minLength={12} required disabled={pending || created} />
+            <FieldDescription>At least 12 characters.</FieldDescription>
+          </Field>
+        </FieldGroup>
+        <Button type="submit" disabled={pending || created}>{pending ? "Creating admin..." : "Create first admin"}</Button>
       </form>
-      <p className="status-message" role="status" aria-live="polite">{message}</p>
-      {error ? <p className="alert-message" role="alert">{error}</p> : null}
+      <p className="text-sm text-muted-foreground" role="status" aria-live="polite">{message}</p>
+      {error ? <p className="text-sm text-destructive" role="alert">{error}</p> : null}
       {created ? <LoginForm apiBaseUrl={apiBaseUrl} reason="missing-cookie" /> : null}
     </div>
   );
@@ -189,5 +198,7 @@ export function LogoutButton({ apiBaseUrl }: AuthControlsProps) {
     router.push("/");
   }
 
-  return <button className="link-button" type="button" onClick={onLogout}>Sign out</button>;
+  return (
+    <Button type="button" variant="ghost" size="sm" onClick={onLogout}>Sign out</Button>
+  );
 }

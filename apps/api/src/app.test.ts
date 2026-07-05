@@ -1,10 +1,33 @@
 import { BcryptPasswordHasher, createOpaqueSessionToken, hashSessionToken } from "@deploylite/db";
-import { InitialAdminAlreadyExistsError, type AgentRepository, type AuthUser, type AuthUserRepository, type CreateInitialAdminInput, type DeploymentRepository, type ProjectRepository } from "@deploylite/domain";
+import {
+  InitialAdminAlreadyExistsError,
+  InMemoryEnvVariableMetadataRepository,
+  type AgentRepository,
+  type AuthUser,
+  type AuthUserRepository,
+  type CreateInitialAdminInput,
+  type DeploymentRepository,
+  type EnvVariableMetadataRecord,
+  type EnvVariableMetadataRepository,
+  type ProjectRepository
+} from "@deploylite/domain";
 import { describe, expect, it } from "vitest";
 import { buildApiApp, createRuntimeRepositories, InMemoryAuditRepository, InMemoryAuthUserRepository, InMemorySessionRepository } from "./app.js";
 
 const contentHeaders = { "content-type": "application/json" };
 const password = "correct horse battery staple";
+
+function projectFixture(id = "project-1") {
+  return {
+    id,
+    name: "DeployLite",
+    repoUrl: "https://github.com/CoreFoundryTech/DeployLite",
+    defaultBranch: "main",
+    buildCommand: "pnpm build",
+    runCommand: "pnpm start",
+    port: 3000
+  };
+}
 
 type AuthFixtureOptions = {
   dbMode?: boolean;
@@ -48,11 +71,11 @@ function metadataRepositories() {
     },
     async findById(id) {
       calls.push("projects.findById");
-      return id === "project-1" ? { id, name: "DeployLite", repoUrl: "https://github.com/CoreFoundryTech/DeployLite", defaultBranch: "main" } : null;
+      return id === "project-1" ? projectFixture(id) : null;
     },
     async list() {
       calls.push("projects.list");
-      return [{ id: "project-1", name: "DeployLite", repoUrl: "https://github.com/CoreFoundryTech/DeployLite", defaultBranch: "main" }];
+      return [projectFixture()];
     }
   };
   const agents: AgentRepository = {
@@ -92,7 +115,7 @@ function metadataRepositories() {
     }
   };
 
-  return { calls, state: { agents, deployments, projects } };
+  return { calls, state: { agents, deployments, projects, envMetadata: new InMemoryEnvVariableMetadataRepository() } };
 }
 
 async function loginCookie(app: Awaited<ReturnType<typeof buildApiApp>>, email = "admin@example.test") {
@@ -479,5 +502,178 @@ describe("DeployLite API scaffold", () => {
     expect(response.statusCode).toBe(400);
     expect(body.error).toEqual({ code: "VALIDATION_ERROR", message: "Request validation failed.", correlationId: "req_invalid_1" });
     expect(JSON.stringify(body)).not.toContain("dl_");
+  });
+
+  it("creates a project with build/run/port, fetches it back, and rejects when port is out of range", async () => {
+    const { app } = await authFixture();
+    const cookie = await loginCookie(app);
+
+    const create = await app.inject({
+      method: "POST",
+      url: "/api/v1/projects",
+      headers: { ...contentHeaders, cookie },
+      payload: { name: "Demo API", repoUrl: "https://github.com/example/demo", defaultBranch: "main", buildCommand: "pnpm install", runCommand: "node server.js", port: 4000 }
+    });
+    const created = create.json();
+    expect(create.statusCode).toBe(200);
+    expect(created.data.project).toMatchObject({ name: "Demo API", buildCommand: "pnpm install", runCommand: "node server.js", port: 4000 });
+
+    const detail = await app.inject({ method: "GET", url: `/api/v1/projects/${created.data.project.id}`, headers: { cookie } });
+    expect(detail.statusCode).toBe(200);
+    expect(detail.json().data.project.id).toBe(created.data.project.id);
+
+    const badPort = await app.inject({
+      method: "POST",
+      url: "/api/v1/projects",
+      headers: { ...contentHeaders, cookie },
+      payload: { name: "Bad", repoUrl: "https://github.com/example/bad", defaultBranch: "main", port: 70000 }
+    });
+    expect(badPort.statusCode).toBe(400);
+
+    const missing = await app.inject({ method: "GET", url: "/api/v1/projects/missing-id", headers: { cookie } });
+    expect(missing.statusCode).toBe(404);
+  });
+
+  it("manages env metadata as key-only records (no secret values) and never echoes them", async () => {
+    const { app } = await authFixture();
+    const cookie = await loginCookie(app);
+
+    const create = await app.inject({
+      method: "POST",
+      url: "/api/v1/projects",
+      headers: { ...contentHeaders, cookie },
+      payload: { name: "EnvDemo", repoUrl: "https://github.com/example/env", defaultBranch: "main" }
+    });
+    const projectId = create.json().data.project.id;
+
+    const upsert = await app.inject({
+      method: "POST",
+      url: `/api/v1/projects/${projectId}/env-variables`,
+      headers: { ...contentHeaders, cookie },
+      payload: { key: "DATABASE_URL", scope: "project", required: true, description: "Postgres connection string" }
+    });
+    expect(upsert.statusCode).toBe(200);
+    expect(upsert.json().data.envVariable).toMatchObject({ key: "DATABASE_URL", required: true, valuePresent: false });
+
+    const list = await app.inject({ method: "GET", url: `/api/v1/projects/${projectId}/env-variables`, headers: { cookie } });
+    expect(list.statusCode).toBe(200);
+    expect(list.json().data.envVariables).toHaveLength(1);
+    expect(JSON.stringify(list.json())).not.toContain("value=");
+    expect(JSON.stringify(list.json())).not.toContain("plaintextValue");
+    expect(JSON.stringify(list.json())).not.toContain("secret");
+
+    const rejectValue = await app.inject({
+      method: "POST",
+      url: `/api/v1/projects/${projectId}/env-variables`,
+      headers: { ...contentHeaders, cookie },
+      payload: { key: "API_KEY", scope: "project", required: false, value: "should-be-rejected" }
+    });
+    expect(rejectValue.statusCode).toBe(400);
+  });
+
+  it("triggers a deploy end-to-end: queued record, log events, status transitions to succeeded", async () => {
+    const { app } = await authFixture();
+    const cookie = await loginCookie(app);
+
+    const project = (await app.inject({
+      method: "POST",
+      url: "/api/v1/projects",
+      headers: { ...contentHeaders, cookie },
+      payload: { name: "Deployable", repoUrl: "https://github.com/example/deployable", defaultBranch: "main", buildCommand: "pnpm build", runCommand: "node server.js", port: 3000 }
+    })).json().data.project;
+
+    const trigger = await app.inject({
+      method: "POST",
+      url: `/api/v1/projects/${project.id}/deployments`,
+      headers: { ...contentHeaders, cookie, "x-request-id": "req_deploy_1" },
+      payload: {}
+    });
+    expect(trigger.statusCode).toBe(200);
+    const deployment = trigger.json().data.deployment;
+    expect(deployment.status).toBe("queued");
+    expect(trigger.json().data.audit).toMatchObject({ action: "deployment.trigger", requestId: "req_deploy_1" });
+
+    const initialLogs = await app.inject({ method: "GET", url: `/api/v1/deployments/${deployment.id}/logs`, headers: { cookie } });
+    const initialEvents = initialLogs.json().data.events;
+    expect(initialEvents.length).toBeGreaterThan(0);
+    expect(initialEvents.some((e: { message: string }) => e.message.includes("Queued deploy"))).toBe(true);
+    expect(initialEvents.some((e: { message: string }) => e.message.includes("Build command: pnpm build"))).toBe(true);
+    expect(initialEvents.some((e: { message: string }) => e.message.includes("Run command: node server.js"))).toBe(true);
+
+    await new Promise((resolve) => setTimeout(resolve, 350));
+
+    const finalDetail = await app.inject({ method: "GET", url: `/api/v1/deployments/${deployment.id}`, headers: { cookie } });
+    const finalStatus = finalDetail.json().data.deployment.status;
+    expect(["running", "succeeded"]).toContain(finalStatus);
+
+    const finalLogs = await app.inject({ method: "GET", url: `/api/v1/deployments/${deployment.id}/logs`, headers: { cookie } });
+    const finalMessages = (finalLogs.json().data.events as Array<{ message: string; sequence: number }>).map((e) => e.message);
+    expect(finalMessages.some((m) => m.includes("Queued deploy"))).toBe(true);
+
+    await app.close();
+  });
+
+  it("fails a deploy when required env metadata has no value present", async () => {
+    const { app } = await authFixture();
+    const cookie = await loginCookie(app);
+
+    const project = (await app.inject({
+      method: "POST",
+      url: "/api/v1/projects",
+      headers: { ...contentHeaders, cookie },
+      payload: { name: "NeedsSecret", repoUrl: "https://github.com/example/needs", defaultBranch: "main", runCommand: "node server.js" }
+    })).json().data.project;
+
+    await app.inject({
+      method: "POST",
+      url: `/api/v1/projects/${project.id}/env-variables`,
+      headers: { ...contentHeaders, cookie },
+      payload: { key: "DATABASE_URL", required: true }
+    });
+
+    const trigger = await app.inject({
+      method: "POST",
+      url: `/api/v1/projects/${project.id}/deployments`,
+      headers: { ...contentHeaders, cookie },
+      payload: {}
+    });
+    expect(trigger.statusCode).toBe(200);
+    const deployment = trigger.json().data.deployment;
+    expect(deployment.status).toBe("failed");
+    expect(deployment.finishedAt).not.toBeNull();
+
+    const logs = await app.inject({ method: "GET", url: `/api/v1/deployments/${deployment.id}/logs`, headers: { cookie } });
+    expect((logs.json().data.events as Array<{ message: string; level: string }>).some((e) => e.level === "error" && e.message.includes("Refusing to advance"))).toBe(true);
+
+    await app.close();
+  });
+
+  it("returns 409 when no agent is available to trigger a deploy", async () => {
+    const agents: AgentRepository = {
+      async save() { throw new Error("unused"); },
+      async findById() { return null; },
+      async list() { return []; }
+    };
+    const projects: ProjectRepository = {
+      async save() { throw new Error("unused"); },
+      async findById(id) { return id === "project-1" ? { id, name: "X", repoUrl: "https://github.com/example/x", defaultBranch: "main", buildCommand: null, runCommand: null, port: null } : null; },
+      async list() { return []; }
+    };
+    const envRepo: EnvVariableMetadataRepository = {
+      async listByProject() { return []; },
+      async upsert(record: EnvVariableMetadataRecord) { return record; },
+      async remove() { return true; }
+    };
+    const { app } = await authFixture({ dbMode: true, state: { agents, projects, envMetadata: envRepo, deployments: undefined as never } });
+    const cookie = await loginCookie(app);
+
+    const trigger = await app.inject({
+      method: "POST",
+      url: "/api/v1/projects/project-1/deployments",
+      headers: { ...contentHeaders, cookie },
+      payload: {}
+    });
+    expect(trigger.statusCode).toBe(409);
+    expect(trigger.json().error.code).toBe("NO_AGENT_AVAILABLE");
   });
 });

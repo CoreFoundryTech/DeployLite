@@ -88,7 +88,10 @@ describeIntegration("DeployLite API PostgreSQL integration", () => {
       id: projectId,
       name: "PostgreSQL project",
       repoUrl: "https://github.com/example/deploylite-postgres",
-      defaultBranch: "main"
+      defaultBranch: "main",
+      buildCommand: "pnpm build",
+      runCommand: "pnpm start",
+      port: 3000
     });
     await new DbAgentRepository(requireDb()).save({
       id: agentId,
