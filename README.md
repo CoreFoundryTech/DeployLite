@@ -2,7 +2,7 @@
 
 Initial scaffold for DeployLite, a self-hosted deployment platform. This chain establishes TypeScript workspace boundaries, shared contracts, domain foundations, mock API/web/agent surfaces, and read-only MCP tools only.
 
-The current auth foundation is intentionally narrow: API sessions are opaque HttpOnly cookies with canonical roles. A first VPS runtime slice now provides Docker images and Compose wiring, but the one-command installer, TLS, domains, Traefik, and deployment-agent behavior remain deferred.
+The current auth foundation is intentionally narrow: API sessions are opaque HttpOnly cookies with canonical roles. The first VPS slice now provides Docker images, Compose wiring, and a local plug-and-play installer. TLS, domains, Traefik, and deployment-agent behavior remain deferred.
 
 ## Scaffold chain
 
@@ -22,9 +22,19 @@ The current auth foundation is intentionally narrow: API sessions are opaque Htt
 - MCP tools are read-only and non-destructive: `deploylite_get_server_status`, `deploylite_list_deployments`, and `deploylite_get_deployment_logs`.
 - Traefik, ACME, production auth claims, real secret storage, and host shell execution are out of scope.
 
-## VPS runtime preview
+## VPS plug-and-play install
 
-PR1 of the VPS installer work adds a reviewable runtime contract only. It is useful for local review and future installer integration, but it is not a deploy command and it must not be treated as production hardening.
+The installer is designed for a clean Ubuntu/Debian VPS and bootstraps DeployLite without manual Docker, Compose, Postgres, env, or migration setup. It installs/verifies Docker Engine and the Compose plugin when missing, creates `/opt/deploylite`, generates private secrets once, starts the Compose runtime, waits for health, and prints the browser URL for first-owner setup.
+
+Reviewed local invocation from a checked-out release/source tree:
+
+```bash
+sudo DEPLOYLITE_PUBLIC_HOST=203.0.113.10 bash scripts/install.sh
+```
+
+Replace `203.0.113.10` with the public VPS IP or hostname. If omitted, the installer tries conservative IP detection and asks you to set `DEPLOYLITE_PUBLIC_HOST` when it cannot determine a stable address.
+
+Future release packaging can wrap the same reviewed script in a one-line download command, but this repository slice intentionally documents source-tree execution first.
 
 Included:
 
@@ -32,18 +42,19 @@ Included:
 - `infra/vps/compose.yml` with Postgres, one-shot migrations, API, Web, named volumes, an internal network, health checks, and restart policies.
 - Temporary HTTP exposure: Web on host `:80` and API on host `:3001`.
 - Browser-first initial owner creation through the existing setup UI. There are no default admin credentials.
+- `scripts/install.sh`, a defensive Bash installer with mocked tests in `scripts/install.test.sh`.
 
 Deferred non-goals:
 
-- One-command installer, Docker installation, host preflight, upgrades, uninstall/reset, backups, firewall mutation, Dokploy access, real VPS deployment, server Docker socket integration, Traefik, ACME, domains, and HTTPS automation.
+- Upgrades, uninstall/reset, backups, firewall mutation, Dokploy access, deployment-agent/server Docker socket integration, Traefik, ACME, domains, and HTTPS automation.
 
-For review only, copy `infra/vps/.env.example` to a private env file, replace placeholder values, then render the Compose configuration without starting services:
+For local review without starting services, render the Compose configuration with the checked-in example env:
 
 ```bash
-docker compose -f infra/vps/compose.yml --env-file /path/to/private.env config
+docker compose -f infra/vps/compose.yml --env-file infra/vps/.env.example config
 ```
 
-The HTTP-first slice deliberately sets `DEPLOYLITE_SESSION_COOKIE_SECURE=false` and requires `DEPLOYLITE_CORS_ORIGIN` to match the public Web origin. A later TLS/proxy slice must revisit both values.
+The installer writes real runtime config to `/opt/deploylite/.env` with owner-only permissions and preserves it on reruns. Do not paste or commit that file. The HTTP-first slice deliberately sets `DEPLOYLITE_SESSION_COOKIE_SECURE=false` and requires `DEPLOYLITE_CORS_ORIGIN` to match the public Web origin. A later TLS/proxy slice must revisit both values.
 
 ## Auth/PostgreSQL chain
 
