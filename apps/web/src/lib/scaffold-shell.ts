@@ -56,7 +56,8 @@ const mockProject: Project = {
   defaultBranch: "main",
   buildCommand: "pnpm build",
   runCommand: "pnpm start",
-  port: 3000
+  port: 3000,
+  description: null
 };
 
 const mockDeployment: Deployment = {

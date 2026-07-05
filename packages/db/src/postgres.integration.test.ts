@@ -163,7 +163,8 @@ describeIntegration("PostgreSQL auth foundation integration", () => {
       defaultBranch: "main",
       buildCommand: "pnpm build",
       runCommand: "pnpm start",
-      port: 3000
+      port: 3000,
+      description: null
     });
 
     await requireDbDeploymentRepository().save({

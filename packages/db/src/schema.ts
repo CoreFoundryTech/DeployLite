@@ -123,6 +123,7 @@ export const projects = pgTable("projects", {
   buildCommand: text("build_command"),
   runCommand: text("run_command"),
   port: integer("port"),
+  description: text("description"),
   ...timestamps
 });
 

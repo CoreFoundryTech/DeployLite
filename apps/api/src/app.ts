@@ -69,16 +69,22 @@ class InMemoryProjectRepository implements ProjectRepository {
   readonly #projects = new Map<string, Project>();
 
   async save(project: Project): Promise<Project> {
-    this.#projects.set(project.id, structuredClone(project));
-    return project;
+    const cloned = structuredClone(project);
+    this.#projects.set(project.id, cloned);
+    return cloned;
   }
 
   async findById(id: string): Promise<Project | null> {
-    return this.#projects.get(id) ?? null;
+    const existing = this.#projects.get(id);
+    return existing ? structuredClone(existing) : null;
   }
 
   async list(): Promise<Project[]> {
-    return [...this.#projects.values()];
+    return [...this.#projects.values()].map((project) => structuredClone(project));
+  }
+
+  async remove(id: string): Promise<boolean> {
+    return this.#projects.delete(id);
   }
 }
 
@@ -515,7 +521,8 @@ async function seedMockData(state: PlatformRepositories): Promise<void> {
     defaultBranch: "main",
     buildCommand: "pnpm build",
     runCommand: "pnpm start",
-    port: 3000
+    port: 3000,
+    description: null
   });
   await state.deployments.save({
     id: "dep_mock_1",
@@ -668,7 +675,8 @@ function registerRoutes(app: FastifyInstance, state: PlatformRepositories, adapt
       defaultBranch: body.defaultBranch,
       buildCommand: body.buildCommand ?? null,
       runCommand: body.runCommand ?? null,
-      port: body.port ?? null
+      port: body.port ?? null,
+      description: body.description ?? null
     };
     const saved = await state.projects.save(project);
     return ok(request, { project: saved, audit: auditMutation(request, "project.create", "project", saved.id) });
@@ -692,10 +700,24 @@ function registerRoutes(app: FastifyInstance, state: PlatformRepositories, adapt
       defaultBranch: body.defaultBranch ?? existing.defaultBranch,
       buildCommand: body.buildCommand !== undefined ? (body.buildCommand ?? null) : existing.buildCommand,
       runCommand: body.runCommand !== undefined ? (body.runCommand ?? null) : existing.runCommand,
-      port: body.port !== undefined ? (body.port ?? null) : existing.port
+      port: body.port !== undefined ? (body.port ?? null) : existing.port,
+      description: body.description !== undefined ? (body.description ?? null) : existing.description
     };
     const saved = await state.projects.save(next);
     return ok(request, { project: saved, audit: auditMutation(request, "project.update", "project", saved.id) });
+  });
+  app.delete(`${API_PREFIX}/projects/:projectId`, { preHandler: [requireAuth, requireMutationRole] }, async (request, reply) => {
+    const params = z.object({ projectId: z.string().min(1) }).parse(request.params);
+    const existing = await state.projects.findById(params.projectId);
+    if (!existing) {
+      return reply.code(404).send(errorEnvelope(request, "NOT_FOUND", "Project not found."));
+    }
+    const removed = await state.projects.remove(params.projectId);
+    if (!removed) {
+      return reply.code(404).send(errorEnvelope(request, "NOT_FOUND", "Project not found."));
+    }
+    await appendAudit(adapters.audit, request, { actorUserId: request.auth?.user.id ?? null, action: "project.delete", targetType: "project", targetId: params.projectId });
+    return ok(request, { removed: true, audit: auditMutation(request, "project.delete", "project", params.projectId) });
   });
   app.get(`${API_PREFIX}/projects/:projectId/env-variables`, { preHandler: requireAuth }, async (request, reply) => {
     const params = z.object({ projectId: z.string().min(1) }).parse(request.params);

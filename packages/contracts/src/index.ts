@@ -86,7 +86,8 @@ export const projectSchema = z.object({
   defaultBranch: z.string().min(1),
   buildCommand: z.string().min(1).nullable(),
   runCommand: z.string().min(1).nullable(),
-  port: z.number().int().min(1).max(65535).nullable()
+  port: z.number().int().min(1).max(65535).nullable(),
+  description: z.string().max(2000).nullable()
 });
 
 export const projectCreateRequestSchema = z.object({
@@ -95,11 +96,13 @@ export const projectCreateRequestSchema = z.object({
   defaultBranch: z.string().min(1),
   buildCommand: z.string().min(1).optional(),
   runCommand: z.string().min(1).optional(),
-  port: z.coerce.number().int().min(1).max(65535).optional()
+  port: z.coerce.number().int().min(1).max(65535).optional(),
+  description: z.string().max(2000).nullable().optional()
 });
 
 const nullableRuntimeStringSchema = z.string().min(1).nullable();
 const nullablePortSchema = z.union([z.coerce.number().int().min(1).max(65535), z.null()]);
+const nullableDescriptionSchema = z.union([z.string().max(2000), z.null()]);
 
 export const projectUpdateRequestSchema = z.object({
   name: z.string().min(1).optional(),
@@ -107,7 +110,8 @@ export const projectUpdateRequestSchema = z.object({
   defaultBranch: z.string().min(1).optional(),
   buildCommand: nullableRuntimeStringSchema.optional(),
   runCommand: nullableRuntimeStringSchema.optional(),
-  port: nullablePortSchema.optional()
+  port: nullablePortSchema.optional(),
+  description: nullableDescriptionSchema.optional()
 });
 
 export const envVariableMetadataSchema = z.object({

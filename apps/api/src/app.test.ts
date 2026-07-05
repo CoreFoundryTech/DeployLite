@@ -25,7 +25,8 @@ function projectFixture(id = "project-1") {
     defaultBranch: "main",
     buildCommand: "pnpm build",
     runCommand: "pnpm start",
-    port: 3000
+    port: 3000,
+    description: null
   };
 }
 
@@ -76,6 +77,10 @@ function metadataRepositories() {
     async list() {
       calls.push("projects.list");
       return [projectFixture()];
+    },
+    async remove() {
+      calls.push("projects.remove");
+      return false;
     }
   };
   const agents: AgentRepository = {
@@ -783,8 +788,9 @@ describe("DeployLite API scaffold", () => {
     };
     const projects: ProjectRepository = {
       async save() { throw new Error("unused"); },
-      async findById(id) { return id === "project-1" ? { id, name: "X", repoUrl: "https://github.com/example/x", defaultBranch: "main", buildCommand: null, runCommand: null, port: null } : null; },
-      async list() { return []; }
+      async findById(id) { return id === "project-1" ? { id, name: "X", repoUrl: "https://github.com/example/x", defaultBranch: "main", buildCommand: null, runCommand: null, port: null, description: null } : null; },
+      async list() { return []; },
+      async remove() { return false; }
     };
     const envRepo: EnvVariableMetadataRepository = {
       async listByProject() { return []; },
@@ -802,5 +808,104 @@ describe("DeployLite API scaffold", () => {
     });
     expect(trigger.statusCode).toBe(409);
     expect(trigger.json().error.code).toBe("NO_AGENT_AVAILABLE");
+  });
+
+  it("persists a project description on create and returns it in detail and audit metadata", async () => {
+    const { app } = await authFixture();
+    const cookie = await loginCookie(app);
+
+    const create = await app.inject({
+      method: "POST",
+      url: "/api/v1/projects",
+      headers: { ...contentHeaders, cookie, "x-request-id": "req_project_desc_1" },
+      payload: { name: "Described", repoUrl: "https://github.com/example/described", defaultBranch: "main", description: "Owns billing automation" }
+    });
+    expect(create.statusCode).toBe(200);
+    const projectId = create.json().data.project.id;
+    expect(create.json().data.project).toMatchObject({ description: "Owns billing automation" });
+    expect(create.json().data.audit).toMatchObject({ action: "project.create", targetId: projectId, requestId: "req_project_desc_1" });
+
+    const detail = await app.inject({ method: "GET", url: `/api/v1/projects/${projectId}`, headers: { cookie } });
+    expect(detail.statusCode).toBe(200);
+    expect(detail.json().data.project.description).toBe("Owns billing automation");
+  });
+
+  it("clears a project description via PATCH and leaves non-mentioned fields untouched", async () => {
+    const { app } = await authFixture();
+    const cookie = await loginCookie(app);
+
+    const create = await app.inject({
+      method: "POST",
+      url: "/api/v1/projects",
+      headers: { ...contentHeaders, cookie },
+      payload: { name: "Editable", repoUrl: "https://github.com/example/editable-desc", defaultBranch: "main", description: "Staging app" }
+    });
+    const projectId = create.json().data.project.id;
+
+    const clear = await app.inject({
+      method: "PATCH",
+      url: `/api/v1/projects/${projectId}`,
+      headers: { ...contentHeaders, cookie },
+      payload: { description: null }
+    });
+    expect(clear.statusCode).toBe(200);
+    expect(clear.json().data.project).toMatchObject({ id: projectId, name: "Editable", description: null });
+
+    const detail = await app.inject({ method: "GET", url: `/api/v1/projects/${projectId}`, headers: { cookie } });
+    expect(detail.json().data.project.description).toBeNull();
+  });
+
+  it("deletes a project, removes it from list, and audits the deletion", async () => {
+    const { app, audit } = await authFixture();
+    const cookie = await loginCookie(app);
+
+    const create = await app.inject({
+      method: "POST",
+      url: "/api/v1/projects",
+      headers: { ...contentHeaders, cookie, "x-request-id": "req_project_delete_1" },
+      payload: { name: "Disposable", repoUrl: "https://github.com/example/disposable", defaultBranch: "main" }
+    });
+    const projectId = create.json().data.project.id;
+
+    const deletion = await app.inject({
+      method: "DELETE",
+      url: `/api/v1/projects/${projectId}`,
+      headers: { cookie }
+    });
+    expect(deletion.statusCode).toBe(200);
+    expect(deletion.json().data).toEqual({ removed: true, audit: expect.objectContaining({ action: "project.delete", targetId: projectId }) });
+
+    const detail = await app.inject({ method: "GET", url: `/api/v1/projects/${projectId}`, headers: { cookie } });
+    expect(detail.statusCode).toBe(404);
+
+    const list = await app.inject({ method: "GET", url: "/api/v1/projects", headers: { cookie } });
+    expect(list.json().data.projects.find((p: { id: string }) => p.id === projectId)).toBeUndefined();
+
+    expect(audit.events.some((event) => event.action === "project.delete" && event.targetId === projectId)).toBe(true);
+  });
+
+  it("rejects DELETE for read-only callers, missing projects, and unauthenticated requests", async () => {
+    const { app, audit } = await authFixture();
+    const adminCookie = await loginCookie(app);
+
+    const create = await app.inject({
+      method: "POST",
+      url: "/api/v1/projects",
+      headers: { ...contentHeaders, cookie: adminCookie },
+      payload: { name: "Locked", repoUrl: "https://github.com/example/locked", defaultBranch: "main" }
+    });
+    const projectId = create.json().data.project.id;
+
+    const unauthenticated = await app.inject({ method: "DELETE", url: `/api/v1/projects/${projectId}` });
+    expect(unauthenticated.statusCode).toBe(401);
+
+    const missing = await app.inject({ method: "DELETE", url: "/api/v1/projects/does-not-exist", headers: { cookie: adminCookie } });
+    expect(missing.statusCode).toBe(404);
+
+    const readOnlyFixture = await authFixture({ user: { role: "read-only" } });
+    const readOnlyCookie = await loginCookie(readOnlyFixture.app);
+    const forbidden = await readOnlyFixture.app.inject({ method: "DELETE", url: `/api/v1/projects/${projectId}`, headers: { cookie: readOnlyCookie } });
+    expect(forbidden.statusCode).toBe(403);
+    expect(audit.events.some((event) => event.action === "project.delete" && event.targetId === projectId)).toBe(false);
   });
 });

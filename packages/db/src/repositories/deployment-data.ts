@@ -6,6 +6,7 @@ import type { AgentRepository, DeploymentRepository, ProjectRepository } from "@
 import type { DeployLiteDb } from "../client.js";
 import { agents, deploymentLogs, deployments, projects } from "../schema.js";
 
+
 export class DbAgentRepository implements AgentRepository {
   constructor(private readonly db: DeployLiteDb) {}
 
@@ -61,7 +62,8 @@ export class DbProjectRepository implements ProjectRepository {
         defaultBranch: project.defaultBranch,
         buildCommand: project.buildCommand,
         runCommand: project.runCommand,
-        port: project.port
+        port: project.port,
+        description: project.description
       })
       .onConflictDoUpdate({
         target: projects.id,
@@ -72,6 +74,7 @@ export class DbProjectRepository implements ProjectRepository {
           buildCommand: project.buildCommand,
           runCommand: project.runCommand,
           port: project.port,
+          description: project.description,
           updatedAt: new Date()
         }
       })
@@ -90,6 +93,11 @@ export class DbProjectRepository implements ProjectRepository {
     const [row] = await this.db.select().from(projects).where(eq(projects.id, id)).limit(1);
     return row ? toProject(row) : null;
   }
+
+  async remove(id: string): Promise<boolean> {
+    const result = await this.db.delete(projects).where(eq(projects.id, id)).returning({ id: projects.id });
+    return result.length > 0;
+  }
 }
 
 function toProject(row: typeof projects.$inferSelect): Project {
@@ -100,7 +108,8 @@ function toProject(row: typeof projects.$inferSelect): Project {
     defaultBranch: row.defaultBranch,
     buildCommand: row.buildCommand,
     runCommand: row.runCommand,
-    port: row.port
+    port: row.port,
+    description: row.description
   };
 }
 

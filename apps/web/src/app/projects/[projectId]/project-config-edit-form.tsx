@@ -70,7 +70,8 @@ export function ProjectConfigEditForm({ project, apiBaseUrl, cookieHeader }: Pro
       defaultBranch: String(formData.get("defaultBranch") ?? ""),
       buildCommand: String(formData.get("buildCommand") ?? ""),
       runCommand: String(formData.get("runCommand") ?? ""),
-      port: String(formData.get("port") ?? "")
+      port: String(formData.get("port") ?? ""),
+      description: String(formData.get("description") ?? "")
     });
 
     if (!normalized.ok) {
@@ -128,6 +129,11 @@ export function ProjectConfigEditForm({ project, apiBaseUrl, cookieHeader }: Pro
           <FieldLabel htmlFor="project-port">Port</FieldLabel>
           <Input id="project-port" name="port" defaultValue={project.port?.toString() ?? ""} disabled={pending} inputMode="numeric" placeholder="3000" />
           <FieldDescription>Use a whole number from 1 to 65535, or leave empty to clear.</FieldDescription>
+        </Field>
+        <Field>
+          <FieldLabel htmlFor="project-description">Description</FieldLabel>
+          <Input id="project-description" name="description" defaultValue={project.description ?? ""} disabled={pending} maxLength={2000} placeholder="Short summary shown next to the project" />
+          <FieldDescription>Up to 2000 characters. Leave empty to clear.</FieldDescription>
         </Field>
       </FieldGroup>
       <div className="flex flex-wrap items-center gap-3">

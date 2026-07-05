@@ -1,5 +1,7 @@
 import type { ProjectUpdateRequest } from "@deploylite/contracts";
 
+const projectDescriptionMaxLength = 2000;
+
 export type ProjectConfigFormValues = {
   name: string;
   repoUrl: string;
@@ -7,6 +9,7 @@ export type ProjectConfigFormValues = {
   buildCommand: string;
   runCommand: string;
   port: string | number | null;
+  description?: string | null;
 };
 
 type CurrentProjectConfig = {
@@ -16,6 +19,7 @@ type CurrentProjectConfig = {
   buildCommand: string | null;
   runCommand: string | null;
   port: number | null;
+  description: string | null;
 };
 
 export type NormalizeProjectConfigUpdateResult =
@@ -38,6 +42,9 @@ export function normalizeProjectConfigUpdate(
   const portResult = normalizePort(values.port);
   if (!portResult.ok) return portResult;
 
+  const descriptionResult = normalizeDescription(values.description);
+  if (!descriptionResult.ok) return descriptionResult;
+
   const payload: ProjectUpdateRequest = {};
   if (name !== current.name) payload.name = name;
   if (repoUrl !== current.repoUrl) payload.repoUrl = repoUrl;
@@ -46,6 +53,7 @@ export function normalizeProjectConfigUpdate(
   assignOptionalString(payload, "buildCommand", values.buildCommand, current.buildCommand);
   assignOptionalString(payload, "runCommand", values.runCommand, current.runCommand);
   if (portResult.port !== current.port) payload.port = portResult.port;
+  if (descriptionResult.changed) payload.description = descriptionResult.description;
 
   return { ok: true, payload };
 }
@@ -61,6 +69,17 @@ function assignOptionalString(
   if (normalized !== currentValue) {
     payload[key] = normalized;
   }
+}
+
+function normalizeDescription(rawDescription: string | null | undefined): { ok: true; description: string | null; changed: boolean } | { ok: false; message: string } {
+  if (rawDescription === undefined) {
+    return { ok: true, description: null, changed: false };
+  }
+  const trimmed = (rawDescription ?? "").trim();
+  if (trimmed.length > projectDescriptionMaxLength) {
+    return { ok: false, message: `Project description must be ${projectDescriptionMaxLength} characters or fewer.` };
+  }
+  return { ok: true, description: trimmed.length > 0 ? trimmed : null, changed: true };
 }
 
 function normalizePort(rawPort: string | number | null): { ok: true; port: number | null } | { ok: false; message: string } {

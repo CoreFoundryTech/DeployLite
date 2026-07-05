@@ -15,7 +15,8 @@ const projectFixture = {
   defaultBranch: "main",
   buildCommand: "pnpm build",
   runCommand: "node server.js",
-  port: 3000
+  port: 3000,
+  description: null as string | null
 };
 
 describe("submitProjectDeployment", () => {
