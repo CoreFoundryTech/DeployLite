@@ -323,6 +323,44 @@ describe("deployment log real API rendering", () => {
     expect(html).toContain("View all deployments");
   });
 
+  it("shows the canceled-state guidance and redacted status in the evidence summary", async () => {
+    mockCookies("deploylite_session", "opaque");
+    process.env.DEPLOYLITE_WEB_API_BASE_URL = apiBaseUrl;
+    mockFetch({
+      "/api/v1/auth/me": { data: { user: userFixture }, error: null, requestId: "req_auth_1" },
+      "/api/v1/deployments/dep-1": {
+        data: {
+          deployment: {
+            ...deploymentFixture,
+            status: "canceled",
+            startedAt: "2026-01-01T00:00:00.000Z",
+            finishedAt: "2026-01-01T00:00:17.000Z"
+          }
+        },
+        error: null,
+        requestId: "req_deployment_canceled"
+      },
+      "/api/v1/deployments/dep-1/logs": {
+        data: { events: [logFixture(1, "Redacted secret leaked")] },
+        error: null,
+        requestId: "req_logs_canceled"
+      }
+    });
+
+    const html = renderToStaticMarkup(await DeploymentLogsPage({ params: Promise.resolve({ deploymentId: "dep-1" }) }));
+
+    expect(html).toContain("data-testid=\"deployment-attention-alert\"");
+    expect(html).toContain("This deployment needs attention");
+    expect(html).toContain("project configuration");
+    expect(html).toContain('href="/projects/project-1#env-metadata"');
+    expect(html).toContain("VPS, Docker, Dokploy, Traefik, ACME");
+    expect(html).toContain("canceled");
+    expect(html).toContain("redacted");
+    expect(html).toContain('href="/projects/project-1"');
+    expect(html).toContain("Back to project");
+    expect(html).toContain("View all deployments");
+  });
+
   it("keeps the no-log state path while still rendering the evidence summary, project link, and CTAs", async () => {
     mockCookies("deploylite_session", "opaque");
     process.env.DEPLOYLITE_WEB_API_BASE_URL = apiBaseUrl;
