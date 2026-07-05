@@ -7,6 +7,11 @@ REPO_ROOT="${DEPLOYLITE_REPO_ROOT:-$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && p
 COMPOSE_FILE="${INSTALL_DIR}/compose.yml"
 ENV_FILE="${INSTALL_DIR}/.env"
 STATE_DIR="${INSTALL_DIR}/.state"
+DEFAULT_LOG_FILE="/var/log/deploylite/install.log"
+INSTALL_LOG="${DEPLOYLITE_INSTALL_LOG:-$DEFAULT_LOG_FILE}"
+INSTALL_LOG_DIR="${DEPLOYLITE_INSTALL_LOG_DIR:-$(dirname "$INSTALL_LOG")}"
+INTERACTIVE=0
+NOOP=0
 CHANGED_STEPS=()
 CREATED_RUNTIME=0
 
@@ -36,6 +41,110 @@ trap on_error ERR
 record_change() { CHANGED_STEPS+=("$1"); }
 command_exists() { command -v "$1" >/dev/null 2>&1; }
 run() { "$@"; }
+
+print_usage() {
+  cat <<'USAGE'
+Usage: install.sh [options]
+
+Options:
+  --interactive, -i   Prompt for install values (TUI when available, read fallback).
+  --help, -h          Show this help and exit.
+
+Environment:
+  DEPLOYLITE_PUBLIC_HOST=<ip-or-host>  Public host for the runtime.
+  DEPLOYLITE_INSTALL_DIR=<path>        Install directory (default: /opt/deploylite).
+  DEPLOYLITE_INSTALL_LOG=<path>        Install log file (default: /var/log/deploylite/install.log).
+  DEPLOYLITE_INSTALL_LOG_DIR=<path>    Install log directory (default: parent of DEPLOYLITE_INSTALL_LOG).
+
+Logs:
+  The installer tees stdout and stderr to the install log with redaction applied
+  to every line, including database URLs, password assignments, and secret tokens.
+  Default path: /var/log/deploylite/install.log
+USAGE
+}
+
+parse_args() {
+  while (( $# > 0 )); do
+    case "$1" in
+      --interactive|-i) INTERACTIVE=1; shift ;;
+      --noop) NOOP=1; shift ;;
+      --help|-h) print_usage; exit 0 ;;
+      --)
+        shift
+        while (( $# > 0 )); do
+          fail "Unknown argument: $1. Use --interactive or --help." 2
+        done
+        ;;
+      *) fail "Unknown argument: $1. Use --interactive or --help." 2 ;;
+    esac
+  done
+}
+
+# Create the install log directory and file, then redirect stdout and stderr
+# through `tee` so the terminal and the log file see the same redacted stream.
+# Idempotent: re-running appends to the existing log instead of truncating.
+install_log_setup() {
+  local log_file="${INSTALL_LOG}"
+  local log_dir="${INSTALL_LOG_DIR}"
+  if [[ ! -d "$log_dir" ]]; then
+    if ! as_root mkdir -p "$log_dir" 2>/dev/null; then
+      warn "Could not create log directory ${log_dir}. Continuing without file log."
+      return 0
+    fi
+  fi
+  info "log directory ready at ${log_dir}"
+  if ! ( umask 027; as_root touch "$log_file" ) 2>/dev/null; then
+    warn "Could not create log file ${log_file}. Continuing without file log."
+    return 0
+  fi
+  if ! as_root test -w "$log_file"; then
+    warn "Log file ${log_file} is not writable. Continuing without file log."
+    return 0
+  fi
+  if [[ "${DEPLOYLITE_INSTALL_TESTING:-0}" == "1" && "${DEPLOYLITE_INSTALL_SKIP_TEE:-0}" == "1" ]]; then
+    info "Install log: ${log_file} (tee disabled in test mode)"
+    return 0
+  fi
+  # `exec` replaces the shell's stdout and stderr so the redirect survives
+  # every subsequent function call. The redaction layer at log() runs before
+  # the write, so the file never sees raw secrets.
+  if exec > >(as_root tee -a "$log_file") 2>&1; then
+    info "Install log: ${log_file}"
+  else
+    warn "Could not redirect stdout to tee for ${log_file}."
+  fi
+  return 0
+}
+
+# Render an interactive prompt. Prefers whiptail when available; otherwise
+# falls back to plain read so `--interactive` works on minimal VPS images
+# and on systems without a tty (where read reads from a pipe).
+prompt_value() {
+  local label="$1" default_value="${2:-}" response=""
+  if [[ "${INTERACTIVE}" != "1" ]]; then
+    printf '%s' "$default_value"
+    return 0
+  fi
+  if command_exists whiptail && [[ -t 0 ]]; then
+    response="$(whiptail --inputbox "$label" 8 60 "$default_value" --title "DeployLite install" 3>&1 1>&2 2>&3 || true)"
+    if [[ -n "$response" ]]; then
+      printf '%s' "$response"
+      return 0
+    fi
+  fi
+  if [[ -t 0 ]]; then
+    local ans
+    read -r -p "${label} [${default_value}]: " ans || true
+    printf '%s' "${ans:-$default_value}"
+  else
+    # Non-tty stdin: read whatever line was piped in. This keeps
+    # `printf 'value\n' | bash install.sh --interactive` working in tests
+    # and in piped automation that still wants a confirmation.
+    local ans
+    IFS= read -r ans || true
+    printf '%s' "${ans:-$default_value}"
+  fi
+}
 
 as_root() {
   if [[ "${EUID}" -eq 0 ]]; then
@@ -88,8 +197,12 @@ preflight() {
 }
 
 install_docker() {
+  if [[ "${DEPLOYLITE_SKIP_DOCKER_INSTALL:-0}" == "1" ]]; then
+    info "Skipping Docker install (DEPLOYLITE_SKIP_DOCKER_INSTALL=1)."
+    return 0
+  fi
   if command_exists docker && as_root docker compose version >/dev/null 2>&1; then
-    info "Docker Engine and Compose plugin are available."
+    info "Docker Engine and Compose plugin already installed; skipping apt install."
     return
   fi
   command_exists apt-get || fail "Docker is missing and automatic install requires apt-get." 2
@@ -178,6 +291,9 @@ EOF
 }
 
 prepare_install_dir() {
+  if [[ -d "$INSTALL_DIR" && -f "$COMPOSE_FILE" && -f "$ENV_FILE" ]]; then
+    info "Existing install at ${INSTALL_DIR} detected; preserving state."
+  fi
   info "Preparing ${INSTALL_DIR}."
   as_root mkdir -p "$INSTALL_DIR" "$STATE_DIR"
   as_root chmod 700 "$INSTALL_DIR"
@@ -244,8 +360,23 @@ print_success() {
 }
 
 main() {
+  parse_args "$@"
+  install_log_setup
+  if [[ "${INTERACTIVE}" == "1" ]]; then
+    info "Interactive mode: prompts enabled (TUI when available, read fallback)."
+  else
+    info "Running in non-interactive mode; use --interactive to enable prompts."
+  fi
+  if [[ "${NOOP}" == "1" ]]; then
+    info "Noop mode: skipping preflight, Docker install, and runtime."
+    return 0
+  fi
   preflight
   install_docker
+  if [[ "${DEPLOYLITE_SKIP_RUNTIME:-0}" == "1" ]]; then
+    info "Skipping runtime install (DEPLOYLITE_SKIP_RUNTIME=1)."
+    return 0
+  fi
   prepare_install_dir
   start_runtime
   wait_for_health

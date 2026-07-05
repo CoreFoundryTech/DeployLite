@@ -57,7 +57,7 @@ Included:
 - Temporary HTTP exposure: Web on host `:80` and API on host `:3001`.
 - Browser-first initial owner creation through the existing setup UI. There are no default admin credentials.
 - `scripts/bootstrap.sh`, a GitHub raw bootstrapper with mocked tests in `scripts/bootstrap.test.sh`.
-- `scripts/install.sh`, a defensive Bash installer with mocked tests in `scripts/install.test.sh`.
+- `scripts/install.sh`, a defensive Bash installer with mocked tests in `scripts/install.test.sh` and a tee-based file logger tested in `scripts/install-tee.test.sh`.
 
 Deferred non-goals:
 
@@ -70,6 +70,26 @@ docker compose -f infra/vps/compose.yml --env-file infra/vps/.env.example config
 ```
 
 The installer writes real runtime config to `/opt/deploylite/.env` with owner-only permissions and preserves it on reruns. Do not paste or commit that file. The HTTP-first slice deliberately sets `DEPLOYLITE_SESSION_COOKIE_SECURE=false` and requires `DEPLOYLITE_CORS_ORIGIN` to match the public Web origin. A later TLS/proxy slice must revisit both values.
+
+### Install log, idempotency, and interactive mode
+
+The installer tees every line of stdout and stderr into `/var/log/deploylite/install.log` so post-mortem review does not require re-attaching to the terminal. The log is append-only, mode `0640` (or `0600` on filesystems that strip the group bit), and the redaction layer at the script's `log()` function rewrites every line — including database URLs, password assignments, and secret tokens — before the bytes reach either the terminal or the file. Reruns append; the file is never truncated by the installer.
+
+Override the log path with `DEPLOYLITE_INSTALL_LOG=<path>` and the log directory with `DEPLOYLITE_INSTALL_LOG_DIR=<path>`. When the installer cannot create the configured directory it logs a warning and continues without a file log instead of failing.
+
+Idempotency probes log a clear "already installed; preserving state" marker for each component the script detects:
+
+- `/opt/deploylite/compose.yml` and `/opt/deploylite/.env` already present.
+- Docker Engine and the Compose plugin already on `PATH`.
+- Install log directory already present.
+
+Pass `--interactive` (or `-i`) to enable confirmation prompts. The script tries a TUI dialog when one is available and falls back to plain `read` so the flag works on minimal VPS images and on piped automation:
+
+```bash
+sudo DEPLOYLITE_PUBLIC_HOST=203.0.113.10 bash scripts/install.sh --interactive
+```
+
+Without `--interactive` the installer is non-interactive and safe to drive from `curl | bash`. Pass `--help` to print the full usage block.
 
 ## Auth/PostgreSQL chain
 
