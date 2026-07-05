@@ -46,6 +46,8 @@ export const metadataApiPaths = {
   deploymentLogs: (deploymentId: string) => `/api/v1/deployments/${encodeURIComponent(deploymentId)}/logs`
 } as const;
 
+export type AuthApiRequestMethod = "GET" | "POST" | "PATCH" | "DELETE";
+
 export const defaultSessionCookieName = "deploylite_session";
 
 export type AuthBoundaryReason = "missing-cookie" | "api-unconfigured" | "api-rejected" | "api-unreachable";
@@ -81,7 +83,7 @@ export type ProjectDetailMetadata = {
 };
 
 export type AuthApiRequestOptions = {
-  method: "GET" | "POST" | "PATCH";
+  method: AuthApiRequestMethod;
   body?: unknown;
 };
 
@@ -319,6 +321,35 @@ export async function upsertEnvVariable(projectId: string, input: { key: string;
     });
     if (!response.ok) return { kind: "error", reason: "api-rejected", status: response.status };
     return parseApiEnvelope(await response.json(), z.object({ envVariable: envVariableMetadataSchema }));
+  } catch {
+    return { kind: "error", reason: "api-unreachable" };
+  }
+}
+
+export type DeleteProjectFailureReason = "api-unconfigured" | "api-rejected" | "api-unreachable" | "not-found" | "invalid-payload";
+
+export type DeleteProjectResult =
+  | { kind: "deleted" }
+  | { kind: "error"; reason: DeleteProjectFailureReason; status?: number };
+
+export async function deleteProject(projectId: string, options: LoadAuthSessionOptions): Promise<DeleteProjectResult> {
+  if (!options.apiBaseUrl) return { kind: "error", reason: "api-unconfigured" };
+  try {
+    const response = await (options.fetchImpl ?? fetch)(createAuthApiUrl(metadataApiPaths.project(projectId), options.apiBaseUrl), {
+      ...createAuthApiRequest({ method: "DELETE" }),
+      headers: { cookie: options.cookieHeader ?? "" }
+    });
+    if (response.status === 404) {
+      return { kind: "error", reason: "not-found", status: 404 };
+    }
+    if (!response.ok) {
+      return { kind: "error", reason: "api-rejected", status: response.status };
+    }
+    const envelope = responseEnvelopeSchema(z.object({ removed: z.boolean() })).safeParse(await response.json());
+    if (!envelope.success || !envelope.data.data?.removed) {
+      return { kind: "error", reason: "invalid-payload" };
+    }
+    return { kind: "deleted" };
   } catch {
     return { kind: "error", reason: "api-unreachable" };
   }

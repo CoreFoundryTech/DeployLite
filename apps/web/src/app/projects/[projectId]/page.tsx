@@ -4,6 +4,7 @@ import { getAuthApiBaseUrl } from "@/lib/auth-boundary";
 import { loadRequestAuthSession, loadRequestProjectDetailMetadata } from "@/lib/server-auth";
 import { ProjectConfigEditForm } from "./project-config-edit-form";
 import { ProjectDetailActions } from "./project-detail-actions";
+import { ProjectDeleteDialog } from "@/components/project-delete-dialog";
 import { AppShell } from "@/components/app-shell";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
@@ -82,11 +83,24 @@ export default async function ProjectDetailPage({ params }: { params: Promise<Pa
         <div>
           <Link href="/projects" className="text-sm text-muted-foreground hover:text-foreground">← Back to projects</Link>
           <div className="mt-2 flex items-center justify-between">
-            <div>
+            <div className="flex flex-col gap-1">
               <h1 className="text-2xl font-semibold tracking-tight">{project.name}</h1>
               <p className="font-mono text-sm text-muted-foreground">{project.repoUrl}</p>
+              {project.description ? (
+                <p className="text-sm text-muted-foreground" data-testid="project-detail-description">{project.description}</p>
+              ) : null}
             </div>
-            <Badge variant="outline">{project.defaultBranch}</Badge>
+            <div className="flex items-center gap-3">
+              <Badge variant="outline">{project.defaultBranch}</Badge>
+              <ProjectDeleteDialog
+                projectId={project.id}
+                projectName={project.name}
+                apiBaseUrl={apiBaseUrl}
+                cookieHeader={cookieHeader}
+                triggerLabel="Delete"
+                triggerVariant="outline"
+              />
+            </div>
           </div>
         </div>
 
@@ -100,6 +114,10 @@ export default async function ProjectDetailPage({ params }: { params: Promise<Pa
               <ConfigRow label="Build command" value={project.buildCommand ?? "—"} />
               <ConfigRow label="Run command" value={project.runCommand ?? "—"} />
               <ConfigRow label="Port" value={project.port?.toString() ?? "—"} />
+            </div>
+            <div className="grid gap-3 md:grid-cols-2">
+              <ConfigRow label="Image tag" value={project.imageTag ?? "—"} />
+              <ConfigRow label="Description" value={project.description ?? "—"} />
             </div>
             <ProjectConfigEditForm project={project} apiBaseUrl={apiBaseUrl} cookieHeader={cookieHeader} />
           </CardContent>

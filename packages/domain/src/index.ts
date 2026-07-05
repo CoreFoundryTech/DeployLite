@@ -89,6 +89,7 @@ export type ProjectRepository = {
   save(project: Project): Promise<Project>;
   findById(id: string): Promise<Project | null>;
   list(): Promise<Project[]>;
+  remove(id: string): Promise<boolean>;
 };
 
 export type EnvVariableMetadataRecord = EnvVariableMetadata;

@@ -678,7 +678,9 @@ const projectFixture = {
   defaultBranch: "main",
   buildCommand: "pnpm build",
   runCommand: "node server.js",
-  port: 3000
+  port: 3000,
+  description: null as string | null,
+  imageTag: null as string | null
 };
 const agentFixture = {
   id: "agent-1",

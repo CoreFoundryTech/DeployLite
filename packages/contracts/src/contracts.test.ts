@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { agentHeartbeatSchema, bootstrapInitialAdminRequestSchema, bootstrapStatusSchema, logEventSchema, projectUpdateRequestSchema, sseEventSchema } from "./index.js";
+import { agentHeartbeatSchema, bootstrapInitialAdminRequestSchema, bootstrapStatusSchema, logEventSchema, projectCreateRequestSchema, projectSchema, projectUpdateRequestSchema, sseEventSchema } from "./index.js";
 
 const now = new Date().toISOString();
 
@@ -70,5 +70,83 @@ describe("contracts", () => {
     expect(projectUpdateRequestSchema.safeParse({ defaultBranch: "" }).success).toBe(false);
     expect(projectUpdateRequestSchema.safeParse({ port: 0 }).success).toBe(false);
     expect(projectUpdateRequestSchema.safeParse({ port: 65536 }).success).toBe(false);
+  });
+
+  it("accepts a project create payload with an optional description", () => {
+    const result = projectCreateRequestSchema.parse({
+      name: "Demo",
+      repoUrl: "https://github.com/example/demo",
+      defaultBranch: "main",
+      description: "Internal admin app for staging"
+    });
+
+    expect(result).toEqual({
+      name: "Demo",
+      repoUrl: "https://github.com/example/demo",
+      defaultBranch: "main",
+      description: "Internal admin app for staging"
+    });
+  });
+
+  it("treats project description as nullable on the canonical project schema", () => {
+    const parsed = projectSchema.parse({
+      id: "project_1",
+      name: "Demo",
+      repoUrl: "https://github.com/example/demo",
+      defaultBranch: "main",
+      buildCommand: null,
+      runCommand: null,
+      port: null,
+      description: null,
+      imageTag: null
+    });
+
+    expect(parsed.description).toBeNull();
+  });
+
+  it("clears project description via a project update payload", () => {
+    const result = projectUpdateRequestSchema.parse({ description: null });
+
+    expect(result).toEqual({ description: null });
+  });
+
+  it("accepts a project image tag on create, surfaces it on the canonical schema, and clears via null on update", () => {
+    const created = projectCreateRequestSchema.parse({
+      name: "Tagged",
+      repoUrl: "https://github.com/example/tagged",
+      defaultBranch: "main",
+      imageTag: "ghcr.io/example/tagged:v1.2.3"
+    });
+
+    expect(created.imageTag).toBe("ghcr.io/example/tagged:v1.2.3");
+
+    const canonical = projectSchema.parse({
+      id: "project_tagged",
+      name: "Tagged",
+      repoUrl: "https://github.com/example/tagged",
+      defaultBranch: "main",
+      buildCommand: null,
+      runCommand: null,
+      port: null,
+      description: null,
+      imageTag: "v1.0.0"
+    });
+
+    expect(canonical.imageTag).toBe("v1.0.0");
+
+    const cleared = projectUpdateRequestSchema.parse({ imageTag: null });
+    expect(cleared).toEqual({ imageTag: null });
+  });
+
+  it("rejects empty or oversized project image tags across create and update payloads", () => {
+    expect(projectCreateRequestSchema.safeParse({
+      name: "Tagged",
+      repoUrl: "https://github.com/example/tagged",
+      defaultBranch: "main",
+      imageTag: ""
+    }).success).toBe(false);
+
+    expect(projectUpdateRequestSchema.safeParse({ imageTag: "" }).success).toBe(false);
+    expect(projectUpdateRequestSchema.safeParse({ imageTag: "x".repeat(257) }).success).toBe(false);
   });
 });

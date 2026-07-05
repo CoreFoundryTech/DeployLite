@@ -1,6 +1,7 @@
 import { cookies } from "next/headers";
 import {
   createProject,
+  deleteProject,
   getAuthApiBaseUrl,
   loadAuthSession,
   loadBootstrapStatus,
@@ -61,6 +62,11 @@ export async function triggerRequestProjectDeployment(projectId: string) {
 export async function upsertRequestEnvVariable(projectId: string, input: Parameters<typeof upsertEnvVariable>[1]) {
   const cookieHeader = await getRequestCookieHeader();
   return upsertEnvVariable(projectId, input, { apiBaseUrl: getAuthApiBaseUrl() ?? undefined, cookieHeader });
+}
+
+export async function deleteRequestProject(projectId: string) {
+  const cookieHeader = await getRequestCookieHeader();
+  return deleteProject(projectId, { apiBaseUrl: getAuthApiBaseUrl() ?? undefined, cookieHeader });
 }
 
 export { buildRequestOptions };
