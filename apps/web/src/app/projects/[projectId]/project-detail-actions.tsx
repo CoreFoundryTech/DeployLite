@@ -20,6 +20,7 @@ type ProjectDetailActionsProps = {
 type TriggerState =
   | { kind: "idle" }
   | { kind: "pending" }
+  | { kind: "triggered"; deploymentId: string; status: string }
   | { kind: "error"; message: string };
 
 type EnvState =
@@ -28,8 +29,9 @@ type EnvState =
   | { kind: "error"; message: string };
 
 const triggerCopy = {
-  triggered: "Deployment queued. Refreshing the project page…",
   invalid: "Could not trigger the deploy. Check that the project has at least one online agent.",
+  invalidPayload: "Deploy trigger returned an unexpected response. Try again, and check the API logs if it keeps failing.",
+  unconfigured: "Configure DEPLOYLITE_WEB_API_BASE_URL before triggering deploys.",
   unreachable: "The local API is unreachable. Start the API and try again."
 } as const;
 
@@ -38,6 +40,82 @@ const envCopy = {
   invalid: "Use a non-empty key (letters, digits, underscores) without secret values.",
   unreachable: "The local API is unreachable. Start the API and try again."
 } as const;
+
+export type SubmitProjectDeploymentResult =
+  | { kind: "triggered"; deploymentId: string; status: string }
+  | { kind: "rejected"; message: string }
+  | { kind: "invalid"; message: string }
+  | { kind: "unreachable"; message: string }
+  | { kind: "unconfigured"; message: string };
+
+export type SubmitProjectDeploymentOptions = {
+  projectId: string;
+  apiBaseUrl: string | null;
+  cookieHeader: string;
+  fetchImpl?: typeof fetch;
+};
+
+export async function submitProjectDeployment({
+  projectId,
+  apiBaseUrl,
+  cookieHeader,
+  fetchImpl = fetch
+}: SubmitProjectDeploymentOptions): Promise<SubmitProjectDeploymentResult> {
+  if (!apiBaseUrl) {
+    return { kind: "unconfigured", message: triggerCopy.unconfigured };
+  }
+
+  const url = new URL(`/api/v1/projects/${encodeURIComponent(projectId)}/deployments`, apiBaseUrl).toString();
+  let response: Response;
+  try {
+    response = await fetchImpl(url, {
+      method: "POST",
+      credentials: "include",
+      headers: { "content-type": "application/json", cookie: cookieHeader },
+      body: JSON.stringify({})
+    });
+  } catch {
+    return { kind: "unreachable", message: triggerCopy.unreachable };
+  }
+
+  if (!response.ok) {
+    return { kind: "rejected", message: triggerCopy.invalid };
+  }
+
+  let payload: unknown;
+  try {
+    payload = await response.json();
+  } catch {
+    return { kind: "invalid", message: triggerCopy.invalidPayload };
+  }
+
+  const deploymentId = extractDeploymentId(payload);
+  if (!deploymentId) {
+    return { kind: "invalid", message: triggerCopy.invalidPayload };
+  }
+
+  return { kind: "triggered", deploymentId, status: extractDeploymentStatus(payload) ?? "queued" };
+}
+
+function extractDeploymentId(payload: unknown): string | null {
+  if (!payload || typeof payload !== "object") return null;
+  const envelope = payload as { data?: unknown };
+  if (!envelope.data || typeof envelope.data !== "object") return null;
+  const data = envelope.data as { deployment?: unknown };
+  if (!data.deployment || typeof data.deployment !== "object") return null;
+  const deployment = data.deployment as { id?: unknown };
+  return typeof deployment.id === "string" && deployment.id.length > 0 ? deployment.id : null;
+}
+
+function extractDeploymentStatus(payload: unknown): string | null {
+  if (!payload || typeof payload !== "object") return null;
+  const envelope = payload as { data?: unknown };
+  if (!envelope.data || typeof envelope.data !== "object") return null;
+  const data = envelope.data as { deployment?: unknown };
+  if (!data.deployment || typeof data.deployment !== "object") return null;
+  const deployment = data.deployment as { status?: unknown };
+  return typeof deployment.status === "string" && deployment.status.length > 0 ? deployment.status : null;
+}
 
 export function ProjectDetailActions({ project, apiBaseUrl, cookieHeader, envVariables }: ProjectDetailActionsProps) {
   const router = useRouter();
@@ -49,26 +127,13 @@ export function ProjectDetailActions({ project, apiBaseUrl, cookieHeader, envVar
 
   async function onTrigger() {
     setTrigger({ kind: "pending" });
-    if (!apiBaseUrl) {
-      setTrigger({ kind: "error", message: "Configure DEPLOYLITE_WEB_API_BASE_URL." });
+    const result = await submitProjectDeployment({ projectId: project.id, apiBaseUrl, cookieHeader });
+    if (result.kind === "triggered") {
+      setTrigger({ kind: "triggered", deploymentId: result.deploymentId, status: result.status });
+      router.push(`/deployments/${result.deploymentId}`);
       return;
     }
-    try {
-      const response = await fetch(new URL(`/api/v1/projects/${project.id}/deployments`, apiBaseUrl).toString(), {
-        method: "POST",
-        credentials: "include",
-        headers: { "content-type": "application/json", cookie: cookieHeader },
-        body: JSON.stringify({})
-      });
-      if (!response.ok) {
-        setTrigger({ kind: "error", message: triggerCopy.invalid });
-        return;
-      }
-      setTrigger({ kind: "pending" });
-      router.refresh();
-    } catch {
-      setTrigger({ kind: "error", message: triggerCopy.unreachable });
-    }
+    setTrigger({ kind: "error", message: result.message });
   }
 
   async function onAddEnv(event: FormEvent<HTMLFormElement>) {
@@ -129,10 +194,19 @@ export function ProjectDetailActions({ project, apiBaseUrl, cookieHeader, envVar
           </CardDescription>
         </CardHeader>
         <CardContent className="flex flex-col gap-3">
-          <Button onClick={onTrigger} disabled={trigger.kind === "pending"}>
+          <Button
+            onClick={onTrigger}
+            disabled={trigger.kind === "pending"}
+            data-state={trigger.kind}
+          >
             {trigger.kind === "pending" ? "Triggering..." : "Deploy latest"}
           </Button>
-          {trigger.kind === "error" ? <p className="text-sm text-destructive" role="alert">{trigger.message}</p> : null}
+          {trigger.kind === "triggered" ? (
+            <p className="text-sm text-muted-foreground" role="status" aria-live="polite" data-testid="deploy-triggered-status">
+              Deployment {trigger.deploymentId} queued. Opening logs…
+            </p>
+          ) : null}
+          {trigger.kind === "error" ? <p className="text-sm text-destructive" role="alert" data-testid="deploy-trigger-error">{trigger.message}</p> : null}
         </CardContent>
       </Card>
 
