@@ -16,7 +16,8 @@ const projectFixture = {
   buildCommand: "pnpm build",
   runCommand: "node server.js",
   port: 3000,
-  description: null as string | null
+  description: null as string | null,
+  imageTag: null as string | null
 };
 
 describe("submitProjectDeployment", () => {

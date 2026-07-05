@@ -34,6 +34,7 @@ export function NewProjectForm({ apiBaseUrl, cookieHeader }: { apiBaseUrl: strin
       runCommand: { value: string };
       port: { value: string };
       description: { value: string };
+      imageTag: { value: string };
     };
     const input: ProjectCreateRequest = {
       name: form.name.value.trim(),
@@ -44,10 +45,12 @@ export function NewProjectForm({ apiBaseUrl, cookieHeader }: { apiBaseUrl: strin
     const run = form.runCommand.value.trim();
     const portRaw = form.port.value.trim();
     const description = form.description.value.trim();
+    const imageTag = form.imageTag.value.trim();
     if (build) input.buildCommand = build;
     if (run) input.runCommand = run;
     if (portRaw) input.port = Number(portRaw);
     if (description) input.description = description;
+    if (imageTag) input.imageTag = imageTag;
 
     if (!apiBaseUrl) {
       setStatus({ kind: "error", message: "Configure DEPLOYLITE_WEB_API_BASE_URL before creating projects." });
@@ -119,6 +122,11 @@ export function NewProjectForm({ apiBaseUrl, cookieHeader }: { apiBaseUrl: strin
               <FieldLabel htmlFor="project-description">Description (optional)</FieldLabel>
               <Input id="project-description" name="description" maxLength={2000} placeholder="Short summary shown next to the project" disabled={status.kind === "pending"} />
               <FieldDescription>Up to 2000 characters. Markdown is not rendered.</FieldDescription>
+            </Field>
+            <Field>
+              <FieldLabel htmlFor="project-image-tag">Image tag (optional)</FieldLabel>
+              <Input id="project-image-tag" name="imageTag" maxLength={256} placeholder="ghcr.io/example/app:v1.0.0" disabled={status.kind === "pending"} />
+              <FieldDescription>Config metadata only. The real deploy executor wires the tag in Phase 5; this is stored on the project record now.</FieldDescription>
             </Field>
           </FieldGroup>
           <div className="flex items-center gap-3">

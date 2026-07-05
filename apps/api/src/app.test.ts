@@ -26,7 +26,8 @@ function projectFixture(id = "project-1") {
     buildCommand: "pnpm build",
     runCommand: "pnpm start",
     port: 3000,
-    description: null
+    description: null,
+    imageTag: null
   };
 }
 
@@ -788,7 +789,7 @@ describe("DeployLite API scaffold", () => {
     };
     const projects: ProjectRepository = {
       async save() { throw new Error("unused"); },
-      async findById(id) { return id === "project-1" ? { id, name: "X", repoUrl: "https://github.com/example/x", defaultBranch: "main", buildCommand: null, runCommand: null, port: null, description: null } : null; },
+      async findById(id) { return id === "project-1" ? { id, name: "X", repoUrl: "https://github.com/example/x", defaultBranch: "main", buildCommand: null, runCommand: null, port: null, description: null, imageTag: null } : null; },
       async list() { return []; },
       async remove() { return false; }
     };
@@ -907,5 +908,67 @@ describe("DeployLite API scaffold", () => {
     const forbidden = await readOnlyFixture.app.inject({ method: "DELETE", url: `/api/v1/projects/${projectId}`, headers: { cookie: readOnlyCookie } });
     expect(forbidden.statusCode).toBe(403);
     expect(audit.events.some((event) => event.action === "project.delete" && event.targetId === projectId)).toBe(false);
+  });
+
+  it("persists a project image tag on create and surfaces it in detail, list, and the audit envelope", async () => {
+    const { app } = await authFixture();
+    const cookie = await loginCookie(app);
+
+    const create = await app.inject({
+      method: "POST",
+      url: "/api/v1/projects",
+      headers: { ...contentHeaders, cookie, "x-request-id": "req_project_image_tag_1" },
+      payload: { name: "Tagged", repoUrl: "https://github.com/example/tagged", defaultBranch: "main", imageTag: "ghcr.io/example/tagged:v1.2.3" }
+    });
+    expect(create.statusCode).toBe(200);
+    const projectId = create.json().data.project.id;
+    expect(create.json().data.project).toMatchObject({ name: "Tagged", imageTag: "ghcr.io/example/tagged:v1.2.3" });
+    expect(create.json().data.audit).toMatchObject({ action: "project.create", targetId: projectId, requestId: "req_project_image_tag_1" });
+
+    const detail = await app.inject({ method: "GET", url: `/api/v1/projects/${projectId}`, headers: { cookie } });
+    expect(detail.statusCode).toBe(200);
+    expect(detail.json().data.project.imageTag).toBe("ghcr.io/example/tagged:v1.2.3");
+
+    const list = await app.inject({ method: "GET", url: "/api/v1/projects", headers: { cookie } });
+    const listed = (list.json().data.projects as Array<{ id: string; imageTag: string | null }>).find((p) => p.id === projectId);
+    expect(listed?.imageTag).toBe("ghcr.io/example/tagged:v1.2.3");
+  });
+
+  it("clears a project image tag via PATCH and rejects invalid image tag shapes", async () => {
+    const { app } = await authFixture();
+    const cookie = await loginCookie(app);
+
+    const create = await app.inject({
+      method: "POST",
+      url: "/api/v1/projects",
+      headers: { ...contentHeaders, cookie },
+      payload: { name: "Taggable", repoUrl: "https://github.com/example/taggable", defaultBranch: "main", imageTag: "v1.0.0" }
+    });
+    const projectId = create.json().data.project.id;
+
+    const clear = await app.inject({
+      method: "PATCH",
+      url: `/api/v1/projects/${projectId}`,
+      headers: { ...contentHeaders, cookie },
+      payload: { imageTag: null }
+    });
+    expect(clear.statusCode).toBe(200);
+    expect(clear.json().data.project).toMatchObject({ id: projectId, name: "Taggable", imageTag: null });
+
+    const invalid = await app.inject({
+      method: "PATCH",
+      url: `/api/v1/projects/${projectId}`,
+      headers: { ...contentHeaders, cookie },
+      payload: { imageTag: "" }
+    });
+    expect(invalid.statusCode).toBe(400);
+
+    const oversize = await app.inject({
+      method: "PATCH",
+      url: `/api/v1/projects/${projectId}`,
+      headers: { ...contentHeaders, cookie },
+      payload: { imageTag: "x".repeat(257) }
+    });
+    expect(oversize.statusCode).toBe(400);
   });
 });

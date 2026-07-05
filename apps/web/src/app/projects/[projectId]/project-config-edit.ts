@@ -1,6 +1,7 @@
 import type { ProjectUpdateRequest } from "@deploylite/contracts";
 
 const projectDescriptionMaxLength = 2000;
+const projectImageTagMaxLength = 256;
 
 export type ProjectConfigFormValues = {
   name: string;
@@ -10,6 +11,7 @@ export type ProjectConfigFormValues = {
   runCommand: string;
   port: string | number | null;
   description?: string | null;
+  imageTag?: string | null;
 };
 
 type CurrentProjectConfig = {
@@ -20,6 +22,7 @@ type CurrentProjectConfig = {
   runCommand: string | null;
   port: number | null;
   description: string | null;
+  imageTag: string | null;
 };
 
 export type NormalizeProjectConfigUpdateResult =
@@ -45,6 +48,9 @@ export function normalizeProjectConfigUpdate(
   const descriptionResult = normalizeDescription(values.description);
   if (!descriptionResult.ok) return descriptionResult;
 
+  const imageTagResult = normalizeImageTag(values.imageTag);
+  if (!imageTagResult.ok) return imageTagResult;
+
   const payload: ProjectUpdateRequest = {};
   if (name !== current.name) payload.name = name;
   if (repoUrl !== current.repoUrl) payload.repoUrl = repoUrl;
@@ -54,6 +60,7 @@ export function normalizeProjectConfigUpdate(
   assignOptionalString(payload, "runCommand", values.runCommand, current.runCommand);
   if (portResult.port !== current.port) payload.port = portResult.port;
   if (descriptionResult.changed) payload.description = descriptionResult.description;
+  if (imageTagResult.changed) payload.imageTag = imageTagResult.imageTag;
 
   return { ok: true, payload };
 }
@@ -80,6 +87,20 @@ function normalizeDescription(rawDescription: string | null | undefined): { ok: 
     return { ok: false, message: `Project description must be ${projectDescriptionMaxLength} characters or fewer.` };
   }
   return { ok: true, description: trimmed.length > 0 ? trimmed : null, changed: true };
+}
+
+function normalizeImageTag(rawImageTag: string | null | undefined): { ok: true; imageTag: string | null; changed: boolean } | { ok: false; message: string } {
+  if (rawImageTag === undefined) {
+    return { ok: true, imageTag: null, changed: false };
+  }
+  const trimmed = (rawImageTag ?? "").trim();
+  if (trimmed.length === 0) {
+    return { ok: true, imageTag: null, changed: true };
+  }
+  if (trimmed.length > projectImageTagMaxLength) {
+    return { ok: false, message: `Project image tag must be ${projectImageTagMaxLength} characters or fewer.` };
+  }
+  return { ok: true, imageTag: trimmed, changed: true };
 }
 
 function normalizePort(rawPort: string | number | null): { ok: true; port: number | null } | { ok: false; message: string } {

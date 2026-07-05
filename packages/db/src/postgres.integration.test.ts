@@ -164,7 +164,8 @@ describeIntegration("PostgreSQL auth foundation integration", () => {
       buildCommand: "pnpm build",
       runCommand: "pnpm start",
       port: 3000,
-      description: null
+      description: null,
+      imageTag: null
     });
 
     await requireDbDeploymentRepository().save({

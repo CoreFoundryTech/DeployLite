@@ -57,7 +57,8 @@ const mockProject: Project = {
   buildCommand: "pnpm build",
   runCommand: "pnpm start",
   port: 3000,
-  description: null
+  description: null,
+  imageTag: null
 };
 
 const mockDeployment: Deployment = {

@@ -522,7 +522,8 @@ async function seedMockData(state: PlatformRepositories): Promise<void> {
     buildCommand: "pnpm build",
     runCommand: "pnpm start",
     port: 3000,
-    description: null
+    description: null,
+    imageTag: null
   });
   await state.deployments.save({
     id: "dep_mock_1",
@@ -676,7 +677,8 @@ function registerRoutes(app: FastifyInstance, state: PlatformRepositories, adapt
       buildCommand: body.buildCommand ?? null,
       runCommand: body.runCommand ?? null,
       port: body.port ?? null,
-      description: body.description ?? null
+      description: body.description ?? null,
+      imageTag: body.imageTag ?? null
     };
     const saved = await state.projects.save(project);
     return ok(request, { project: saved, audit: auditMutation(request, "project.create", "project", saved.id) });
@@ -701,7 +703,8 @@ function registerRoutes(app: FastifyInstance, state: PlatformRepositories, adapt
       buildCommand: body.buildCommand !== undefined ? (body.buildCommand ?? null) : existing.buildCommand,
       runCommand: body.runCommand !== undefined ? (body.runCommand ?? null) : existing.runCommand,
       port: body.port !== undefined ? (body.port ?? null) : existing.port,
-      description: body.description !== undefined ? (body.description ?? null) : existing.description
+      description: body.description !== undefined ? (body.description ?? null) : existing.description,
+      imageTag: body.imageTag !== undefined ? (body.imageTag ?? null) : existing.imageTag
     };
     const saved = await state.projects.save(next);
     return ok(request, { project: saved, audit: auditMutation(request, "project.update", "project", saved.id) });

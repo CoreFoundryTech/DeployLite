@@ -124,6 +124,7 @@ export const projects = pgTable("projects", {
   runCommand: text("run_command"),
   port: integer("port"),
   description: text("description"),
+  imageTag: text("image_tag"),
   ...timestamps
 });
 

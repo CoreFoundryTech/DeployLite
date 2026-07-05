@@ -63,7 +63,8 @@ export class DbProjectRepository implements ProjectRepository {
         buildCommand: project.buildCommand,
         runCommand: project.runCommand,
         port: project.port,
-        description: project.description
+        description: project.description,
+        imageTag: project.imageTag
       })
       .onConflictDoUpdate({
         target: projects.id,
@@ -75,6 +76,7 @@ export class DbProjectRepository implements ProjectRepository {
           runCommand: project.runCommand,
           port: project.port,
           description: project.description,
+          imageTag: project.imageTag,
           updatedAt: new Date()
         }
       })
@@ -109,7 +111,8 @@ function toProject(row: typeof projects.$inferSelect): Project {
     buildCommand: row.buildCommand,
     runCommand: row.runCommand,
     port: row.port,
-    description: row.description
+    description: row.description,
+    imageTag: row.imageTag
   };
 }
 

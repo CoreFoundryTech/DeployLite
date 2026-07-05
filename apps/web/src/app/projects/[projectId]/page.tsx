@@ -115,6 +115,10 @@ export default async function ProjectDetailPage({ params }: { params: Promise<Pa
               <ConfigRow label="Run command" value={project.runCommand ?? "—"} />
               <ConfigRow label="Port" value={project.port?.toString() ?? "—"} />
             </div>
+            <div className="grid gap-3 md:grid-cols-2">
+              <ConfigRow label="Image tag" value={project.imageTag ?? "—"} />
+              <ConfigRow label="Description" value={project.description ?? "—"} />
+            </div>
             <ProjectConfigEditForm project={project} apiBaseUrl={apiBaseUrl} cookieHeader={cookieHeader} />
           </CardContent>
         </Card>

@@ -97,7 +97,8 @@ describe("contracts", () => {
       buildCommand: null,
       runCommand: null,
       port: null,
-      description: null
+      description: null,
+      imageTag: null
     });
 
     expect(parsed.description).toBeNull();
@@ -107,5 +108,45 @@ describe("contracts", () => {
     const result = projectUpdateRequestSchema.parse({ description: null });
 
     expect(result).toEqual({ description: null });
+  });
+
+  it("accepts a project image tag on create, surfaces it on the canonical schema, and clears via null on update", () => {
+    const created = projectCreateRequestSchema.parse({
+      name: "Tagged",
+      repoUrl: "https://github.com/example/tagged",
+      defaultBranch: "main",
+      imageTag: "ghcr.io/example/tagged:v1.2.3"
+    });
+
+    expect(created.imageTag).toBe("ghcr.io/example/tagged:v1.2.3");
+
+    const canonical = projectSchema.parse({
+      id: "project_tagged",
+      name: "Tagged",
+      repoUrl: "https://github.com/example/tagged",
+      defaultBranch: "main",
+      buildCommand: null,
+      runCommand: null,
+      port: null,
+      description: null,
+      imageTag: "v1.0.0"
+    });
+
+    expect(canonical.imageTag).toBe("v1.0.0");
+
+    const cleared = projectUpdateRequestSchema.parse({ imageTag: null });
+    expect(cleared).toEqual({ imageTag: null });
+  });
+
+  it("rejects empty or oversized project image tags across create and update payloads", () => {
+    expect(projectCreateRequestSchema.safeParse({
+      name: "Tagged",
+      repoUrl: "https://github.com/example/tagged",
+      defaultBranch: "main",
+      imageTag: ""
+    }).success).toBe(false);
+
+    expect(projectUpdateRequestSchema.safeParse({ imageTag: "" }).success).toBe(false);
+    expect(projectUpdateRequestSchema.safeParse({ imageTag: "x".repeat(257) }).success).toBe(false);
   });
 });
