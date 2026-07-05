@@ -120,7 +120,8 @@ export function ProjectDetailActions({ project, apiBaseUrl, cookieHeader, envVar
 
   return (
     <div className="flex flex-col gap-6">
-      <Card>
+      {/* Anchor targets for the launch-checklist CTAs in the parent page; do not rename without updating those links. */}
+      <Card id="deploy-actions">
         <CardHeader>
           <CardTitle>Trigger deployment</CardTitle>
           <CardDescription>
@@ -135,7 +136,7 @@ export function ProjectDetailActions({ project, apiBaseUrl, cookieHeader, envVar
         </CardContent>
       </Card>
 
-      <Card>
+      <Card id="env-metadata">
         <CardHeader>
           <CardTitle>Env metadata</CardTitle>
           <CardDescription>

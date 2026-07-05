@@ -266,9 +266,15 @@ describe("project detail and deploy flow rendering", () => {
     expect(html).toContain("node server.js");
     expect(html).toContain("3000");
     expect(html).toContain("DATABASE_URL");
+    expect(html).toContain("Launch checklist");
+    expect(html).toContain("3/4 ready");
+    expect(html).toContain("Missing values for: DATABASE_URL");
+    expect(html).toContain("#env-metadata");
+    expect(html).toContain("#deploy-actions");
     expect(html).toContain("Deploy latest");
     expect(html).toContain("Recent deployments");
     expect(html).toContain("/deployments/dep-1");
+    expect(html).toContain("View latest logs");
   });
 
   it("renders the projects list page with the new project CTA", async () => {

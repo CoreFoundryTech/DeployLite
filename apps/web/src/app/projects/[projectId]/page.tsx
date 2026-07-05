@@ -9,6 +9,7 @@ import { Button } from "@/components/ui/button";
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card";
 import { Separator } from "@/components/ui/separator";
 import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from "@/components/ui/table";
+import type { Deployment, EnvVariableMetadata, Project } from "@deploylite/contracts";
 
 export const dynamic = "force-dynamic";
 
@@ -67,6 +68,9 @@ export default async function ProjectDetailPage({ params }: { params: Promise<Pa
   }
 
   const { project, envVariables, deployments } = result.data;
+  const launchChecklist = buildLaunchChecklist(project, envVariables, deployments);
+  const latestDeployment = getLatestDeployment(deployments);
+  const readyCount = launchChecklist.filter((item) => item.state === "ready").length;
   const cookieStore = await cookies();
   const cookieHeader = cookieStore.getAll().map((c) => `${c.name}=${c.value}`).join("; ");
 
@@ -93,6 +97,46 @@ export default async function ProjectDetailPage({ params }: { params: Promise<Pa
             <ConfigRow label="Build command" value={project.buildCommand ?? "—"} />
             <ConfigRow label="Run command" value={project.runCommand ?? "—"} />
             <ConfigRow label="Port" value={project.port?.toString() ?? "—"} />
+          </CardContent>
+        </Card>
+
+        <Card>
+          <CardHeader>
+            <div className="flex flex-col gap-3 sm:flex-row sm:items-start sm:justify-between">
+              <div>
+                <CardTitle>Launch checklist</CardTitle>
+                <CardDescription>Post-install path for creating, configuring, and deploying this app from the UI.</CardDescription>
+              </div>
+              <Badge variant={readyCount === launchChecklist.length ? "secondary" : "outline"}>{readyCount}/{launchChecklist.length} ready</Badge>
+            </div>
+          </CardHeader>
+          <CardContent className="flex flex-col gap-4">
+            <div className="grid gap-3 md:grid-cols-2">
+              {launchChecklist.map((item) => (
+                <div key={item.label} className="rounded-md border p-3">
+                  <div className="flex items-center justify-between gap-3">
+                    <span className="text-sm font-medium">{item.label}</span>
+                    <Badge variant={checklistVariant(item.state)}>{item.badge}</Badge>
+                  </div>
+                  <p className="mt-2 text-sm text-muted-foreground">{item.detail}</p>
+                </div>
+              ))}
+            </div>
+            <Separator />
+            {/* Anchor targets `#env-metadata` and `#deploy-actions` are owned by `project-detail-actions.tsx` (the in-page side panel); keep both sides in sync when the panel layout changes. */}
+            <div className="flex flex-wrap gap-2">
+              <Link href="#env-metadata">
+                <Button variant="outline">Configure env metadata</Button>
+              </Link>
+              <Link href="#deploy-actions">
+                <Button variant="outline">Open deploy panel</Button>
+              </Link>
+              {latestDeployment ? (
+                <Link href={`/deployments/${latestDeployment.id}`}>
+                  <Button>View latest logs</Button>
+                </Link>
+              ) : null}
+            </div>
           </CardContent>
         </Card>
 
@@ -167,4 +211,65 @@ function statusVariant(status: string): "default" | "secondary" | "destructive" 
   return "outline";
 }
 
-void Separator;
+type ChecklistState = "ready" | "pending" | "attention";
+
+type ChecklistItem = {
+  label: string;
+  state: ChecklistState;
+  badge: string;
+  detail: string;
+};
+
+function buildLaunchChecklist(project: Project, envVariables: EnvVariableMetadata[], deployments: Deployment[]): ChecklistItem[] {
+  const latestDeployment = getLatestDeployment(deployments);
+  const requiredEnv = envVariables.filter((record) => record.required);
+  const missingRequiredEnv = requiredEnv.filter((record) => !record.valuePresent);
+  const hasRuntime = Boolean(project.runCommand && project.port);
+
+  return [
+    {
+      label: "Source",
+      state: project.repoUrl && project.defaultBranch ? "ready" : "attention",
+      badge: project.repoUrl && project.defaultBranch ? "Ready" : "Missing",
+      detail: project.repoUrl && project.defaultBranch ? `Repository and branch ${project.defaultBranch} are saved.` : "Add a repository URL and default branch."
+    },
+    {
+      label: "Runtime",
+      state: hasRuntime ? "ready" : "attention",
+      badge: hasRuntime ? "Ready" : "Needs command",
+      detail: hasRuntime ? `Run command targets port ${project.port}.` : "Set a run command and port before triggering useful deploys."
+    },
+    {
+      label: "Environment",
+      state: missingRequiredEnv.length === 0 ? "ready" : "attention",
+      badge: missingRequiredEnv.length === 0 ? "Unblocked" : `${missingRequiredEnv.length} missing`,
+      detail: missingRequiredEnv.length === 0
+        ? requiredEnv.length > 0
+          ? `${requiredEnv.length} required key(s) have values present.`
+          : "No required env keys are blocking deployment."
+        : `Missing values for: ${missingRequiredEnv.map((record) => record.key).join(", ")}.`
+    },
+    {
+      label: "Deploy",
+      state: deploymentChecklistState(latestDeployment),
+      badge: latestDeployment ? latestDeployment.status : "Not run",
+      detail: latestDeployment ? `Latest deployment ${latestDeployment.id} is ${latestDeployment.status}.` : "Trigger the first deployment from the deploy panel."
+    }
+  ];
+}
+
+function getLatestDeployment(deployments: Deployment[]): Deployment | null {
+  return [...deployments].sort((a, b) => new Date(b.startedAt).getTime() - new Date(a.startedAt).getTime())[0] ?? null;
+}
+
+function deploymentChecklistState(deployment: Deployment | null): ChecklistState {
+  if (!deployment) return "pending";
+  if (deployment.status === "failed" || deployment.status === "canceled") return "attention";
+  return "ready";
+}
+
+function checklistVariant(state: ChecklistState): "default" | "secondary" | "destructive" | "outline" {
+  if (state === "ready") return "secondary";
+  if (state === "attention") return "destructive";
+  return "outline";
+}
