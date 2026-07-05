@@ -206,7 +206,7 @@ class InMemoryAuditRepository implements AuditRepository {
 
   async append(input: AuditEventInput): Promise<AuditEvent> {
     const safe = createAuditLogRecord({
-      actorId: input.actorUserId ?? "system",
+      actorId: input.actorUserId === null ? "anonymous" : input.actorUserId ?? "system",
       action: input.action,
       targetType: input.targetType,
       targetId: input.targetId,
@@ -620,7 +620,7 @@ function registerRoutes(app: FastifyInstance, state: PlatformRepositories, adapt
       return reply.code(409).send(errorEnvelope(request, "BOOTSTRAP_LOCKED", "Initial admin setup is no longer available."));
     }
 
-    await appendAudit(adapters.audit, request, { actorUserId: result.user.id, action: "bootstrap.initial-admin.created", targetType: "user", targetId: result.user.id });
+    await appendAudit(adapters.audit, request, { actorUserId: null, action: "bootstrap.initial-admin", targetType: "user", targetId: result.user.id });
     return ok(request, { user: toSafeAuthDto(result.user) });
   });
   app.post(`${API_PREFIX}/auth/login`, async (request, reply) => {

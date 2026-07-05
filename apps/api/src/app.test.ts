@@ -230,6 +230,24 @@ describe("DeployLite API scaffold", () => {
     expect(response.json().data).toEqual({ setupRequired: true });
   });
 
+  it("reports bootstrap status as not required after the first user is created", async () => {
+    const users = new InMemoryAuthUserRepository();
+    const app = await buildApiApp({ auth: { users } });
+
+    const before = await app.inject({ method: "GET", url: "/api/v1/bootstrap/status" });
+    expect(before.statusCode).toBe(200);
+    expect(before.json().data).toEqual({ setupRequired: true });
+
+    const created = await app.inject({ method: "POST", url: "/api/v1/bootstrap/initial-admin", headers: contentHeaders, payload: { email: "first@example.test", password: "long-enough-password" } });
+    expect(created.statusCode).toBe(200);
+
+    const after = await app.inject({ method: "GET", url: "/api/v1/bootstrap/status" });
+    expect(after.statusCode).toBe(200);
+    expect(after.json().data).toEqual({ setupRequired: false });
+
+    await app.close();
+  });
+
   it("creates the first admin and records an audit event", async () => {
     const audit = new InMemoryAuditRepository();
     const app = await buildApiApp({ auth: { audit, users: new InMemoryAuthUserRepository() } });
@@ -237,7 +255,20 @@ describe("DeployLite API scaffold", () => {
 
     expect(response.statusCode).toBe(200);
     expect(response.json().data.user).toEqual(expect.objectContaining({ email: "first@example.test", role: "admin", status: "active" }));
-    expect(audit.inputs.some((event) => event.action === "bootstrap.initial-admin.created" && event.requestId === "req_bootstrap_1")).toBe(true);
+    expect(audit.inputs.some((event) => event.action === "bootstrap.initial-admin" && event.requestId === "req_bootstrap_1")).toBe(true);
+  });
+
+  it("records the first-owner bootstrap audit with an anonymous actor", async () => {
+    const audit = new InMemoryAuditRepository();
+    const app = await buildApiApp({ auth: { audit, users: new InMemoryAuthUserRepository() } });
+    const response = await app.inject({ method: "POST", url: "/api/v1/bootstrap/initial-admin", headers: { ...contentHeaders, "x-request-id": "req_bootstrap_anon_1" }, payload: { email: "first@example.test", password: "long-enough-password" } });
+
+    expect(response.statusCode).toBe(200);
+    const created = audit.events.find((event) => event.action === "bootstrap.initial-admin" && event.requestId === "req_bootstrap_anon_1");
+    expect(created).toBeDefined();
+    expect(created?.actorId).toBe("anonymous");
+
+    await app.close();
   });
 
   it("rejects invalid bootstrap input and audits the rejection", async () => {
@@ -255,6 +286,30 @@ describe("DeployLite API scaffold", () => {
 
     expect(response.statusCode).toBe(409);
     expect(audit.inputs.some((event) => event.action === "bootstrap.initial-admin.rejected" && event.metadata?.["reason"] === "locked")).toBe(true);
+  });
+
+  it("never persists the submitted password in bootstrap audit metadata", async () => {
+    const audit = new InMemoryAuditRepository();
+    const submitted = "first-owner-very-secret-password-123";
+    const users = new InMemoryAuthUserRepository();
+
+    const created = await buildApiApp({ auth: { audit, users, hasher: new BcryptPasswordHasher(10) } });
+    const createdResponse = await created.inject({ method: "POST", url: "/api/v1/bootstrap/initial-admin", headers: contentHeaders, payload: { email: "first@example.test", password: submitted } });
+    expect(createdResponse.statusCode).toBe(200);
+
+    const rejectedInvalid = await created.inject({ method: "POST", url: "/api/v1/bootstrap/initial-admin", headers: contentHeaders, payload: { email: "bad", password: "short" } });
+    expect(rejectedInvalid.statusCode).toBe(400);
+
+    const second = await created.inject({ method: "POST", url: "/api/v1/bootstrap/initial-admin", headers: contentHeaders, payload: { email: "second@example.test", password: submitted } });
+    expect(second.statusCode).toBe(409);
+
+    const bootstrapEvents = audit.inputs.filter((event) => event.action === "bootstrap.initial-admin" || event.action === "bootstrap.initial-admin.rejected");
+    expect(bootstrapEvents.length).toBeGreaterThanOrEqual(3);
+    for (const event of bootstrapEvents) {
+      expect(JSON.stringify(event.metadata ?? {})).not.toContain(submitted);
+    }
+
+    await created.close();
   });
 
   it("maps concurrent atomic bootstrap conflicts to locked without creating a second admin", async () => {

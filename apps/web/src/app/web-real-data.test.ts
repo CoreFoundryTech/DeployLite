@@ -96,7 +96,8 @@ describe("initial admin setup client interactions", () => {
       }
     });
 
-    expect(result).toEqual({ kind: "success", message: "First admin created. Sign in with the new local admin account." });
+    expect(result.kind).toBe("success");
+    expect(result.kind === "success" && result.message).toContain("First admin created");
     expect(new URL(calls[0]?.url ?? "").pathname).toBe("/api/v1/bootstrap/initial-admin");
     expect(JSON.stringify(result)).not.toContain("very-secret-admin-password");
   });
@@ -140,6 +141,26 @@ describe("initial admin setup client interactions", () => {
     expect(html).toContain("role=\"status\"");
     expect(html).toContain("aria-live=\"polite\"");
     expect(html).toContain("disabled");
+  });
+
+  it("renders a post-setup continuation hint that points the operator to the dashboard and never echoes the password", () => {
+    const html = renderToStaticMarkup(React.createElement(InitialAdminSetupPanel, {
+      apiBaseUrl,
+      state: {
+        message: "First admin created. Sign in with the new local admin account.",
+        error: "",
+        created: true,
+        pending: false
+      },
+      onSubmit: vi.fn()
+    }));
+
+    expect(html).toContain("data-testid=\"first-owner-success-summary\"");
+    expect(html).toContain("data-testid=\"first-owner-continue-cta\"");
+    expect(html).toContain("Open the dashboard");
+    expect(html).toContain("/dashboard");
+    expect(html).toContain("aria-live=\"polite\"");
+    expect(html).not.toContain("very-secret-admin-password");
   });
 });
 
