@@ -238,6 +238,117 @@ describe("deployment log real API rendering", () => {
     expect(html.indexOf("1 INFO First event")).toBeLessThan(html.indexOf("2 INFO Second event"));
     expect(html).toContain("last event ID: 2");
   });
+
+  it("renders the evidence summary card with status, project link, commit, timing, event count, and latest sequence for a healthy deployment", async () => {
+    mockCookies("deploylite_session", "opaque");
+    process.env.DEPLOYLITE_WEB_API_BASE_URL = apiBaseUrl;
+    mockFetch({
+      "/api/v1/auth/me": { data: { user: userFixture }, error: null, requestId: "req_auth_1" },
+      "/api/v1/deployments/dep-1": {
+        data: {
+          deployment: {
+            ...deploymentFixture,
+            status: "succeeded",
+            commitSha: "abcdef1",
+            startedAt: "2026-01-01T00:00:00.000Z",
+            finishedAt: "2026-01-01T00:00:30.000Z"
+          }
+        },
+        error: null,
+        requestId: "req_deployment_evidence"
+      },
+      "/api/v1/deployments/dep-1/logs": {
+        data: { events: [logFixture(1, "Build started"), { ...logFixture(2, "Build finished"), redactionApplied: false }] },
+        error: null,
+        requestId: "req_logs_evidence"
+      }
+    });
+
+    const html = renderToStaticMarkup(await DeploymentLogsPage({ params: Promise.resolve({ deploymentId: "dep-1" }) }));
+
+    expect(html).toContain("data-testid=\"deployment-evidence-summary\"");
+    expect(html).toContain("Deployment evidence");
+    expect(html).toContain("abcdef1");
+    expect(html).toContain("data-testid=\"evidence-project-link\"");
+    expect(html).toContain('href="/projects/project-1"');
+    expect(html).toContain("data-testid=\"evidence-event-count\"");
+    expect(html).toContain(">2<");
+    expect(html).toContain("data-testid=\"evidence-latest-sequence\"");
+    expect(html).toContain("#2");
+    expect(html).toContain("raw");
+    expect(html).toContain("data-testid=\"deployment-next-actions\"");
+    expect(html).toContain("data-testid=\"cta-back-to-project\"");
+    expect(html).toContain("Back to project");
+    expect(html).toContain("data-testid=\"cta-view-all-deployments\"");
+    expect(html).toContain("View all deployments");
+    expect(html).toContain('href="/deployments"');
+    expect(html).not.toContain("data-testid=\"deployment-attention-alert\"");
+    expect(html).not.toContain("This deployment needs attention");
+  });
+
+  it("shows the failed-state guidance and redacted status in the evidence summary", async () => {
+    mockCookies("deploylite_session", "opaque");
+    process.env.DEPLOYLITE_WEB_API_BASE_URL = apiBaseUrl;
+    mockFetch({
+      "/api/v1/auth/me": { data: { user: userFixture }, error: null, requestId: "req_auth_1" },
+      "/api/v1/deployments/dep-1": {
+        data: {
+          deployment: {
+            ...deploymentFixture,
+            status: "failed",
+            startedAt: "2026-01-01T00:00:00.000Z",
+            finishedAt: "2026-01-01T00:00:42.000Z"
+          }
+        },
+        error: null,
+        requestId: "req_deployment_failed"
+      },
+      "/api/v1/deployments/dep-1/logs": {
+        data: { events: [logFixture(1, "Redacted secret leaked")] },
+        error: null,
+        requestId: "req_logs_failed"
+      }
+    });
+
+    const html = renderToStaticMarkup(await DeploymentLogsPage({ params: Promise.resolve({ deploymentId: "dep-1" }) }));
+
+    expect(html).toContain("data-testid=\"deployment-attention-alert\"");
+    expect(html).toContain("This deployment needs attention");
+    expect(html).toContain("project configuration");
+    expect(html).toContain('href="/projects/project-1#env-metadata"');
+    expect(html).toContain("VPS, Docker, Dokploy, Traefik, ACME");
+    expect(html).toContain("redacted");
+    expect(html).toContain('href="/projects/project-1"');
+    expect(html).toContain("Back to project");
+    expect(html).toContain("View all deployments");
+  });
+
+  it("keeps the no-log state path while still rendering the evidence summary, project link, and CTAs", async () => {
+    mockCookies("deploylite_session", "opaque");
+    process.env.DEPLOYLITE_WEB_API_BASE_URL = apiBaseUrl;
+    mockFetch({
+      "/api/v1/auth/me": { data: { user: userFixture }, error: null, requestId: "req_auth_1" },
+      "/api/v1/deployments/dep-1": {
+        data: {
+          deployment: { ...deploymentFixture, status: "running", startedAt: "2026-01-01T00:00:00.000Z", finishedAt: null }
+        },
+        error: null,
+        requestId: "req_deployment_running"
+      },
+      "/api/v1/deployments/dep-1/logs": { data: { events: [] }, error: null, requestId: "req_logs_empty" }
+    });
+
+    const html = renderToStaticMarkup(await DeploymentLogsPage({ params: Promise.resolve({ deploymentId: "dep-1" }) }));
+
+    expect(html).toContain("data-testid=\"deployment-evidence-summary\"");
+    expect(html).toContain("data-testid=\"log-empty-state\"");
+    expect(html).toContain("No log events are available yet.");
+    expect(html).toContain(">0<");
+    expect(html).toContain("—");
+    expect(html).toContain("Back to project");
+    expect(html).toContain("View all deployments");
+    expect(html).not.toContain("data-testid=\"deployment-attention-alert\"");
+  });
 });
 
 describe("project detail and deploy flow rendering", () => {
