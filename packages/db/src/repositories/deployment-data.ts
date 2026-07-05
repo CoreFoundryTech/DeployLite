@@ -54,26 +54,54 @@ export class DbProjectRepository implements ProjectRepository {
   async save(project: Project): Promise<Project> {
     const [row] = await this.db
       .insert(projects)
-      .values({ id: project.id, name: project.name, repoUrl: project.repoUrl, defaultBranch: project.defaultBranch })
+      .values({
+        id: project.id,
+        name: project.name,
+        repoUrl: project.repoUrl,
+        defaultBranch: project.defaultBranch,
+        buildCommand: project.buildCommand,
+        runCommand: project.runCommand,
+        port: project.port
+      })
       .onConflictDoUpdate({
         target: projects.id,
-        set: { name: project.name, repoUrl: project.repoUrl, defaultBranch: project.defaultBranch, updatedAt: new Date() }
+        set: {
+          name: project.name,
+          repoUrl: project.repoUrl,
+          defaultBranch: project.defaultBranch,
+          buildCommand: project.buildCommand,
+          runCommand: project.runCommand,
+          port: project.port,
+          updatedAt: new Date()
+        }
       })
       .returning();
 
     if (!row) throw new Error("Failed to save project");
-    return { id: row.id, name: row.name, repoUrl: row.repoUrl, defaultBranch: row.defaultBranch };
+    return toProject(row);
   }
 
   async list(): Promise<Project[]> {
     const rows = await this.db.select().from(projects);
-    return rows.map((row) => ({ id: row.id, name: row.name, repoUrl: row.repoUrl, defaultBranch: row.defaultBranch }));
+    return rows.map(toProject);
   }
 
   async findById(id: string): Promise<Project | null> {
     const [row] = await this.db.select().from(projects).where(eq(projects.id, id)).limit(1);
-    return row ? { id: row.id, name: row.name, repoUrl: row.repoUrl, defaultBranch: row.defaultBranch } : null;
+    return row ? toProject(row) : null;
   }
+}
+
+function toProject(row: typeof projects.$inferSelect): Project {
+  return {
+    id: row.id,
+    name: row.name,
+    repoUrl: row.repoUrl,
+    defaultBranch: row.defaultBranch,
+    buildCommand: row.buildCommand,
+    runCommand: row.runCommand,
+    port: row.port
+  };
 }
 
 export class DbDeploymentRepository implements DeploymentRepository {

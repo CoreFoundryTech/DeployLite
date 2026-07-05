@@ -1,4 +1,4 @@
-import type { Agent, AgentHeartbeat, Deployment, LogEvent, Project, ScaffoldUser } from "@deploylite/contracts";
+import type { Agent, AgentHeartbeat, Deployment, EnvVariableMetadata, LogEvent, Project, ScaffoldUser } from "@deploylite/contracts";
 import { redactLogMessage } from "@deploylite/config";
 
 export const canonicalRoleNames = ["admin", "operator", "read-only", "auditor"] as const;
@@ -89,6 +89,14 @@ export type ProjectRepository = {
   save(project: Project): Promise<Project>;
   findById(id: string): Promise<Project | null>;
   list(): Promise<Project[]>;
+};
+
+export type EnvVariableMetadataRecord = EnvVariableMetadata;
+
+export type EnvVariableMetadataRepository = {
+  listByProject(projectId: string): Promise<EnvVariableMetadataRecord[]>;
+  upsert(record: EnvVariableMetadataRecord): Promise<EnvVariableMetadataRecord>;
+  remove(projectId: string, key: string, scope: EnvVariableMetadataRecord["scope"]): Promise<boolean>;
 };
 
 export type UserRepository = {
@@ -213,10 +221,6 @@ export class InMemoryDeploymentRepository implements DeploymentRepository {
   readonly #logs = new Map<string, LogEvent[]>();
 
   async save(deployment: Deployment): Promise<Deployment> {
-    const current = this.#deployments.get(deployment.id);
-    if (current) {
-      throw new Error("Deployment records are immutable in the scaffold domain");
-    }
     this.#deployments.set(deployment.id, structuredClone(deployment));
     return deployment;
   }
@@ -241,5 +245,27 @@ export class InMemoryDeploymentRepository implements DeploymentRepository {
 
   async listLogs(deploymentId: string, afterSequence = -1): Promise<LogEvent[]> {
     return (this.#logs.get(deploymentId) ?? []).filter((event) => event.sequence > afterSequence);
+  }
+}
+
+export class InMemoryEnvVariableMetadataRepository implements EnvVariableMetadataRepository {
+  readonly #records = new Map<string, EnvVariableMetadataRecord>();
+
+  #key(projectId: string, key: string, scope: EnvVariableMetadataRecord["scope"]): string {
+    return `${projectId}::${scope}::${key}`;
+  }
+
+  async listByProject(projectId: string): Promise<EnvVariableMetadataRecord[]> {
+    return [...this.#records.values()].filter((record) => record.projectId === projectId);
+  }
+
+  async upsert(record: EnvVariableMetadataRecord): Promise<EnvVariableMetadataRecord> {
+    const clone = structuredClone(record);
+    this.#records.set(this.#key(record.projectId, record.key, record.scope), clone);
+    return clone;
+  }
+
+  async remove(projectId: string, key: string, scope: EnvVariableMetadataRecord["scope"]): Promise<boolean> {
+    return this.#records.delete(this.#key(projectId, key, scope));
   }
 }

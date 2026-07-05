@@ -26,7 +26,7 @@ describe("domain foundation", () => {
     expect(agent ? service.markStale(agent, now).status : "missing").toBe("stale");
   });
 
-  it("keeps deployment records immutable", async () => {
+  it("updates deployment records when status transitions to a terminal state", async () => {
     const deployments = new InMemoryDeploymentRepository();
     const deployment = {
       id: "dep_1",
@@ -39,7 +39,9 @@ describe("domain foundation", () => {
     };
 
     await deployments.save(deployment);
-    await expect(deployments.save({ ...deployment, status: "succeeded" })).rejects.toThrow("immutable");
+    const next = await deployments.save({ ...deployment, status: "succeeded" });
+    expect(next.status).toBe("succeeded");
+    expect(await deployments.findById("dep_1")).toMatchObject({ status: "succeeded" });
   });
 
   it("redacts and preserves ordered immutable logs", async () => {
