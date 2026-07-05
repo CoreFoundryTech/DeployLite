@@ -93,12 +93,36 @@ install_docker() {
     return
   fi
   command_exists apt-get || fail "Docker is missing and automatic install requires apt-get." 2
-  info "Installing Docker Engine and Compose plugin through apt."
+  info "Installing Docker Engine and Compose plugin through Docker's official apt repository."
+  install_docker_apt_repository
   as_root apt-get update
-  as_root apt-get install -y ca-certificates curl gnupg docker.io docker-compose-plugin
+  as_root apt-get install -y docker-ce docker-ce-cli containerd.io docker-buildx-plugin docker-compose-plugin
   command_exists docker || fail "Docker installation did not provide docker CLI." 2
   as_root docker compose version >/dev/null 2>&1 || fail "Docker Compose plugin is unavailable after install." 2
   record_change "docker-installed-or-updated"
+}
+
+install_docker_apt_repository() {
+  local codename arch signed_by repo_file
+  command_exists curl || as_root apt-get install -y ca-certificates curl gnupg
+  command_exists gpg || as_root apt-get install -y gnupg
+  # shellcheck disable=SC1091
+  . /etc/os-release
+  codename="${VERSION_CODENAME:-}"
+  [[ -n "$codename" ]] || fail "Could not detect distro codename for Docker apt repository." 2
+  case "$(dpkg --print-architecture)" in
+    amd64|arm64) arch="$(dpkg --print-architecture)" ;;
+    *) fail "Unsupported apt architecture for Docker repository: $(dpkg --print-architecture)." 2 ;;
+  esac
+  signed_by="/etc/apt/keyrings/docker.asc"
+  repo_file="/etc/apt/sources.list.d/docker.list"
+  as_root install -m 0755 -d /etc/apt/keyrings
+  if [[ ! -s "$signed_by" ]]; then
+    curl -fsSL "https://download.docker.com/linux/${ID}/gpg" | as_root tee "$signed_by" >/dev/null
+    as_root chmod a+r "$signed_by"
+  fi
+  printf 'deb [arch=%s signed-by=%s] https://download.docker.com/linux/%s %s stable\n' "$arch" "$signed_by" "${ID}" "$codename" \
+    | as_root tee "$repo_file" >/dev/null
 }
 
 random_secret() {

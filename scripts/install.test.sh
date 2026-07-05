@@ -67,14 +67,22 @@ test_occupied_port_fails_actionably() {
   assert_contains "$output" 'Port 80 is already in use'
 }
 
-test_install_docker_uses_apt_when_missing() {
+test_install_docker_uses_docker_apt_repo_when_missing() {
   local calls=() docker_ready=0
-  command_exists() { [[ "$1" == "apt-get" ]] || { [[ "$1" == "docker" && "$docker_ready" == "1" ]]; }; }
+  command_exists() {
+    case "$1" in
+      apt-get|curl|gpg) return 0 ;;
+      docker) [[ "$docker_ready" == "1" ]] ;;
+      *) return 1 ;;
+    esac
+  }
   docker() { [[ "$1 $2" == "compose version" ]]; }
+  install_docker_apt_repository() { calls+=("install_docker_apt_repository"); }
   as_root() { calls+=("$*"); [[ "$*" == apt-get\ install* ]] && docker_ready=1; return 0; }
   install_docker
+  [[ " ${calls[*]} " == *" install_docker_apt_repository "* ]]
   [[ " ${calls[*]} " == *" apt-get update "* ]]
-  [[ " ${calls[*]} " == *" apt-get install -y ca-certificates curl gnupg docker.io docker-compose-plugin "* ]]
+  [[ " ${calls[*]} " == *" apt-get install -y docker-ce docker-ce-cli containerd.io docker-buildx-plugin docker-compose-plugin "* ]]
 }
 
 test_prepare_install_dir_preserves_existing_secret() {
@@ -162,7 +170,7 @@ test_final_url_output_points_to_first_owner_setup() {
 run_test 'redaction masks secrets' test_redaction_masks_database_url_and_secret_assignments
 run_test 'unsupported host fails before mutation' test_unsupported_host_fails_without_mutation
 run_test 'occupied port fails actionably' test_occupied_port_fails_actionably
-run_test 'missing Docker triggers apt install path' test_install_docker_uses_apt_when_missing
+run_test 'missing Docker triggers Docker apt repository install path' test_install_docker_uses_docker_apt_repo_when_missing
 run_test 'rerun preserves existing secret' test_prepare_install_dir_preserves_existing_secret
 run_test 'env generation writes private config' test_write_env_generates_once_with_private_permissions
 run_test 'installed compose keeps valid build context' test_installed_compose_uses_source_tree_build_context
