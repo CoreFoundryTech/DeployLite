@@ -1,6 +1,7 @@
 "use client";
 
 import React from "react";
+import Link from "next/link";
 import { useRouter } from "next/navigation";
 import { useState, type FormEvent } from "react";
 import { authApiPaths, bootstrapApiPaths, createAuthApiRequest, createAuthApiUrl, createInitialAdminApiRequest, type AuthBoundaryReason } from "../lib/auth-boundary";
@@ -28,7 +29,7 @@ type InitialAdminSetupSubmitResult =
 const initialAdminSetupCopy = {
   idle: "Create the first local admin, then sign in with that account.",
   pending: "Creating the first local admin account.",
-  success: "First admin created. Sign in with the new local admin account.",
+  success: "First admin created. Sign in with the new local admin account, then open the dashboard to register a project.",
   locked: "Initial admin setup is locked because an admin already exists. Sign in instead.",
   rejected: "Initial admin setup failed. Use a valid email and a password with at least 12 characters.",
   unreachable: "Initial admin setup could not reach the local API. Check that the API process is running."
@@ -184,7 +185,17 @@ export function InitialAdminSetupPanel({ apiBaseUrl, state, onSubmit }: AuthCont
       </form>
       <p className="text-sm text-muted-foreground" role="status" aria-live="polite">{message}</p>
       {error ? <p className="text-sm text-destructive" role="alert">{error}</p> : null}
-      {created ? <LoginForm apiBaseUrl={apiBaseUrl} reason="missing-cookie" /> : null}
+      {created ? (
+        <div className="flex flex-col gap-3" data-testid="first-owner-success-summary">
+          <p className="text-sm text-muted-foreground">
+            After sign-in, continue into the dashboard to register your first project and trigger a deployment.
+          </p>
+          <Link href="/dashboard" data-testid="first-owner-continue-cta" className="text-sm font-medium text-primary underline-offset-4 hover:underline">
+            Open the dashboard →
+          </Link>
+          <LoginForm apiBaseUrl={apiBaseUrl} reason="missing-cookie" />
+        </div>
+      ) : null}
     </div>
   );
 }

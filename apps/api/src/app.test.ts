@@ -257,6 +257,30 @@ describe("DeployLite API scaffold", () => {
     expect(audit.inputs.some((event) => event.action === "bootstrap.initial-admin.rejected" && event.metadata?.["reason"] === "locked")).toBe(true);
   });
 
+  it("never persists the submitted password in bootstrap audit metadata", async () => {
+    const audit = new InMemoryAuditRepository();
+    const submitted = "first-owner-very-secret-password-123";
+    const users = new InMemoryAuthUserRepository();
+
+    const created = await buildApiApp({ auth: { audit, users, hasher: new BcryptPasswordHasher(10) } });
+    const createdResponse = await created.inject({ method: "POST", url: "/api/v1/bootstrap/initial-admin", headers: contentHeaders, payload: { email: "first@example.test", password: submitted } });
+    expect(createdResponse.statusCode).toBe(200);
+
+    const rejectedInvalid = await created.inject({ method: "POST", url: "/api/v1/bootstrap/initial-admin", headers: contentHeaders, payload: { email: "bad", password: "short" } });
+    expect(rejectedInvalid.statusCode).toBe(400);
+
+    const second = await created.inject({ method: "POST", url: "/api/v1/bootstrap/initial-admin", headers: contentHeaders, payload: { email: "second@example.test", password: submitted } });
+    expect(second.statusCode).toBe(409);
+
+    const bootstrapEvents = audit.inputs.filter((event) => event.action === "bootstrap.initial-admin.created" || event.action === "bootstrap.initial-admin.rejected");
+    expect(bootstrapEvents.length).toBeGreaterThanOrEqual(3);
+    for (const event of bootstrapEvents) {
+      expect(JSON.stringify(event.metadata ?? {})).not.toContain(submitted);
+    }
+
+    await created.close();
+  });
+
   it("maps concurrent atomic bootstrap conflicts to locked without creating a second admin", async () => {
     const audit = new InMemoryAuditRepository();
     const createdUsers: AuthUser[] = [];
