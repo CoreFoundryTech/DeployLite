@@ -84,7 +84,9 @@ printf 'secret_present=%s\n' "${DEPLOYLITE_SECRET_TOKEN:+yes}"
 printf 'args=%s\n' "$*"
 SCRIPT
   chmod +x "$SOURCE_DIR/scripts/install.sh"
+  # shellcheck disable=SC2034
   DEPLOYLITE_PUBLIC_HOST="203.0.113.10"
+  # shellcheck disable=SC2034
   DEPLOYLITE_SECRET_TOKEN="super-secret-value"
   captured="$(run_installer --dry-run)"
   assert_contains "$captured" "public_host=203.0.113.10" || return 1

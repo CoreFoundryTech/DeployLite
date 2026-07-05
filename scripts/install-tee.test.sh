@@ -295,6 +295,149 @@ test_install_wrapper_does_not_run_full_install_in_test_mode() {
   rm -rf "$tmp"
 }
 
+test_raw_command_output_through_tee_is_redacted() {
+  # Builds a custom runner that overrides preflight() to print raw
+  # command-style output (postgres URL, password assignment) directly to
+  # stdout — bypassing the installer's value-based redact() — so the
+  # stream-level filter in install_log_setup is the only defense. The
+  # log file MUST contain [REDACTED] markers and MUST NOT contain the
+  # raw secrets.
+  local tmp install_path custom_runner log_content
+  tmp="$(mktemp -d)"
+  install_path="${ROOT_DIR}/scripts/install.sh"
+  custom_runner="${tmp}/custom_runner.sh"
+  cat >"$custom_runner" <<RUNNER
+#!/usr/bin/env bash
+set -Eeuo pipefail
+export DEPLOYLITE_INSTALL_TESTING=1
+export DEPLOYLITE_INSTALL_LOG="${tmp}/install.log"
+export DEPLOYLITE_INSTALL_LOG_DIR="${tmp}"
+export DEPLOYLITE_INSTALL_DIR="${tmp}/opt"
+export DEPLOYLITE_SKIP_DOCKER_INSTALL=1
+export DEPLOYLITE_SKIP_RUNTIME=1
+
+# shellcheck source=/dev/null
+. '${install_path}'
+
+as_root() { "\$@"; }
+command_exists() { [[ "\$1" == "sudo" || "\$1" == "openssl" || "\$1" == "tee" ]]; }
+detect_os() { :; }
+detect_arch() { :; }
+port_available() { return 0; }
+preflight() {
+  printf 'Reading package lists...\\n'
+  printf 'DATABASE_URL=postgres://deploylite:top-secret@postgres:5432/deploylite\\n'
+  printf 'POSTGRES_PASSWORD=hunter2\\n'
+  printf 'TOKEN_VALUE=raw-token-xyz\\n'
+  printf 'Done.\\n'
+}
+install_docker() { :; }
+prepare_install_dir() { :; }
+start_runtime() { :; }
+wait_for_health() { :; }
+print_success() { :; }
+
+main "\$@"
+RUNNER
+  chmod +x "$custom_runner"
+  "$custom_runner" >/dev/null 2>&1 || true
+  for _ in 1 2 3 4 5 6 7 8 9 10; do
+    [[ -s "${tmp}/install.log" ]] && break
+    sleep 0.05
+  done
+  log_content="$(cat "${tmp}/install.log" 2>/dev/null || true)"
+  assert_not_contains "$log_content" 'top-secret' || { printf 'raw postgres password leaked to log: %s\n' "$log_content"; rm -rf "$tmp"; return 1; }
+  assert_not_contains "$log_content" 'hunter2' || { printf 'raw POSTGRES_PASSWORD leaked to log: %s\n' "$log_content"; rm -rf "$tmp"; return 1; }
+  assert_not_contains "$log_content" 'raw-token-xyz' || { printf 'raw TOKEN_VALUE leaked to log: %s\n' "$log_content"; rm -rf "$tmp"; return 1; }
+  # The stream-level filter applies the same two-pass rewrite as the
+  # value-based redact(): the postgres URL pass redacts the password
+  # segment, then the KEY=VALUE pass redacts the entire DATABASE_URL
+  # value. The end state must have [REDACTED] markers and no raw
+  # secrets.
+  assert_contains "$log_content" 'DATABASE_URL=[REDACTED]' || { printf 'expected redacted DB URL in log, got: %s\n' "$log_content"; rm -rf "$tmp"; return 1; }
+  assert_contains "$log_content" 'POSTGRES_PASSWORD=[REDACTED]' || { printf 'expected redacted POSTGRES_PASSWORD in log, got: %s\n' "$log_content"; rm -rf "$tmp"; return 1; }
+  assert_contains "$log_content" 'TOKEN_VALUE=[REDACTED]' || { printf 'expected redacted TOKEN_VALUE in log, got: %s\n' "$log_content"; rm -rf "$tmp"; return 1; }
+  assert_contains "$log_content" 'Done.' || { printf 'plain output lost in stream: %s\n' "$log_content"; rm -rf "$tmp"; return 1; }
+  rm -rf "$tmp"
+}
+
+test_log_file_mode_is_repaired_on_rerun() {
+  # Pre-create the log file with an unsafe mode (0666) to simulate an
+  # older install that left the file world-writable. The installer must
+  # detect the unsafe mode and downgrade it to 0640 on rerun.
+  local tmp runner mode
+  tmp="$(mktemp -d)"
+  runner="$(build_runner "$tmp")"
+  touch "${tmp}/install.log"
+  chmod 0666 "${tmp}/install.log"
+  if ! "$runner" --noop >/dev/null 2>&1; then
+    printf 'wrapper rejected by installer (mode repair may have failed)\n'
+    rm -rf "$tmp"
+    return 1
+  fi
+  mode="$(stat -f '%Lp' "${tmp}/install.log" 2>/dev/null || stat -c '%a' "${tmp}/install.log")"
+  case "$mode" in
+    640|600) ;;
+    *)
+      printf 'expected install.log mode 0640 or 0600 after rerun, got %s\n' "$mode"
+      rm -rf "$tmp"
+      return 1
+      ;;
+  esac
+  rm -rf "$tmp"
+}
+
+test_log_file_repair_warns_when_mode_changes() {
+  # When the installer repairs an unsafe log file mode, the log MUST
+  # contain a warning that mentions both the old and new mode so the
+  # operator has a paper trail.
+  local tmp runner log_content
+  tmp="$(mktemp -d)"
+  runner="$(build_runner "$tmp")"
+  touch "${tmp}/install.log"
+  chmod 0666 "${tmp}/install.log"
+  "$runner" --noop >/dev/null 2>&1 || true
+  for _ in 1 2 3 4 5 6 7 8 9 10; do
+    [[ -s "${tmp}/install.log" ]] && break
+    sleep 0.05
+  done
+  log_content="$(cat "${tmp}/install.log" 2>/dev/null || true)"
+  assert_contains "$log_content" 'Repaired unsafe log file mode' || { printf 'expected repair warning in log, got: %s\n' "$log_content"; rm -rf "$tmp"; return 1; }
+  # macOS stat returns 666 (no leading zero); GNU stat returns 0666.
+  # Accept either so the test passes on both platforms.
+  if [[ "$log_content" != *"0666"* && "$log_content" != *"666 "* && "$log_content" != *"666."* ]]; then
+    printf 'expected old mode 0666 or 666 in log, got: %s\n' "$log_content"
+    rm -rf "$tmp"
+    return 1
+  fi
+  assert_contains "$log_content" '0640' || { printf 'expected new mode 0640 in log, got: %s\n' "$log_content"; rm -rf "$tmp"; return 1; }
+  rm -rf "$tmp"
+}
+
+test_log_file_safe_mode_is_not_changed_on_rerun() {
+  # If the log file is already in a safe mode (0640 or 0600), the
+  # installer must NOT warn or change the mode on rerun.
+  local tmp runner mode log_content
+  tmp="$(mktemp -d)"
+  runner="$(build_runner "$tmp")"
+  touch "${tmp}/install.log"
+  chmod 0640 "${tmp}/install.log"
+  "$runner" --noop >/dev/null 2>&1 || true
+  mode="$(stat -f '%Lp' "${tmp}/install.log" 2>/dev/null || stat -c '%a' "${tmp}/install.log")"
+  [[ "$mode" == "640" ]] || { printf 'expected safe mode to remain 0640, got %s\n' "$mode"; rm -rf "$tmp"; return 1; }
+  for _ in 1 2 3 4 5 6 7 8 9 10; do
+    [[ -s "${tmp}/install.log" ]] && break
+    sleep 0.05
+  done
+  log_content="$(cat "${tmp}/install.log" 2>/dev/null || true)"
+  if [[ "$log_content" == *"Repaired unsafe log file mode"* ]]; then
+    printf 'repair warning fired on a safe-mode rerun\n'
+    rm -rf "$tmp"
+    return 1
+  fi
+  rm -rf "$tmp"
+}
+
 run_test 'log file is created at configured path' test_log_file_is_created_at_configured_path
 run_test 'log file is not world readable' test_log_file_permissions_are_not_world_readable
 run_test 'log file captures stdout and stderr' test_log_file_captures_stdout_and_stderr
@@ -309,6 +452,10 @@ run_test 'noninteractive automation mode runs without tty' test_noninteractive_a
 run_test 'log file uses tee and appends on rerun' test_log_file_uses_tee_and_appends_on_rerun
 run_test 'idempotency probe handles missing docker and missing env' test_idempotency_probe_handles_missing_docker_and_missing_env
 run_test 'install wrapper does not run full install in test mode' test_install_wrapper_does_not_run_full_install_in_test_mode
+run_test 'raw command output through tee is redacted' test_raw_command_output_through_tee_is_redacted
+run_test 'log file mode is repaired on rerun' test_log_file_mode_is_repaired_on_rerun
+run_test 'log file repair warns when mode changes' test_log_file_repair_warns_when_mode_changes
+run_test 'log file safe mode is not changed on rerun' test_log_file_safe_mode_is_not_changed_on_rerun
 
 printf '\n%d passed, %d failed\n' "$PASS" "$FAIL"
 [[ "$FAIL" -eq 0 ]]

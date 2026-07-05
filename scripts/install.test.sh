@@ -76,7 +76,6 @@ test_install_docker_uses_docker_apt_repo_when_missing() {
       *) return 1 ;;
     esac
   }
-  docker() { [[ "$1 $2" == "compose version" ]]; }
   install_docker_apt_repository() { calls+=("install_docker_apt_repository"); }
   as_root() { calls+=("$*"); [[ "$*" == apt-get\ install* ]] && docker_ready=1; return 0; }
   install_docker
@@ -167,6 +166,112 @@ test_final_url_output_points_to_first_owner_setup() {
   rm -rf "$tmp"
 }
 
+test_prompt_value_returns_default_in_noninteractive_mode() {
+  local result
+  INTERACTIVE=0
+  result="$(prompt_value 'label' 'default-value')"
+  [[ "$result" == "default-value" ]] || { printf 'expected default-value, got: %s\n' "$result"; return 1; }
+}
+
+test_prompt_value_returns_piped_value_in_interactive_no_tty_mode() {
+  local result
+  INTERACTIVE=1
+  # No tty (heredoc), so the function falls through to the non-tty
+  # stdin branch and reads the next line. The default is still
+  # reported as a fallback if the piped line is empty.
+  result="$(prompt_value 'label' 'default-value' <<<'piped-value')"
+  [[ "$result" == "piped-value" ]] || { printf 'expected piped-value, got: %s\n' "$result"; return 1; }
+}
+
+test_prompt_value_returns_default_when_piped_empty_in_interactive_no_tty_mode() {
+  local result
+  INTERACTIVE=1
+  result="$(prompt_value 'label' 'default-value' <<<'')"
+  [[ "$result" == "default-value" ]] || { printf 'expected default-value, got: %s\n' "$result"; return 1; }
+}
+
+test_redact_stream_removes_postgres_passwords_and_key_value_secrets() {
+  local output
+  # The stream-level filter applies the same two-pass rewrite as the
+  # value-based redact(): the postgres URL pass redacts the password
+  # segment, then the KEY=VALUE pass redacts the entire DATABASE_URL
+  # value. The end state must have [REDACTED] markers and no raw
+  # secrets. The exact replacement shape matches the value-based
+  # redact() so a single redaction contract covers both call sites.
+  output="$(printf 'DATABASE_URL=postgres://deploylite:top-secret@postgres:5432/deploylite\nPOSTGRES_PASSWORD=hunter2\nTOKEN_VALUE=xyz\nplain line\n' | redact_stream)"
+  assert_contains "$output" 'DATABASE_URL=[REDACTED]' || { printf 'missing redacted DB URL: %s\n' "$output"; return 1; }
+  assert_contains "$output" 'POSTGRES_PASSWORD=[REDACTED]' || { printf 'missing redacted POSTGRES_PASSWORD: %s\n' "$output"; return 1; }
+  assert_contains "$output" 'TOKEN_VALUE=[REDACTED]' || { printf 'missing redacted TOKEN_VALUE: %s\n' "$output"; return 1; }
+  assert_not_contains "$output" 'top-secret' || { printf 'raw postgres password leaked: %s\n' "$output"; return 1; }
+  assert_not_contains "$output" 'hunter2' || { printf 'raw POSTGRES_PASSWORD leaked: %s\n' "$output"; return 1; }
+  assert_contains "$output" 'plain line' || { printf 'plain line lost in stream: %s\n' "$output"; return 1; }
+}
+
+test_write_env_uses_prompted_public_host_in_interactive_mode() {
+  local tmp saved
+  tmp="$(mktemp -d)"
+  INSTALL_DIR="${tmp}/install"
+  ENV_FILE="${INSTALL_DIR}/.env"
+  mkdir -p "$INSTALL_DIR"
+  # Provide a default via env so detect_public_host_inner returns it.
+  DEPLOYLITE_PUBLIC_HOST="198.51.100.10"
+  INTERACTIVE=1
+  as_root() { "$@"; }
+  random_secret() { printf 'generated-secret'; }
+  # Pipe an override value; the function must use it in the env file.
+  write_env <<<'203.0.113.99'
+  saved="$(cat "$ENV_FILE")"
+  assert_contains "$saved" 'DEPLOYLITE_PUBLIC_HOST=203.0.113.99' || { printf 'expected prompted host, got: %s\n' "$saved"; rm -rf "$tmp"; return 1; }
+  assert_contains "$saved" 'DEPLOYLITE_PUBLIC_WEB_ORIGIN=http://203.0.113.99' || { printf 'expected web origin, got: %s\n' "$saved"; rm -rf "$tmp"; return 1; }
+  assert_contains "$saved" 'DEPLOYLITE_PUBLIC_API_ORIGIN=http://203.0.113.99:3001' || { printf 'expected api origin, got: %s\n' "$saved"; rm -rf "$tmp"; return 1; }
+  rm -rf "$tmp"
+}
+
+test_write_env_in_interactive_mode_uses_empty_default_when_detection_fails() {
+  local tmp saved
+  tmp="$(mktemp -d)"
+  INSTALL_DIR="${tmp}/install"
+  ENV_FILE="${INSTALL_DIR}/.env"
+  mkdir -p "$INSTALL_DIR"
+  unset DEPLOYLITE_PUBLIC_HOST
+  INTERACTIVE=1
+  as_root() { "$@"; }
+  random_secret() { printf 'generated-secret'; }
+  # Stub detect_public_host_inner to return empty (no network, no env).
+  detect_public_host_inner() { :; }
+  # Provide a value via the prompt.
+  write_env <<<'198.51.100.42'
+  saved="$(cat "$ENV_FILE")"
+  assert_contains "$saved" 'DEPLOYLITE_PUBLIC_HOST=198.51.100.42' || { printf 'expected prompted host with empty default, got: %s\n' "$saved"; rm -rf "$tmp"; return 1; }
+  rm -rf "$tmp"
+}
+
+test_write_env_in_noninteractive_mode_hard_fails_when_no_host() {
+  local tmp status fail_called=0
+  tmp="$(mktemp -d)"
+  INSTALL_DIR="${tmp}/install"
+  ENV_FILE="${INSTALL_DIR}/.env"
+  mkdir -p "$INSTALL_DIR"
+  unset DEPLOYLITE_PUBLIC_HOST
+  INTERACTIVE=0
+  as_root() { "$@"; }
+  random_secret() { printf 'generated-secret'; }
+  # Stub detect_public_host to return empty (simulating a host that
+  # cannot be detected) WITHOUT calling the real fail() — that would
+  # exit the test runner. The hard-fail path in write_env must then
+  # call fail() itself. We stub fail() to record the call and return
+  # a non-zero status instead of exiting; the real fail() would call
+  # exit, which is the behavior we are exercising the guard for.
+  detect_public_host() { :; }
+  fail() { fail_called=1; return 2; }
+  set +e
+  write_env >/dev/null 2>&1
+  status=$?
+  set -e
+  [[ "$fail_called" -eq 1 ]] || { printf 'expected fail() to be called when no host available, got status=%s fail_called=%s\n' "$status" "$fail_called"; rm -rf "$tmp"; return 1; }
+  rm -rf "$tmp"
+}
+
 run_test 'redaction masks secrets' test_redaction_masks_database_url_and_secret_assignments
 run_test 'unsupported host fails before mutation' test_unsupported_host_fails_without_mutation
 run_test 'occupied port fails actionably' test_occupied_port_fails_actionably
@@ -176,6 +281,13 @@ run_test 'env generation writes private config' test_write_env_generates_once_wi
 run_test 'installed compose keeps valid build context' test_installed_compose_uses_source_tree_build_context
 run_test 'failure cleanup preserves config' test_failure_cleanup_preserves_config_and_uses_compose_down_only
 run_test 'final URL guides first owner setup' test_final_url_output_points_to_first_owner_setup
+run_test 'prompt_value returns default in noninteractive mode' test_prompt_value_returns_default_in_noninteractive_mode
+run_test 'prompt_value returns piped value in interactive no-tty mode' test_prompt_value_returns_piped_value_in_interactive_no_tty_mode
+run_test 'prompt_value returns default when piped empty in interactive no-tty mode' test_prompt_value_returns_default_when_piped_empty_in_interactive_no_tty_mode
+run_test 'redact_stream removes postgres passwords and key=value secrets' test_redact_stream_removes_postgres_passwords_and_key_value_secrets
+run_test 'write_env uses prompted public host in interactive mode' test_write_env_uses_prompted_public_host_in_interactive_mode
+run_test 'write_env in interactive mode uses empty default when detection fails' test_write_env_in_interactive_mode_uses_empty_default_when_detection_fails
+run_test 'write_env in noninteractive mode hard-fails when no host' test_write_env_in_noninteractive_mode_hard_fails_when_no_host
 
 printf '\n%d passed, %d failed\n' "$PASS" "$FAIL"
 [[ "$FAIL" -eq 0 ]]

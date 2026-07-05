@@ -82,6 +82,7 @@ export_deploylite_environment() {
   local name
   while IFS= read -r name; do
     [[ "$name" =~ ^DEPLOYLITE_[A-Za-z0-9_]*$ ]] || continue
+    # shellcheck disable=SC2163
     export "$name"
   done < <(compgen -v DEPLOYLITE_ || true)
 }

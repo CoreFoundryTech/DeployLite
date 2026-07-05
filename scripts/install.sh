@@ -1,7 +1,6 @@
 #!/usr/bin/env bash
 set -Eeuo pipefail
 
-readonly APP_NAME="deploylite"
 INSTALL_DIR="${DEPLOYLITE_INSTALL_DIR:-/opt/deploylite}"
 REPO_ROOT="${DEPLOYLITE_REPO_ROOT:-$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)}"
 COMPOSE_FILE="${INSTALL_DIR}/compose.yml"
@@ -17,14 +16,31 @@ CREATED_RUNTIME=0
 
 log() { printf '[%s] %s\n' "$1" "$(redact "${2:-}")"; }
 info() { log INFO "$1"; }
-warn() { log WARN "$1"; }
-fail() { log ERROR "$1"; exit "${2:-1}"; }
+# warn/fail write to stderr so command substitutions like
+# `host="$(detect_public_host)"` cannot accidentally capture the error
+# message and treat it as a successful value. info stays on stdout
+# because it is the normal "this worked" channel and the installer's
+# `exec > >(tee ...)` redirect is the one that copies it to the log.
+warn() { printf '[%s] %s\n' "$1" "$(redact "${2:-}")" >&2; }
+fail() { printf '[%s] %s\n' "$1" "$(redact "${2:-}")" >&2; exit "${2:-1}"; }
 
 redact() {
   local value="${1:-}"
   value="$(printf '%s' "$value" | sed -E 's#(postgres://[^:]+:)[^@]+@#\1[REDACTED]@#g')"
   value="$(printf '%s' "$value" | sed -E 's#((PASSWORD|SECRET|TOKEN|COOKIE|DATABASE_URL)[A-Z_]*=)[^[:space:]]+#\1[REDACTED]#Ig')"
   printf '%s' "$value"
+}
+
+# Stream-level redaction. Reads bytes from stdin and writes redacted bytes
+# to stdout. Used as a coproc filter so that EVERY line — including raw
+# command stdout/stderr that never touches log() — is rewritten before it
+# reaches the tee that writes the install log. Keep the patterns here in
+# sync with the value-based redact() above; the log() call sites apply the
+# same rewrites a second time, which is idempotent.
+redact_stream() {
+  sed -u -E \
+    -e 's#(postgres://[^:]+:)[^@]+@#\1[REDACTED]@#g' \
+    -e 's#((PASSWORD|SECRET|TOKEN|COOKIE|DATABASE_URL)[A-Z_]*=)[^[:space:]]+#\1[REDACTED]#Ig'
 }
 
 on_error() {
@@ -83,6 +99,9 @@ parse_args() {
 # Create the install log directory and file, then redirect stdout and stderr
 # through `tee` so the terminal and the log file see the same redacted stream.
 # Idempotent: re-running appends to the existing log instead of truncating.
+# Repairs unsafe permissions on a pre-existing log file (e.g., mode 0666 left
+# behind by an earlier installer version) by downgrading to the safe 0640
+# target whenever the current user has permission to do so.
 install_log_setup() {
   local log_file="${INSTALL_LOG}"
   local log_dir="${INSTALL_LOG_DIR}"
@@ -101,14 +120,47 @@ install_log_setup() {
     warn "Log file ${log_file} is not writable. Continuing without file log."
     return 0
   fi
+  # Repair unsafe permissions on a pre-existing log file. The umask only
+  # affects newly created files, so an older install log with mode 0666 or
+  # anything world-readable would otherwise stay world-readable forever.
+  # The warning is written to BOTH the log file (for post-mortem review)
+  # and stderr (for the operator's terminal). We can't just call warn()
+  # because the tee that copies stdout to the log file has not been
+  # started yet at this point in the function.
+  if [[ -f "$log_file" ]]; then
+    local current_mode=""
+    current_mode="$(stat -c '%a' "$log_file" 2>/dev/null || stat -f '%Lp' "$log_file" 2>/dev/null || echo "")"
+    case "$current_mode" in
+      600|640) ;;
+      "")
+        printf '[%s] %s\n' "WARN" "Could not stat ${log_file} to verify mode; leaving permissions untouched." | as_root tee -a "$log_file" >&2
+        ;;
+      *)
+        if as_root chmod 0640 "$log_file" 2>/dev/null; then
+          printf '[%s] %s\n' "WARN" "Repaired unsafe log file mode ${current_mode} -> 0640 on ${log_file}." | as_root tee -a "$log_file" >&2
+        else
+          printf '[%s] %s\n' "WARN" "Could not repair unsafe log file mode ${current_mode} on ${log_file}; leaving permissions untouched." | as_root tee -a "$log_file" >&2
+        fi
+        ;;
+    esac
+  fi
   if [[ "${DEPLOYLITE_INSTALL_TESTING:-0}" == "1" && "${DEPLOYLITE_INSTALL_SKIP_TEE:-0}" == "1" ]]; then
     info "Install log: ${log_file} (tee disabled in test mode)"
     return 0
   fi
   # `exec` replaces the shell's stdout and stderr so the redirect survives
-  # every subsequent function call. The redaction layer at log() runs before
-  # the write, so the file never sees raw secrets.
-  if exec > >(as_root tee -a "$log_file") 2>&1; then
+  # every subsequent function call. The byte stream passes through
+  # redact_stream() — a sed-based filter that rewrites postgres URLs and
+  # KEY=VALUE secret patterns on every line — before tee writes them to
+  # the log file. The terminal also sees the redacted stream, which is
+  # the safe default for an installer. log() redacts again at the value
+  # level, which is idempotent. `trap '' PIPE` keeps the sed filter from
+  # dying with SIGPIPE when the downstream tee closes, which would
+  # otherwise trip `set -o pipefail`.
+  if exec > >(
+    trap '' PIPE
+    redact_stream | as_root tee -a "$log_file"
+  ) 2>&1; then
     info "Install log: ${log_file}"
   else
     warn "Could not redirect stdout to tee for ${log_file}."
@@ -176,13 +228,19 @@ detect_arch() {
 port_available() {
   local port="$1"
   if command_exists ss; then
-    ! ss -ltn "sport = :${port}" | grep -q ":${port}"
-  elif command_exists lsof; then
-    ! lsof -iTCP:"${port}" -sTCP:LISTEN -Pn >/dev/null 2>&1
-  else
-    warn "Cannot verify port ${port}; ss/lsof not installed."
+    if ss -ltn "sport = :${port}" | grep -q ":${port}"; then
+      return 1
+    fi
     return 0
   fi
+  if command_exists lsof; then
+    if lsof -iTCP:"${port}" -sTCP:LISTEN -Pn >/dev/null 2>&1; then
+      return 1
+    fi
+    return 0
+  fi
+  warn "Cannot verify port ${port}; ss/lsof not installed."
+  return 0
 }
 
 preflight() {
@@ -246,18 +304,28 @@ random_secret() {
   fi
 }
 
-detect_public_host() {
+detect_public_host_inner() {
+  # Best-effort public host detection. Returns the detected value on
+  # stdout (which may be empty) and never calls fail/exit, so callers
+  # that want to offer a default without aborting the installer can use
+  # it. detect_public_host wraps this with the hard-fail behavior.
   if [[ -n "${DEPLOYLITE_PUBLIC_HOST:-}" ]]; then
     printf '%s' "$DEPLOYLITE_PUBLIC_HOST"
-    return
+    return 0
   fi
   local candidate=""
   if command_exists curl; then
     candidate="$(curl -fsS --max-time 3 https://api.ipify.org 2>/dev/null || true)"
   fi
   [[ -n "$candidate" ]] || candidate="$(hostname -I 2>/dev/null | awk '{print $1}' || true)"
-  [[ -n "$candidate" ]] || fail "Could not detect public host. Set DEPLOYLITE_PUBLIC_HOST=<ip-or-host>." 2
   printf '%s' "$candidate"
+}
+
+detect_public_host() {
+  local host
+  host="$(detect_public_host_inner)"
+  [[ -n "$host" ]] || fail "Could not detect public host. Set DEPLOYLITE_PUBLIC_HOST=<ip-or-host>." 2
+  printf '%s' "$host"
 }
 
 env_get() {
@@ -267,8 +335,21 @@ env_get() {
 }
 
 write_env() {
-  local host postgres_password tmp
-  host="$(detect_public_host)"
+  local host postgres_password tmp detected interactive_host
+  if [[ "${INTERACTIVE}" == "1" ]]; then
+    # Offer a sensible default to the prompt without aborting the
+    # installer on detection failure. The detect helper caps its own
+    # network call (curl --max-time 3) so an unreachable ipify endpoint
+    # cannot stall the installer. The user can accept the detected
+    # value by pressing enter or override it. In non-interactive mode
+    # this branch is skipped entirely and the hard-fail path runs.
+    detected="$(detect_public_host_inner)"
+    interactive_host="$(prompt_value 'Public host (IP or hostname) for the runtime' "$detected")"
+    host="${interactive_host:-$detected}"
+  else
+    host="$(detect_public_host)"
+  fi
+  [[ -n "${host:-}" ]] || fail "Could not determine the public host. Set DEPLOYLITE_PUBLIC_HOST=<ip-or-host> and retry." 2
   postgres_password="$(env_get POSTGRES_PASSWORD || true)"
   [[ -n "$postgres_password" ]] || postgres_password="$(random_secret)"
   tmp="$(mktemp)"
@@ -288,6 +369,9 @@ DEPLOYLITE_BCRYPT_COST=12
 EOF
   as_root install -m 600 "$tmp" "$ENV_FILE"
   rm -f "$tmp"
+  if [[ "${INTERACTIVE}" == "1" ]]; then
+    info "Public host confirmed: ${host}"
+  fi
 }
 
 prepare_install_dir() {

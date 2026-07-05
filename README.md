@@ -73,7 +73,9 @@ The installer writes real runtime config to `/opt/deploylite/.env` with owner-on
 
 ### Install log, idempotency, and interactive mode
 
-The installer tees every line of stdout and stderr into `/var/log/deploylite/install.log` so post-mortem review does not require re-attaching to the terminal. The log is append-only, mode `0640` (or `0600` on filesystems that strip the group bit), and the redaction layer at the script's `log()` function rewrites every line — including database URLs, password assignments, and secret tokens — before the bytes reach either the terminal or the file. Reruns append; the file is never truncated by the installer.
+The installer tees every line of stdout and stderr through a redacting filter into `/var/log/deploylite/install.log` so post-mortem review does not require re-attaching to the terminal. The log is append-only, mode `0640` (or `0600` on filesystems that strip the group bit), and the redaction layer rewrites every line — including raw command stdout/stderr that never touched the `log()` helper, database URLs, password assignments, and secret tokens — before the bytes reach either the terminal or the file. Reruns append; the file is never truncated by the installer.
+
+The installer also detects and repairs unsafe log file modes on every run. If a previous run left `/var/log/deploylite/install.log` with a world-readable or world-writable mode (for example `0666` from an older installer version), the current run downgrades it to `0640` when the user has permission, records the old and new mode in the log, and continues. A safe mode (`0600` or `0640`) is never changed.
 
 Override the log path with `DEPLOYLITE_INSTALL_LOG=<path>` and the log directory with `DEPLOYLITE_INSTALL_LOG_DIR=<path>`. When the installer cannot create the configured directory it logs a warning and continues without a file log instead of failing.
 
@@ -83,7 +85,7 @@ Idempotency probes log a clear "already installed; preserving state" marker for 
 - Docker Engine and the Compose plugin already on `PATH`.
 - Install log directory already present.
 
-Pass `--interactive` (or `-i`) to enable confirmation prompts. The script tries a TUI dialog when one is available and falls back to plain `read` so the flag works on minimal VPS images and on piped automation:
+Pass `--interactive` (or `-i`) to enable confirmation prompts. The script tries a TUI dialog when one is available and falls back to plain `read` so the flag works on minimal VPS images and on piped automation. In interactive mode the installer prompts to confirm the public host (or override it) before writing `/opt/deploylite/.env`, so the first time the installer writes a secret value is always after the operator has confirmed the host the runtime will serve:
 
 ```bash
 sudo DEPLOYLITE_PUBLIC_HOST=203.0.113.10 bash scripts/install.sh --interactive
