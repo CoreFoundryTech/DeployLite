@@ -13,7 +13,7 @@ RUN pnpm install --frozen-lockfile
 COPY tsconfig.base.json ./
 COPY apps/web apps/web
 COPY packages/contracts packages/contracts
-RUN pnpm --filter @deploylite/web build
+RUN pnpm --filter @deploylite/contracts build && pnpm --filter @deploylite/web build
 
 FROM node:22-alpine AS runtime
 WORKDIR /app

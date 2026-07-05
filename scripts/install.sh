@@ -127,7 +127,7 @@ install_docker_apt_repository() {
 
 random_secret() {
   if command_exists openssl; then
-    openssl rand -base64 36 | tr -d '\n'
+    openssl rand -hex 32 | tr -d '\n'
   else
     LC_ALL=C tr -dc 'A-Za-z0-9_-' </dev/urandom | head -c 48
   fi
