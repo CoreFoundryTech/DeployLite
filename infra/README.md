@@ -1,6 +1,6 @@
 # DeployLite Infrastructure
 
-This directory contains local-development infrastructure and the first reviewable VPS runtime contract used by `scripts/install.sh`.
+This directory contains local-development infrastructure and the first reviewable VPS runtime contract used by `scripts/bootstrap.sh` and `scripts/install.sh`.
 
 - No production Traefik, ACME, DNS, or certificate mutation is performed here.
 - No Docker socket path or host shell command is required by these templates.
@@ -30,7 +30,21 @@ During installation, `scripts/install.sh` copies this Compose file to `/opt/depl
 
 ## VPS installer runbook
 
-Run from a reviewed source checkout on a clean supported VPS:
+Bootstrap from the reviewed GitHub `main` branch on a clean supported VPS:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/CoreFoundryTech/DeployLite/main/scripts/bootstrap.sh | sudo bash
+```
+
+For a stable public IP or hostname, pass it through the environment:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/CoreFoundryTech/DeployLite/main/scripts/bootstrap.sh | sudo DEPLOYLITE_PUBLIC_HOST=<ip-or-host> bash
+```
+
+Set `DEPLOYLITE_VERSION=<branch-tag-or-sha>` to download a specific GitHub ref. The bootstrapper downloads a GitHub tarball, extracts it under a temporary directory, preserves `DEPLOYLITE_*` environment variables when invoking the installer, and cleans temporary files on exit. It does not print secret values.
+
+Alternatively, run from a reviewed source checkout:
 
 ```bash
 sudo DEPLOYLITE_PUBLIC_HOST=203.0.113.10 bash scripts/install.sh
