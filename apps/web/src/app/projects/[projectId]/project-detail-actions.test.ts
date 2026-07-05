@@ -1,7 +1,7 @@
 import { renderToStaticMarkup } from "react-dom/server";
 import React from "react";
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { ProjectDetailActions, submitProjectDeployment } from "./project-detail-actions.js";
+import { ProjectDetailActions, runProjectDeployTrigger, submitProjectDeployment } from "./project-detail-actions.js";
 
 vi.mock("next/navigation", () => ({
   useRouter: () => ({ refresh: vi.fn(), push: vi.fn() })
@@ -134,5 +134,76 @@ describe("ProjectDetailActions render markup", () => {
     expect(html).toContain("id=\"deploy-actions\"");
     expect(html).not.toContain("deploy-triggered-status");
     expect(html).not.toContain("deploy-trigger-error");
+  });
+});
+
+describe("ProjectDetailActions deploy click path", () => {
+  afterEach(() => {
+    vi.restoreAllMocks();
+  });
+
+  it("routes the click to /deployments/{id} when the trigger succeeds", async () => {
+    const fetchImpl = vi.fn(async () => new Response(JSON.stringify({
+      data: {
+        deployment: { id: "dep_abc123", projectId: projectFixture.id, agentId: "agent-1", status: "running", commitSha: "abcdef1", startedAt: "2026-01-01T00:00:00.000Z", finishedAt: null },
+        envVariables: [],
+        audit: { action: "deployment.trigger", targetType: "deployment", targetId: "dep_abc123" }
+      },
+      error: null,
+      requestId: "req_trigger_click_1"
+    }), { status: 200 }));
+
+    const outcome = await runProjectDeployTrigger({
+      projectId: projectFixture.id,
+      apiBaseUrl: "https://api.example.test",
+      cookieHeader: "deploylite_session=opaque",
+      fetchImpl: fetchImpl as unknown as typeof fetch
+    });
+
+    expect(outcome.triggerState).toEqual({ kind: "triggered", deploymentId: "dep_abc123", status: "running" });
+    expect(outcome.redirectPath).toBe("/deployments/dep_abc123");
+  });
+
+  it("does not produce a redirect path when the trigger is rejected by the API", async () => {
+    const fetchImpl = vi.fn(async () => new Response(JSON.stringify({
+      data: null,
+      error: { code: "NO_AGENT_AVAILABLE", message: "No agent online.", correlationId: "req_no_agent_click" },
+      requestId: "req_no_agent_click"
+    }), { status: 409 }));
+
+    const outcome = await runProjectDeployTrigger({
+      projectId: projectFixture.id,
+      apiBaseUrl: "https://api.example.test",
+      cookieHeader: "deploylite_session=opaque",
+      fetchImpl: fetchImpl as unknown as typeof fetch
+    });
+
+    expect(outcome.redirectPath).toBeNull();
+    expect(outcome.triggerState).toEqual({ kind: "error", message: "Could not trigger the deploy. Check that the project has at least one online agent." });
+  });
+
+  it("does not produce a redirect path when the API base URL is missing", async () => {
+    const outcome = await runProjectDeployTrigger({
+      projectId: projectFixture.id,
+      apiBaseUrl: null,
+      cookieHeader: "deploylite_session=opaque"
+    });
+
+    expect(outcome.redirectPath).toBeNull();
+    expect(outcome.triggerState).toEqual({ kind: "error", message: "Configure DEPLOYLITE_WEB_API_BASE_URL before triggering deploys." });
+  });
+
+  it("does not produce a redirect path when the API is unreachable", async () => {
+    const fetchImpl = vi.fn(async () => { throw new Error("ECONNREFUSED"); });
+
+    const outcome = await runProjectDeployTrigger({
+      projectId: projectFixture.id,
+      apiBaseUrl: "https://api.example.test",
+      cookieHeader: "deploylite_session=opaque",
+      fetchImpl: fetchImpl as unknown as typeof fetch
+    });
+
+    expect(outcome.redirectPath).toBeNull();
+    expect(outcome.triggerState).toEqual({ kind: "error", message: "The local API is unreachable. Start the API and try again." });
   });
 });

@@ -55,6 +55,39 @@ export type SubmitProjectDeploymentOptions = {
   fetchImpl?: typeof fetch;
 };
 
+export type RunProjectDeployTriggerResult = {
+  triggerState:
+    | { kind: "triggered"; deploymentId: string; status: string }
+    | { kind: "error"; message: string };
+  redirectPath: string | null;
+};
+
+/**
+ * Pure async handler that mirrors what clicking "Deploy latest" does:
+ * posts to the trigger endpoint and decides whether the client should
+ * router.push to `/deployments/{id}` or surface an error state. Extracted
+ * so the click path can be exercised directly from unit tests without a
+ * DOM or testing-library setup.
+ */
+export async function runProjectDeployTrigger({
+  projectId,
+  apiBaseUrl,
+  cookieHeader,
+  fetchImpl = fetch
+}: SubmitProjectDeploymentOptions): Promise<RunProjectDeployTriggerResult> {
+  const result = await submitProjectDeployment({ projectId, apiBaseUrl, cookieHeader, fetchImpl });
+  if (result.kind === "triggered") {
+    return {
+      triggerState: { kind: "triggered", deploymentId: result.deploymentId, status: result.status },
+      redirectPath: `/deployments/${result.deploymentId}`
+    };
+  }
+  return {
+    triggerState: { kind: "error", message: result.message },
+    redirectPath: null
+  };
+}
+
 export async function submitProjectDeployment({
   projectId,
   apiBaseUrl,
@@ -127,13 +160,11 @@ export function ProjectDetailActions({ project, apiBaseUrl, cookieHeader, envVar
 
   async function onTrigger() {
     setTrigger({ kind: "pending" });
-    const result = await submitProjectDeployment({ projectId: project.id, apiBaseUrl, cookieHeader });
-    if (result.kind === "triggered") {
-      setTrigger({ kind: "triggered", deploymentId: result.deploymentId, status: result.status });
-      router.push(`/deployments/${result.deploymentId}`);
-      return;
+    const { triggerState, redirectPath } = await runProjectDeployTrigger({ projectId: project.id, apiBaseUrl, cookieHeader });
+    setTrigger(triggerState);
+    if (redirectPath) {
+      router.push(redirectPath);
     }
-    setTrigger({ kind: "error", message: result.message });
   }
 
   async function onAddEnv(event: FormEvent<HTMLFormElement>) {
@@ -274,5 +305,3 @@ export function ProjectDetailActions({ project, apiBaseUrl, cookieHeader, envVar
     </div>
   );
 }
-
-// Suppress unused-import linting for Select; shadcn select is fine to ship even if not used here.
