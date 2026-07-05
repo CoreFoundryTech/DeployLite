@@ -389,6 +389,207 @@ describe("deployment log real API rendering", () => {
   });
 });
 
+describe("projects list page launch hub", () => {
+  afterEach(() => {
+    vi.restoreAllMocks();
+    vi.unstubAllGlobals();
+    delete process.env.DEPLOYLITE_WEB_API_BASE_URL;
+  });
+
+  it("renders the projects list page with the new project CTA and launch hub readiness, copy, and CTAs for a project that has runtime but no deployment yet", async () => {
+    mockCookies("deploylite_session", "opaque");
+    process.env.DEPLOYLITE_WEB_API_BASE_URL = apiBaseUrl;
+    mockFetch({
+      "/api/v1/auth/me": { data: { user: userFixture }, error: null, requestId: "req_auth_1" },
+      "/api/v1/projects": { data: { projects: [projectFixture] }, error: null, requestId: "req_projects_1" },
+      "/api/v1/agents": { data: { agents: [agentFixture] }, error: null, requestId: "req_agents_1" },
+      "/api/v1/deployments": { data: { deployments: [] }, error: null, requestId: "req_deployments_1" }
+    });
+
+    const ProjectsPage = (await import("./projects/page.js")).default;
+    const html = renderToStaticMarkup(await ProjectsPage());
+
+    expect(html).toContain("data-testid=\"projects-launch-hub-badge\"");
+    expect(html).toContain("Launch hub");
+    expect(html).toContain("data-testid=\"projects-launch-hub-summary\"");
+    expect(html).toContain("0/1 launchable");
+    expect(html).toContain("All projects");
+    expect(html).toContain("/projects/new");
+    expect(html).toContain("/projects/project-1");
+    expect(html).toContain("data-testid=\"project-launch-row\"");
+    expect(html).toContain("data-project-id=\"project-1\"");
+    expect(html).toContain("data-testid=\"project-launch-runtime-badge\"");
+    expect(html).toContain("Configured");
+    expect(html).toContain("node server.js");
+    expect(html).toContain("port 3000");
+    expect(html).toContain("data-testid=\"project-launch-latest-badge\"");
+    expect(html).toContain("Not run");
+    expect(html).toContain("No deployments yet");
+    expect(html).toContain("data-testid=\"project-launch-next-action\"");
+    expect(html).toContain("Deploy latest");
+    expect(html).toContain("data-testid=\"project-launch-cta-configure\"");
+    expect(html).toContain('href="/projects/project-1#env-metadata"');
+    expect(html).toContain("Configure");
+    expect(html).toContain("data-testid=\"project-launch-cta-deploy\"");
+    expect(html).toContain('href="/projects/project-1#deploy-actions"');
+    expect(html).toContain("Deploy");
+    expect(html).not.toContain("data-testid=\"project-launch-cta-logs\"");
+  });
+
+  it("routes a project without runtime to the env-metadata anchor and uses a 'Needs command' copy", async () => {
+    mockCookies("deploylite_session", "opaque");
+    process.env.DEPLOYLITE_WEB_API_BASE_URL = apiBaseUrl;
+    const projectMissingRuntime = {
+      ...projectFixture,
+      id: "project-no-runtime",
+      name: "No runtime",
+      runCommand: null,
+      port: null
+    };
+    mockFetch({
+      "/api/v1/auth/me": { data: { user: userFixture }, error: null, requestId: "req_auth_1" },
+      "/api/v1/projects": { data: { projects: [projectMissingRuntime] }, error: null, requestId: "req_projects_1" },
+      "/api/v1/agents": { data: { agents: [agentFixture] }, error: null, requestId: "req_agents_1" },
+      "/api/v1/deployments": { data: { deployments: [] }, error: null, requestId: "req_deployments_1" }
+    });
+
+    const ProjectsPage = (await import("./projects/page.js")).default;
+    const html = renderToStaticMarkup(await ProjectsPage());
+
+    expect(html).toContain("data-testid=\"project-launch-runtime-badge\"");
+    expect(html).toContain("Needs command");
+    expect(html).toContain("Set a run command and port");
+    expect(html).toContain("data-testid=\"project-launch-next-action\"");
+    expect(html).toContain("Configure runtime");
+    expect(html).toContain('href="/projects/project-no-runtime#env-metadata"');
+    expect(html).toContain('href="/projects/project-no-runtime#deploy-actions"');
+    expect(html).not.toContain("data-testid=\"project-launch-cta-logs\"");
+  });
+
+  it("shows a successful latest deployment status, the 'Inspect latest logs' next step, and a Logs CTA pointing at /deployments/{id}", async () => {
+    mockCookies("deploylite_session", "opaque");
+    process.env.DEPLOYLITE_WEB_API_BASE_URL = apiBaseUrl;
+    mockFetch({
+      "/api/v1/auth/me": { data: { user: userFixture }, error: null, requestId: "req_auth_1" },
+      "/api/v1/projects": { data: { projects: [projectFixture] }, error: null, requestId: "req_projects_1" },
+      "/api/v1/agents": { data: { agents: [agentFixture] }, error: null, requestId: "req_agents_1" },
+      "/api/v1/deployments": {
+        data: {
+          deployments: [
+            { ...deploymentFixture, status: "succeeded" }
+          ]
+        },
+        error: null,
+        requestId: "req_deployments_1"
+      }
+    });
+
+    const ProjectsPage = (await import("./projects/page.js")).default;
+    const html = renderToStaticMarkup(await ProjectsPage());
+
+    expect(html).toContain("data-testid=\"project-launch-latest-badge\"");
+    expect(html).toContain("succeeded");
+    expect(html).toContain("data-testid=\"project-launch-latest-id\"");
+    expect(html).toContain("dep-1");
+    expect(html).toContain("data-testid=\"project-launch-next-action\"");
+    expect(html).toContain("Inspect latest logs");
+    expect(html).toContain("data-testid=\"project-launch-cta-logs\"");
+    expect(html).toContain('href="/deployments/dep-1"');
+    expect(html).toContain("1/1 launchable");
+  });
+
+  it("keeps the Logs CTA for a failed latest deployment so operators can jump to evidence from the launch hub", async () => {
+    mockCookies("deploylite_session", "opaque");
+    process.env.DEPLOYLITE_WEB_API_BASE_URL = apiBaseUrl;
+    mockFetch({
+      "/api/v1/auth/me": { data: { user: userFixture }, error: null, requestId: "req_auth_1" },
+      "/api/v1/projects": { data: { projects: [projectFixture] }, error: null, requestId: "req_projects_1" },
+      "/api/v1/agents": { data: { agents: [agentFixture] }, error: null, requestId: "req_agents_1" },
+      "/api/v1/deployments": {
+        data: {
+          deployments: [
+            { ...deploymentFixture, status: "failed" }
+          ]
+        },
+        error: null,
+        requestId: "req_deployments_1"
+      }
+    });
+
+    const ProjectsPage = (await import("./projects/page.js")).default;
+    const html = renderToStaticMarkup(await ProjectsPage());
+
+    expect(html).toContain("data-testid=\"project-launch-latest-badge\"");
+    expect(html).toContain("failed");
+    expect(html).toContain("Inspect latest logs");
+    expect(html).toContain("data-testid=\"project-launch-cta-logs\"");
+    expect(html).toContain('href="/deployments/dep-1"');
+  });
+
+  it("only links the Logs CTA to each project's own latest deployment", async () => {
+    mockCookies("deploylite_session", "opaque");
+    process.env.DEPLOYLITE_WEB_API_BASE_URL = apiBaseUrl;
+    const secondProject = { ...projectFixture, id: "project-2", name: "Other app" };
+    mockFetch({
+      "/api/v1/auth/me": { data: { user: userFixture }, error: null, requestId: "req_auth_1" },
+      "/api/v1/projects": { data: { projects: [projectFixture, secondProject] }, error: null, requestId: "req_projects_1" },
+      "/api/v1/agents": { data: { agents: [agentFixture] }, error: null, requestId: "req_agents_1" },
+      "/api/v1/deployments": {
+        data: {
+          deployments: [
+            { ...deploymentFixture, projectId: "project-1", id: "dep-1", status: "succeeded", startedAt: "2026-01-02T00:00:00.000Z" },
+            { ...deploymentFixture, projectId: "project-2", id: "dep-other", status: "failed", startedAt: "2026-01-01T00:00:00.000Z" }
+          ]
+        },
+        error: null,
+        requestId: "req_deployments_1"
+      }
+    });
+
+    const ProjectsPage = (await import("./projects/page.js")).default;
+    const html = renderToStaticMarkup(await ProjectsPage());
+
+    expect(html).toContain("data-project-id=\"project-1\"");
+    expect(html).toContain("data-project-id=\"project-2\"");
+    const projectOneIndex = html.indexOf("data-project-id=\"project-1\"");
+    const projectTwoIndex = html.indexOf("data-project-id=\"project-2\"");
+    const depOneIndex = html.indexOf('href="/deployments/dep-1"');
+    const depOtherIndex = html.indexOf('href="/deployments/dep-other"');
+    expect(depOneIndex).toBeGreaterThan(projectOneIndex);
+    expect(depOneIndex).toBeLessThan(projectTwoIndex);
+    expect(depOtherIndex).toBeGreaterThan(projectTwoIndex);
+  });
+
+  it("preserves the projects list empty state and the API error state", async () => {
+    mockCookies("deploylite_session", "opaque");
+    process.env.DEPLOYLITE_WEB_API_BASE_URL = apiBaseUrl;
+    mockFetch({
+      "/api/v1/auth/me": { data: { user: userFixture }, error: null, requestId: "req_auth_1" },
+      "/api/v1/projects": { data: { projects: [] }, error: null, requestId: "req_projects_1" },
+      "/api/v1/agents": { data: { agents: [] }, error: null, requestId: "req_agents_1" },
+      "/api/v1/deployments": { data: { deployments: [] }, error: null, requestId: "req_deployments_1" }
+    });
+
+    const ProjectsPage = (await import("./projects/page.js")).default;
+    const emptyHtml = renderToStaticMarkup(await ProjectsPage());
+
+    expect(emptyHtml).toContain("No projects yet");
+    expect(emptyHtml).toContain("Create your first project to start the deploy flow.");
+    expect(emptyHtml).not.toContain("data-testid=\"projects-launch-hub-table\"");
+
+    mockFetch({
+      "/api/v1/auth/me": { data: { user: userFixture }, error: null, requestId: "req_auth_1" },
+      "/api/v1/projects": { data: null, error: { code: "FAIL", message: "Failed", correlationId: "req_projects_fail" }, requestId: "req_projects_fail", status: 500 },
+      "/api/v1/agents": { data: { agents: [agentFixture] }, error: null, requestId: "req_agents_1" },
+      "/api/v1/deployments": { data: { deployments: [] }, error: null, requestId: "req_deployments_1" }
+    });
+
+    const errorHtml = renderToStaticMarkup(await ProjectsPage());
+    expect(errorHtml).toContain("Unable to load projects");
+    expect(errorHtml).not.toContain("data-testid=\"projects-launch-hub-table\"");
+  });
+});
+
 describe("project detail and deploy flow rendering", () => {
   afterEach(() => {
     vi.restoreAllMocks();
@@ -424,25 +625,6 @@ describe("project detail and deploy flow rendering", () => {
     expect(html).toContain("Recent deployments");
     expect(html).toContain("/deployments/dep-1");
     expect(html).toContain("View latest logs");
-  });
-
-  it("renders the projects list page with the new project CTA", async () => {
-    mockCookies("deploylite_session", "opaque");
-    process.env.DEPLOYLITE_WEB_API_BASE_URL = apiBaseUrl;
-    mockFetch({
-      "/api/v1/auth/me": { data: { user: userFixture }, error: null, requestId: "req_auth_1" },
-      "/api/v1/projects": { data: { projects: [projectFixture] }, error: null, requestId: "req_projects_1" },
-      "/api/v1/agents": { data: { agents: [agentFixture] }, error: null, requestId: "req_agents_1" },
-      "/api/v1/deployments": { data: { deployments: [] }, error: null, requestId: "req_deployments_1" }
-    });
-
-    const ProjectsPage = (await import("./projects/page.js")).default;
-    const html = renderToStaticMarkup(await ProjectsPage());
-
-    expect(html).toContain("All projects");
-    expect(html).toContain("/projects/new");
-    expect(html).toContain("/projects/project-1");
-    expect(html).toContain("Build");
   });
 });
 
