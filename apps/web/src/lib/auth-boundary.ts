@@ -8,6 +8,7 @@ import {
   logEventSchema,
   projectCreateRequestSchema,
   projectSchema,
+  projectUpdateRequestSchema,
   responseEnvelopeSchema,
   type Agent,
   type AuthResponse,
@@ -18,6 +19,7 @@ import {
   type LogEvent,
   type Project,
   type ProjectCreateRequest,
+  type ProjectUpdateRequest,
   type SafeAuthUserDto
 } from "@deploylite/contracts";
 import { z } from "zod";
@@ -79,7 +81,7 @@ export type ProjectDetailMetadata = {
 };
 
 export type AuthApiRequestOptions = {
-  method: "GET" | "POST";
+  method: "GET" | "POST" | "PATCH";
   body?: unknown;
 };
 
@@ -261,6 +263,21 @@ export async function createProject(input: ProjectCreateRequest, options: LoadAu
   try {
     const response = await (options.fetchImpl ?? fetch)(createAuthApiUrl(metadataApiPaths.projects, options.apiBaseUrl), {
       ...createAuthApiRequest({ method: "POST", body: projectCreateRequestSchema.parse(input) }),
+      headers: { cookie: options.cookieHeader ?? "" }
+    });
+    if (!response.ok) return { kind: "error", reason: "api-rejected", status: response.status };
+    return parseApiEnvelope(await response.json(), z.object({ project: projectSchema }));
+  } catch (error) {
+    if (error instanceof z.ZodError) return { kind: "error", reason: "invalid-payload" };
+    return { kind: "error", reason: "api-unreachable" };
+  }
+}
+
+export async function updateProject(projectId: string, input: ProjectUpdateRequest, options: LoadAuthSessionOptions): Promise<MetadataApiResult<{ project: Project }>> {
+  if (!options.apiBaseUrl) return { kind: "error", reason: "api-unconfigured" };
+  try {
+    const response = await (options.fetchImpl ?? fetch)(createAuthApiUrl(metadataApiPaths.project(projectId), options.apiBaseUrl), {
+      ...createAuthApiRequest({ method: "PATCH", body: projectUpdateRequestSchema.parse(input) }),
       headers: { cookie: options.cookieHeader ?? "" }
     });
     if (!response.ok) return { kind: "error", reason: "api-rejected", status: response.status };

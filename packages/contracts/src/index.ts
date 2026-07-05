@@ -98,7 +98,17 @@ export const projectCreateRequestSchema = z.object({
   port: z.coerce.number().int().min(1).max(65535).optional()
 });
 
-export const projectUpdateRequestSchema = projectCreateRequestSchema.partial();
+const nullableRuntimeStringSchema = z.string().min(1).nullable();
+const nullablePortSchema = z.union([z.coerce.number().int().min(1).max(65535), z.null()]);
+
+export const projectUpdateRequestSchema = z.object({
+  name: z.string().min(1).optional(),
+  repoUrl: z.string().url().optional(),
+  defaultBranch: z.string().min(1).optional(),
+  buildCommand: nullableRuntimeStringSchema.optional(),
+  runCommand: nullableRuntimeStringSchema.optional(),
+  port: nullablePortSchema.optional()
+});
 
 export const envVariableMetadataSchema = z.object({
   id: idSchema,

@@ -612,6 +612,8 @@ describe("project detail and deploy flow rendering", () => {
 
     expect(html).toContain("DeployLite");
     expect(html).toContain("Build command");
+    expect(html).toContain("Edit project configuration");
+    expect(html).toContain("Saved configuration only; no deployment started.");
     expect(html).toContain("pnpm build");
     expect(html).toContain("node server.js");
     expect(html).toContain("3000");
@@ -619,6 +621,7 @@ describe("project detail and deploy flow rendering", () => {
     expect(html).toContain("Launch checklist");
     expect(html).toContain("3/4 ready");
     expect(html).toContain("Missing values for: DATABASE_URL");
+    expect(html).toContain("Run command targets port 3000.");
     expect(html).toContain("#env-metadata");
     expect(html).toContain("#deploy-actions");
     expect(html).toContain("Deploy latest");

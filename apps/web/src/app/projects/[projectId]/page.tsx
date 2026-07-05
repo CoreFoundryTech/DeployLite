@@ -2,6 +2,7 @@ import Link from "next/link";
 import { cookies } from "next/headers";
 import { getAuthApiBaseUrl } from "@/lib/auth-boundary";
 import { loadRequestAuthSession, loadRequestProjectDetailMetadata } from "@/lib/server-auth";
+import { ProjectConfigEditForm } from "./project-config-edit-form";
 import { ProjectDetailActions } from "./project-detail-actions";
 import { AppShell } from "@/components/app-shell";
 import { Badge } from "@/components/ui/badge";
@@ -73,6 +74,7 @@ export default async function ProjectDetailPage({ params }: { params: Promise<Pa
   const readyCount = launchChecklist.filter((item) => item.state === "ready").length;
   const cookieStore = await cookies();
   const cookieHeader = cookieStore.getAll().map((c) => `${c.name}=${c.value}`).join("; ");
+  const apiBaseUrl = getAuthApiBaseUrl();
 
   return (
     <AppShell email={auth.user.email}>
@@ -91,12 +93,15 @@ export default async function ProjectDetailPage({ params }: { params: Promise<Pa
         <Card>
           <CardHeader>
             <CardTitle>Project configuration</CardTitle>
-            <CardDescription>Stored as durable metadata on the project record.</CardDescription>
+            <CardDescription>Stored as durable metadata on the project record. Editing never starts a deployment.</CardDescription>
           </CardHeader>
-          <CardContent className="flex flex-col gap-3 text-sm">
-            <ConfigRow label="Build command" value={project.buildCommand ?? "—"} />
-            <ConfigRow label="Run command" value={project.runCommand ?? "—"} />
-            <ConfigRow label="Port" value={project.port?.toString() ?? "—"} />
+          <CardContent className="flex flex-col gap-5 text-sm">
+            <div className="grid gap-3 md:grid-cols-3">
+              <ConfigRow label="Build command" value={project.buildCommand ?? "—"} />
+              <ConfigRow label="Run command" value={project.runCommand ?? "—"} />
+              <ConfigRow label="Port" value={project.port?.toString() ?? "—"} />
+            </div>
+            <ProjectConfigEditForm project={project} apiBaseUrl={apiBaseUrl} cookieHeader={cookieHeader} />
           </CardContent>
         </Card>
 
@@ -184,7 +189,7 @@ export default async function ProjectDetailPage({ params }: { params: Promise<Pa
           <div>
             <ProjectDetailActions
               project={project}
-              apiBaseUrl={getAuthApiBaseUrl()}
+              apiBaseUrl={apiBaseUrl}
               cookieHeader={cookieHeader}
               envVariables={envVariables}
             />

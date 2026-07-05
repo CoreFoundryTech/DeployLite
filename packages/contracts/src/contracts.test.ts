@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { agentHeartbeatSchema, bootstrapInitialAdminRequestSchema, bootstrapStatusSchema, logEventSchema, sseEventSchema } from "./index.js";
+import { agentHeartbeatSchema, bootstrapInitialAdminRequestSchema, bootstrapStatusSchema, logEventSchema, projectUpdateRequestSchema, sseEventSchema } from "./index.js";
 
 const now = new Date().toISOString();
 
@@ -51,5 +51,24 @@ describe("contracts", () => {
   it("validates initial admin bootstrap payloads", () => {
     expect(bootstrapInitialAdminRequestSchema.safeParse({ email: "admin@example.test", password: "long-enough-password" }).success).toBe(true);
     expect(bootstrapInitialAdminRequestSchema.safeParse({ email: "not-email", password: "short" }).success).toBe(false);
+  });
+
+  it("accepts nullable runtime clears in project update payloads", () => {
+    const result = projectUpdateRequestSchema.parse({
+      name: "DeployLite API",
+      buildCommand: null,
+      runCommand: null,
+      port: null
+    });
+
+    expect(result).toEqual({ name: "DeployLite API", buildCommand: null, runCommand: null, port: null });
+  });
+
+  it("rejects empty required project update fields and invalid ports", () => {
+    expect(projectUpdateRequestSchema.safeParse({ name: "" }).success).toBe(false);
+    expect(projectUpdateRequestSchema.safeParse({ repoUrl: "not-a-url" }).success).toBe(false);
+    expect(projectUpdateRequestSchema.safeParse({ defaultBranch: "" }).success).toBe(false);
+    expect(projectUpdateRequestSchema.safeParse({ port: 0 }).success).toBe(false);
+    expect(projectUpdateRequestSchema.safeParse({ port: 65536 }).success).toBe(false);
   });
 });
