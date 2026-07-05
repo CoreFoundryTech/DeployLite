@@ -26,6 +26,20 @@ The current auth foundation is intentionally narrow: API sessions are opaque Htt
 
 The installer is designed for a clean Ubuntu/Debian VPS and bootstraps DeployLite without manual Docker, Compose, Postgres, env, or migration setup. It installs/verifies Docker Engine and the Compose plugin when missing, creates `/opt/deploylite`, generates private secrets once, starts the Compose runtime, waits for health, and prints the browser URL for first-owner setup.
 
+One-command bootstrap from the reviewed GitHub `main` branch:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/CoreFoundryTech/DeployLite/main/scripts/bootstrap.sh | sudo bash
+```
+
+For a stable public IP or hostname, pass it through the environment without printing secrets:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/CoreFoundryTech/DeployLite/main/scripts/bootstrap.sh | sudo DEPLOYLITE_PUBLIC_HOST=<ip-or-host> bash
+```
+
+Set `DEPLOYLITE_VERSION=<branch-tag-or-sha>` to bootstrap a specific GitHub ref. The bootstrapper downloads the source tarball, extracts it under a temporary directory, preserves `DEPLOYLITE_*` environment variables, runs `scripts/install.sh`, and removes temporary files on exit.
+
 Reviewed local invocation from a checked-out release/source tree:
 
 ```bash
@@ -34,7 +48,7 @@ sudo DEPLOYLITE_PUBLIC_HOST=203.0.113.10 bash scripts/install.sh
 
 Replace `203.0.113.10` with the public VPS IP or hostname. If omitted, the installer tries conservative IP detection and asks you to set `DEPLOYLITE_PUBLIC_HOST` when it cannot determine a stable address.
 
-Future release packaging can wrap the same reviewed script in a one-line download command, but this repository slice intentionally documents source-tree execution first.
+The GitHub bootstrap command downloads the requested repository ref, runs the reviewed installer from a temporary checkout, and cleans up the temporary files afterward.
 
 Included:
 
@@ -42,6 +56,7 @@ Included:
 - `infra/vps/compose.yml` with Postgres, one-shot migrations, API, Web, named volumes, an internal network, health checks, and restart policies.
 - Temporary HTTP exposure: Web on host `:80` and API on host `:3001`.
 - Browser-first initial owner creation through the existing setup UI. There are no default admin credentials.
+- `scripts/bootstrap.sh`, a GitHub raw bootstrapper with mocked tests in `scripts/bootstrap.test.sh`.
 - `scripts/install.sh`, a defensive Bash installer with mocked tests in `scripts/install.test.sh`.
 
 Deferred non-goals:
