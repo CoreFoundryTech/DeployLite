@@ -120,6 +120,9 @@ export const projects = pgTable("projects", {
   name: text("name").notNull(),
   repoUrl: text("repo_url").notNull(),
   defaultBranch: text("default_branch").notNull(),
+  buildCommand: text("build_command"),
+  runCommand: text("run_command"),
+  port: integer("port"),
   ...timestamps
 });
 
@@ -192,6 +195,8 @@ export const envVariableMetadata = pgTable(
     scope: text("scope").notNull().default("project"),
     valuePresent: boolean("value_present").notNull().default(false),
     valueFingerprint: text("value_fingerprint"),
+    required: boolean("required").notNull().default(false),
+    description: text("description"),
     metadata: jsonObject("metadata"),
     ...timestamps
   },

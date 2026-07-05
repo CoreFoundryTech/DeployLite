@@ -83,7 +83,45 @@ export const projectSchema = z.object({
   id: idSchema,
   name: z.string().min(1),
   repoUrl: z.string().url(),
-  defaultBranch: z.string().min(1)
+  defaultBranch: z.string().min(1),
+  buildCommand: z.string().min(1).nullable(),
+  runCommand: z.string().min(1).nullable(),
+  port: z.number().int().min(1).max(65535).nullable()
+});
+
+export const projectCreateRequestSchema = z.object({
+  name: z.string().min(1),
+  repoUrl: z.string().url(),
+  defaultBranch: z.string().min(1),
+  buildCommand: z.string().min(1).optional(),
+  runCommand: z.string().min(1).optional(),
+  port: z.coerce.number().int().min(1).max(65535).optional()
+});
+
+export const projectUpdateRequestSchema = projectCreateRequestSchema.partial();
+
+export const envVariableMetadataSchema = z.object({
+  id: idSchema,
+  projectId: idSchema,
+  key: z.string().min(1),
+  scope: z.enum(["project", "deployment"]),
+  valuePresent: z.boolean(),
+  valueFingerprint: z.string().nullable(),
+  required: z.boolean(),
+  description: z.string().nullable(),
+  updatedAt: isoDateSchema
+});
+
+export const envVariableMetadataUpsertRequestSchema = z.object({
+  key: z.string().min(1).max(128),
+  scope: z.enum(["project", "deployment"]).default("project"),
+  required: z.boolean().default(false),
+  description: z.string().max(512).nullable().optional()
+}).strict();
+
+export const deployRequestSchema = z.object({
+  agentId: idSchema.optional(),
+  commitSha: z.string().regex(/^[a-f0-9]{7,40}$/).optional()
 });
 
 export const deploymentStatusSchema = z.enum(["queued", "running", "succeeded", "failed", "canceled"]);
@@ -124,6 +162,11 @@ export type Agent = z.infer<typeof agentSchema>;
 export type Deployment = z.infer<typeof deploymentSchema>;
 export type LogEvent = z.infer<typeof logEventSchema>;
 export type Project = z.infer<typeof projectSchema>;
+export type ProjectCreateRequest = z.infer<typeof projectCreateRequestSchema>;
+export type ProjectUpdateRequest = z.infer<typeof projectUpdateRequestSchema>;
+export type EnvVariableMetadata = z.infer<typeof envVariableMetadataSchema>;
+export type EnvVariableMetadataUpsertRequest = z.infer<typeof envVariableMetadataUpsertRequestSchema>;
+export type DeployRequest = z.infer<typeof deployRequestSchema>;
 export type ScaffoldUser = z.infer<typeof scaffoldUserSchema>;
 export type CanonicalRole = z.infer<typeof canonicalRoleSchema>;
 export type SafeAuthUserDto = z.infer<typeof safeAuthUserSchema>;

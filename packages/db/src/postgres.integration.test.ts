@@ -160,7 +160,10 @@ describeIntegration("PostgreSQL auth foundation integration", () => {
       id: projectId,
       name: "Integration project",
       repoUrl: "https://github.com/example/deploylite-integration",
-      defaultBranch: "main"
+      defaultBranch: "main",
+      buildCommand: "pnpm build",
+      runCommand: "pnpm start",
+      port: 3000
     });
 
     await requireDbDeploymentRepository().save({
