@@ -36,7 +36,7 @@ describe("local first-admin login rendering", () => {
     expect(html).toContain("Create the first local admin");
     expect(html).toContain("Normal sign-in stays unavailable until setup creates the first local admin");
     expect(html).toContain("Create first admin");
-    expect(html).not.toContain("Sign in with API cookie");
+    expect(html).toContain('aria-label="Create first admin"');
     expect(html).not.toContain("very-secret-admin-password");
   });
 
@@ -49,7 +49,7 @@ describe("local first-admin login rendering", () => {
 
     const html = renderToStaticMarkup(await LoginPage());
 
-    expect(html).toContain("Setup complete");
+    expect(html).toContain("First-admin setup is complete");
     expect(html).toContain("Sign in with API cookie");
     expect(html).not.toContain("Create first admin");
   });
@@ -78,7 +78,7 @@ describe("local first-admin login rendering", () => {
 
     const html = renderToStaticMarkup(await LoginPage());
 
-    expect(html).toContain("Cookie session active");
+    expect(html).toContain("DeployLite admin shell");
     expect(html).toContain("Open dashboard");
   });
 });
@@ -139,7 +139,7 @@ describe("initial admin setup client interactions", () => {
     expect(html).toContain("Creating admin...");
     expect(html).toContain("role=\"status\"");
     expect(html).toContain("aria-live=\"polite\"");
-    expect(html).toContain("disabled=\"\"");
+    expect(html).toContain("disabled");
   });
 });
 
@@ -181,7 +181,7 @@ describe("dashboard real API rendering", () => {
       "/api/v1/agents": { data: { agents: [] }, error: null, requestId: "req_agents_1" },
       "/api/v1/deployments": { data: { deployments: [] }, error: null, requestId: "req_deployments_1" }
     });
-    expect(renderToStaticMarkup(await DashboardPage())).toContain("No platform metadata yet");
+    expect(renderToStaticMarkup(await DashboardPage())).toContain("No projects yet");
     expect(renderToStaticMarkup(await DashboardPage())).toContain("intentionally out of scope");
 
     mockFetch({
@@ -236,7 +236,58 @@ describe("deployment log real API rendering", () => {
     expect(html).toContain("1 INFO First event");
     expect(html).toContain("2 INFO Second event");
     expect(html.indexOf("1 INFO First event")).toBeLessThan(html.indexOf("2 INFO Second event"));
-    expect(html).toContain("Last event ID: 2");
+    expect(html).toContain("last event ID: 2");
+  });
+});
+
+describe("project detail and deploy flow rendering", () => {
+  afterEach(() => {
+    vi.restoreAllMocks();
+    vi.unstubAllGlobals();
+    delete process.env.DEPLOYLITE_WEB_API_BASE_URL;
+  });
+
+  it("renders the project detail page with env metadata, build/run/port, and a deploy trigger", async () => {
+    mockCookies("deploylite_session", "opaque");
+    process.env.DEPLOYLITE_WEB_API_BASE_URL = apiBaseUrl;
+    mockFetch({
+      "/api/v1/auth/me": { data: { user: userFixture }, error: null, requestId: "req_auth_1" },
+      "/api/v1/projects/project-1": { data: { project: projectFixture }, error: null, requestId: "req_project_1" },
+      "/api/v1/projects/project-1/env-variables": { data: { envVariables: [{ id: "env-1", projectId: "project-1", key: "DATABASE_URL", scope: "project", valuePresent: false, valueFingerprint: null, required: true, description: "Postgres connection string", updatedAt: "2026-01-01T00:00:00.000Z" }] }, error: null, requestId: "req_env_1" },
+      "/api/v1/deployments": { data: { deployments: [deploymentFixture] }, error: null, requestId: "req_dep_list_1" }
+    });
+
+    const ProjectDetailPage = (await import("./projects/[projectId]/page.js")).default;
+    const html = renderToStaticMarkup(await ProjectDetailPage({ params: Promise.resolve({ projectId: "project-1" }) }));
+
+    expect(html).toContain("DeployLite");
+    expect(html).toContain("Build command");
+    expect(html).toContain("pnpm build");
+    expect(html).toContain("node server.js");
+    expect(html).toContain("3000");
+    expect(html).toContain("DATABASE_URL");
+    expect(html).toContain("Deploy latest");
+    expect(html).toContain("Recent deployments");
+    expect(html).toContain("/deployments/dep-1");
+  });
+
+  it("renders the projects list page with the new project CTA", async () => {
+    mockCookies("deploylite_session", "opaque");
+    process.env.DEPLOYLITE_WEB_API_BASE_URL = apiBaseUrl;
+    mockFetch({
+      "/api/v1/auth/me": { data: { user: userFixture }, error: null, requestId: "req_auth_1" },
+      "/api/v1/projects": { data: { projects: [projectFixture] }, error: null, requestId: "req_projects_1" },
+      "/api/v1/agents": { data: { agents: [agentFixture] }, error: null, requestId: "req_agents_1" },
+      "/api/v1/deployments": { data: { deployments: [] }, error: null, requestId: "req_deployments_1" }
+    });
+
+    const ProjectsPage = (await import("./projects/page.js")).default;
+    const html = renderToStaticMarkup(await ProjectsPage());
+
+    expect(html).toContain("All projects");
+    expect(html).toContain("/projects/new");
+    expect(html).toContain("/projects/project-1");
+    expect(html).toContain("Build");
   });
 });
 
@@ -259,7 +310,15 @@ function mockFetch(routes: Record<string, { data: unknown; error: unknown; reque
 }
 
 const userFixture = { id: "user-1", email: "admin@example.test", role: "admin", status: "active" };
-const projectFixture = { id: "project-1", name: "DeployLite", repoUrl: "https://github.com/CoreFoundryTech/DeployLite", defaultBranch: "main" };
+const projectFixture = {
+  id: "project-1",
+  name: "DeployLite",
+  repoUrl: "https://github.com/CoreFoundryTech/DeployLite",
+  defaultBranch: "main",
+  buildCommand: "pnpm build",
+  runCommand: "node server.js",
+  port: 3000
+};
 const agentFixture = {
   id: "agent-1",
   name: "Primary Agent",

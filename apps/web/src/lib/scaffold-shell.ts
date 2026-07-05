@@ -53,7 +53,10 @@ const mockProject: Project = {
   id: "project_mock_1",
   name: "DeployLite Mock Project",
   repoUrl: "https://github.com/CoreFoundryTech/DeployLite",
-  defaultBranch: "main"
+  defaultBranch: "main",
+  buildCommand: "pnpm build",
+  runCommand: "pnpm start",
+  port: 3000
 };
 
 const mockDeployment: Deployment = {

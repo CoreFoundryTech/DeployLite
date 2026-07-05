@@ -3,20 +3,26 @@ import {
   agentRegistrationSchema,
   authLoginRequestSchema,
   bootstrapInitialAdminRequestSchema,
+  deployRequestSchema,
   deploymentSchema,
+  envVariableMetadataSchema,
+  envVariableMetadataUpsertRequestSchema,
+  projectCreateRequestSchema,
   projectSchema,
   resourceSnapshotSchema,
   type Agent,
   type Deployment,
+  type EnvVariableMetadata,
   type Project
 } from "@deploylite/contracts";
-import { BcryptPasswordHasher, bootstrapInitialAdmin, closeDbPool, createDbClient, createDbPool, createOpaqueSessionToken, DbAgentRepository, DbAuditRepository, DbAuthUserRepository, DbDeploymentRepository, DbProjectRepository, DbSessionRepository, hashSessionToken, type DeployLiteDb } from "@deploylite/db";
+import { BcryptPasswordHasher, bootstrapInitialAdmin, closeDbPool, createDbClient, createDbPool, createOpaqueSessionToken, DbAgentRepository, DbAuditRepository, DbAuthUserRepository, DbDeploymentRepository, DbEnvVariableMetadataRepository, DbProjectRepository, DbSessionRepository, hashSessionToken, type DeployLiteDb } from "@deploylite/db";
 import {
   AgentStatusService,
   authenticateLocalUser,
   getBootstrapStatus,
   InMemoryAgentRepository,
   InMemoryDeploymentRepository,
+  InMemoryEnvVariableMetadataRepository,
   InitialAdminAlreadyExistsError,
   toSafeAuthUser,
   type AuditEvent,
@@ -28,6 +34,7 @@ import {
   type CanonicalRoleName,
   type CreateInitialAdminInput,
   type CreateSessionInput,
+  type EnvVariableMetadataRepository,
   type PasswordHasher,
   type AgentRepository,
   type DeploymentRepository,
@@ -318,18 +325,118 @@ type PlatformRepositoryOptions = {
   agents: AgentRepository;
   deployments: DeploymentRepository;
   projects: ProjectRepository;
+  envMetadata?: EnvVariableMetadataRepository;
 };
 
 type PlatformRepositories = PlatformRepositoryOptions & {
   agentStatus: AgentStatusService;
+  envMetadata: EnvVariableMetadataRepository;
+  deployRunner: DeployRunner;
 };
 
 function createApiState(overrides: Partial<PlatformRepositoryOptions> = {}): PlatformRepositories {
   const agents = overrides.agents ?? new InMemoryAgentRepository();
   const deployments = overrides.deployments ?? new InMemoryDeploymentRepository();
   const projects = overrides.projects ?? new InMemoryProjectRepository();
+  const envMetadata = overrides.envMetadata ?? new InMemoryEnvVariableMetadataRepository();
   const agentStatus = new AgentStatusService(agents);
-  return { agents, deployments, projects, agentStatus };
+  const deployRunner = new DeployRunner(deployments, envMetadata, agentStatus);
+  return { agents, deployments, projects, envMetadata, agentStatus, deployRunner };
+}
+
+class DeployRunner {
+  #sequenceByDeployment = new Map<string, number>();
+  #timers = new Map<string, NodeJS.Timeout>();
+
+  constructor(
+    private readonly deployments: DeploymentRepository,
+    private readonly envMetadata: EnvVariableMetadataRepository,
+    private readonly agentStatus: AgentStatusService
+  ) {}
+
+  /**
+   * Control-plane deployment runner. In this local MVP, the API does not talk
+   * to a real agent or to a Docker socket. It records the deployment as
+   * `queued`, then schedules status transitions to `running` and `succeeded`
+   * (or `failed` when required env metadata is missing) and appends audit-safe
+   * log events so the UI can show a real lifecycle end-to-end.
+   */
+  async start(deployment: Deployment, project: Project, requestId: string, correlationId: string): Promise<{ deployment: Deployment; logs: EnvVariableMetadata[] }> {
+    const logs = await this.envMetadata.listByProject(project.id);
+    const missingRequired = logs.filter((record) => record.required && !record.valuePresent);
+    await this.appendLog(deployment, "info", `Queued deploy for project ${project.name} (${project.repoUrl}@${project.defaultBranch}).`, requestId, correlationId);
+    await this.appendLog(deployment, "info", `Resolved ${logs.length} env metadata record(s); ${missingRequired.length} required-without-value.`, requestId, correlationId);
+
+    if (missingRequired.length > 0) {
+      await this.appendLog(deployment, "error", `Refusing to advance: required env metadata missing for ${missingRequired.map((m) => m.key).join(", ")}.`, requestId, correlationId);
+      const failed: Deployment = { ...deployment, status: "failed", finishedAt: new Date().toISOString() };
+      await this.deployments.save(failed);
+      return { deployment: failed, logs };
+    }
+
+    if (!project.buildCommand) {
+      await this.appendLog(deployment, "warn", "No build command configured; skipping build step.", requestId, correlationId);
+    } else {
+      await this.appendLog(deployment, "info", `Build command: ${project.buildCommand}`, requestId, correlationId);
+    }
+    if (!project.runCommand) {
+      await this.appendLog(deployment, "warn", "No run command configured; deploy will stay in queued state.", requestId, correlationId);
+    } else {
+      await this.appendLog(deployment, "info", `Run command: ${project.runCommand} (port ${project.port ?? "default"})`, requestId, correlationId);
+    }
+
+    this.scheduleAdvance(deployment.id, "running", 50);
+    this.scheduleAdvance(deployment.id, "succeeded", 250);
+    return { deployment, logs };
+  }
+
+  async appendLog(deployment: Deployment, level: "debug" | "info" | "warn" | "error", message: string, requestId: string, correlationId: string) {
+    const next = (this.#sequenceByDeployment.get(deployment.id) ?? 0) + 1;
+    this.#sequenceByDeployment.set(deployment.id, next);
+    await this.deployments.appendLog({
+      id: `log_${createRequestId()}`,
+      deploymentId: deployment.id,
+      sequence: next,
+      level,
+      message,
+      timestamp: new Date().toISOString(),
+      redactionApplied: true,
+      requestId,
+      correlationId
+    });
+  }
+
+  scheduleAdvance(deploymentId: string, status: "running" | "succeeded" | "failed", delayMs: number) {
+    const previous = this.#timers.get(deploymentId);
+    if (previous) {
+      clearTimeout(previous);
+    }
+    const timer = setTimeout(async () => {
+      this.#timers.delete(deploymentId);
+      const existing = await this.deployments.findById(deploymentId);
+      if (!existing) return;
+      if (existing.status === "failed" || existing.status === "succeeded" || existing.status === "canceled") return;
+      const finishedAt = status === "running" ? null : new Date().toISOString();
+      const next: Deployment = { ...existing, status, finishedAt };
+      await this.deployments.save(next);
+      const message =
+        status === "running"
+          ? "Simulated agent picked up the deployment. Real Docker execution is intentionally deferred."
+          : status === "succeeded"
+            ? "Simulated agent marked the deployment succeeded. Real container execution is intentionally deferred."
+            : "Simulated agent marked the deployment failed.";
+      await this.appendLog(next, status === "succeeded" ? "info" : status === "failed" ? "error" : "info", message, next.startedAt, next.startedAt);
+      void this.agentStatus;
+    }, delayMs);
+    this.#timers.set(deploymentId, timer);
+  }
+
+  cancelTimers() {
+    for (const timer of this.#timers.values()) {
+      clearTimeout(timer);
+    }
+    this.#timers.clear();
+  }
 }
 
 async function createSeededInMemoryAuthAdapters(env: DeployLiteEnv): Promise<AuthAdapters> {
@@ -371,7 +478,8 @@ function createDbAuthAdapters(env: DeployLiteEnv, options: BuildApiAppOptions): 
     state: createApiState({
       agents: options.state?.agents ?? new DbAgentRepository(db),
       deployments: options.state?.deployments ?? new DbDeploymentRepository(db),
-      projects: options.state?.projects ?? new DbProjectRepository(db)
+      projects: options.state?.projects ?? new DbProjectRepository(db),
+      envMetadata: options.state?.envMetadata ?? new DbEnvVariableMetadataRepository(db)
     })
   };
 }
@@ -403,7 +511,10 @@ async function seedMockData(state: PlatformRepositories): Promise<void> {
     id: "project_mock_1",
     name: "DeployLite Mock Project",
     repoUrl: "https://github.com/CoreFoundryTech/DeployLite",
-    defaultBranch: "main"
+    defaultBranch: "main",
+    buildCommand: "pnpm build",
+    runCommand: "pnpm start",
+    port: 3000
   });
   await state.deployments.save({
     id: "dep_mock_1",
@@ -548,9 +659,114 @@ function registerRoutes(app: FastifyInstance, state: PlatformRepositories, adapt
   });
   app.get(`${API_PREFIX}/projects`, { preHandler: requireAuth }, async (request) => ok(request, { projects: await state.projects.list() }));
   app.post(`${API_PREFIX}/projects`, { preHandler: [requireAuth, requireMutationRole] }, async (request) => {
-    const body = parseBody(projectSchema.omit({ id: true }), request.body);
-    const project = await state.projects.save({ id: `project_${createRequestId()}`, ...body });
-    return ok(request, { project, audit: auditMutation(request, "project.create", "project", project.id) });
+    const body = parseBody(projectCreateRequestSchema, request.body);
+    const project: Project = {
+      id: `project_${createRequestId()}`,
+      name: body.name,
+      repoUrl: body.repoUrl,
+      defaultBranch: body.defaultBranch,
+      buildCommand: body.buildCommand ?? null,
+      runCommand: body.runCommand ?? null,
+      port: body.port ?? null
+    };
+    const saved = await state.projects.save(project);
+    return ok(request, { project: saved, audit: auditMutation(request, "project.create", "project", saved.id) });
+  });
+  app.get(`${API_PREFIX}/projects/:projectId`, { preHandler: requireAuth }, async (request, reply) => {
+    const params = z.object({ projectId: z.string().min(1) }).parse(request.params);
+    const project = await state.projects.findById(params.projectId);
+    return project ? ok(request, { project }) : reply.code(404).send(errorEnvelope(request, "NOT_FOUND", "Project not found."));
+  });
+  app.patch(`${API_PREFIX}/projects/:projectId`, { preHandler: [requireAuth, requireMutationRole] }, async (request, reply) => {
+    const params = z.object({ projectId: z.string().min(1) }).parse(request.params);
+    const existing = await state.projects.findById(params.projectId);
+    if (!existing) {
+      return reply.code(404).send(errorEnvelope(request, "NOT_FOUND", "Project not found."));
+    }
+    const body = parseBody(projectCreateRequestSchema.partial(), request.body);
+    const next: Project = {
+      ...existing,
+      name: body.name ?? existing.name,
+      repoUrl: body.repoUrl ?? existing.repoUrl,
+      defaultBranch: body.defaultBranch ?? existing.defaultBranch,
+      buildCommand: body.buildCommand !== undefined ? (body.buildCommand ?? null) : existing.buildCommand,
+      runCommand: body.runCommand !== undefined ? (body.runCommand ?? null) : existing.runCommand,
+      port: body.port !== undefined ? (body.port ?? null) : existing.port
+    };
+    const saved = await state.projects.save(next);
+    return ok(request, { project: saved, audit: auditMutation(request, "project.update", "project", saved.id) });
+  });
+  app.get(`${API_PREFIX}/projects/:projectId/env-variables`, { preHandler: requireAuth }, async (request, reply) => {
+    const params = z.object({ projectId: z.string().min(1) }).parse(request.params);
+    const project = await state.projects.findById(params.projectId);
+    if (!project) {
+      return reply.code(404).send(errorEnvelope(request, "NOT_FOUND", "Project not found."));
+    }
+    const records = await state.envMetadata.listByProject(params.projectId);
+    return ok(request, { envVariables: records.map((record) => envVariableMetadataSchema.parse(record)) });
+  });
+  app.post(`${API_PREFIX}/projects/:projectId/env-variables`, { preHandler: [requireAuth, requireMutationRole] }, async (request, reply) => {
+    const params = z.object({ projectId: z.string().min(1) }).parse(request.params);
+    const project = await state.projects.findById(params.projectId);
+    if (!project) {
+      return reply.code(404).send(errorEnvelope(request, "NOT_FOUND", "Project not found."));
+    }
+    const body = parseBody(envVariableMetadataUpsertRequestSchema, request.body);
+    const now = new Date().toISOString();
+    const record: EnvVariableMetadata = {
+      id: `env_${createRequestId()}`,
+      projectId: params.projectId,
+      key: body.key,
+      scope: body.scope ?? "project",
+      valuePresent: false,
+      valueFingerprint: null,
+      required: body.required ?? false,
+      description: body.description ?? null,
+      updatedAt: now
+    };
+    const saved = await state.envMetadata.upsert(record);
+    return ok(request, { envVariable: envVariableMetadataSchema.parse(saved), audit: auditMutation(request, "project.env.upsert", "project", params.projectId) });
+  });
+  app.delete(`${API_PREFIX}/projects/:projectId/env-variables`, { preHandler: [requireAuth, requireMutationRole] }, async (request, reply) => {
+    const params = z.object({ projectId: z.string().min(1), key: z.string().min(1), scope: z.enum(["project", "deployment"]).default("project") })
+      .parse({ ...(request.params as Record<string, string>), scope: (request.query as { scope?: string } | undefined)?.scope ?? "project" });
+    const removed = await state.envMetadata.remove(params.projectId, params.key, params.scope);
+    return removed
+      ? ok(request, { removed: true, audit: auditMutation(request, "project.env.delete", "project", params.projectId) })
+      : reply.code(404).send(errorEnvelope(request, "NOT_FOUND", "Env metadata not found."));
+  });
+  app.post(`${API_PREFIX}/projects/:projectId/deployments`, { preHandler: [requireAuth, requireMutationRole] }, async (request, reply) => {
+    const params = z.object({ projectId: z.string().min(1) }).parse(request.params);
+    const project = await state.projects.findById(params.projectId);
+    if (!project) {
+      return reply.code(404).send(errorEnvelope(request, "NOT_FOUND", "Project not found."));
+    }
+    const body = parseBody(deployRequestSchema, request.body ?? {});
+    let agentId = body.agentId ?? null;
+    if (!agentId) {
+      const onlineAgents = (await state.agents.list()).filter((agent) => agent.status === "online" || agent.status === "stale");
+      agentId = onlineAgents[0]?.id ?? null;
+    }
+    if (!agentId) {
+      return reply.code(409).send(errorEnvelope(request, "NO_AGENT_AVAILABLE", "No agent is online. Register an agent or bring one online before deploying."));
+    }
+    const commitSha = body.commitSha ?? "0000000";
+    const deployment: Deployment = {
+      id: `dep_${createRequestId()}`,
+      projectId: project.id,
+      agentId,
+      status: "queued",
+      commitSha,
+      startedAt: new Date().toISOString(),
+      finishedAt: null
+    };
+    await state.deployments.save(deployment);
+    const runnerResult = await state.deployRunner.start(deployment, project, request.correlationContext.requestId, request.correlationContext.correlationId);
+    return ok(request, {
+      deployment: runnerResult.deployment,
+      envVariables: runnerResult.logs.map((record) => envVariableMetadataSchema.parse(record)),
+      audit: auditMutation(request, "deployment.trigger", "deployment", deployment.id)
+    });
   });
   app.get(`${API_PREFIX}/deployments/:deploymentId`, { preHandler: requireAuth }, async (request, reply) => {
     const params = z.object({ deploymentId: z.string().min(1) }).parse(request.params);
@@ -598,6 +814,9 @@ export async function buildApiApp(options: BuildApiAppOptions = {}): Promise<Fas
   }
   registerCoreHooks(app, corsOrigin);
   registerRoutes(app, repositories.state, repositories.auth, authConfig);
+  app.addHook("onClose", () => {
+    repositories.state.deployRunner.cancelTimers();
+  });
   return app;
 }
 

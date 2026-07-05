@@ -4,7 +4,9 @@ import {
   bootstrapInitialAdminRequestSchema,
   bootstrapStatusSchema,
   deploymentSchema,
+  envVariableMetadataSchema,
   logEventSchema,
+  projectCreateRequestSchema,
   projectSchema,
   responseEnvelopeSchema,
   type Agent,
@@ -12,8 +14,10 @@ import {
   type BootstrapInitialAdminRequest,
   type BootstrapStatus,
   type Deployment,
+  type EnvVariableMetadata,
   type LogEvent,
   type Project,
+  type ProjectCreateRequest,
   type SafeAuthUserDto
 } from "@deploylite/contracts";
 import { z } from "zod";
@@ -32,6 +36,9 @@ export const bootstrapApiPaths = {
 export const metadataApiPaths = {
   agents: "/api/v1/agents",
   projects: "/api/v1/projects",
+  project: (projectId: string) => `/api/v1/projects/${encodeURIComponent(projectId)}`,
+  projectEnvVariables: (projectId: string) => `/api/v1/projects/${encodeURIComponent(projectId)}/env-variables`,
+  projectDeployments: (projectId: string) => `/api/v1/projects/${encodeURIComponent(projectId)}/deployments`,
   deployments: "/api/v1/deployments",
   deployment: (deploymentId: string) => `/api/v1/deployments/${encodeURIComponent(deploymentId)}`,
   deploymentLogs: (deploymentId: string) => `/api/v1/deployments/${encodeURIComponent(deploymentId)}/logs`
@@ -63,6 +70,12 @@ export type DashboardMetadata = {
 export type DeploymentLogMetadata = {
   deployment: Deployment | null;
   events: LogEvent[];
+};
+
+export type ProjectDetailMetadata = {
+  project: Project;
+  envVariables: EnvVariableMetadata[];
+  deployments: Deployment[];
 };
 
 export type AuthApiRequestOptions = {
@@ -219,6 +232,79 @@ export async function loadDeploymentLogMetadata(deploymentId: string, options: L
   }
 
   return { kind: "ready", data: { deployment: deployment.data.deployment, events: logs.data.events }, requestId: deployment.requestId };
+}
+
+export async function loadProjectDetailMetadata(projectId: string, options: LoadAuthSessionOptions): Promise<MetadataApiResult<ProjectDetailMetadata>> {
+  const [project, envVariables, deployments] = await Promise.all([
+    fetchMetadataEnvelope<{ project: Project }>({ ...options, path: metadataApiPaths.project(projectId), schema: z.object({ project: projectSchema }) }),
+    fetchMetadataEnvelope<{ envVariables: EnvVariableMetadata[] }>({ ...options, path: metadataApiPaths.projectEnvVariables(projectId), schema: z.object({ envVariables: z.array(envVariableMetadataSchema) }) }),
+    fetchMetadataEnvelope<{ deployments: Deployment[] }>({ ...options, path: metadataApiPaths.deployments, schema: z.object({ deployments: z.array(deploymentSchema) }) })
+  ]);
+
+  if (project.kind === "error") return project;
+  if (envVariables.kind === "error") return envVariables;
+  if (deployments.kind === "error") return deployments;
+
+  return {
+    kind: "ready",
+    data: {
+      project: project.data.project,
+      envVariables: envVariables.data.envVariables,
+      deployments: deployments.data.deployments.filter((deployment) => deployment.projectId === projectId)
+    },
+    requestId: project.requestId
+  };
+}
+
+export async function createProject(input: ProjectCreateRequest, options: LoadAuthSessionOptions): Promise<MetadataApiResult<{ project: Project }>> {
+  if (!options.apiBaseUrl) return { kind: "error", reason: "api-unconfigured" };
+  try {
+    const response = await (options.fetchImpl ?? fetch)(createAuthApiUrl(metadataApiPaths.projects, options.apiBaseUrl), {
+      ...createAuthApiRequest({ method: "POST", body: projectCreateRequestSchema.parse(input) }),
+      headers: { cookie: options.cookieHeader ?? "" }
+    });
+    if (!response.ok) return { kind: "error", reason: "api-rejected", status: response.status };
+    return parseApiEnvelope(await response.json(), z.object({ project: projectSchema }));
+  } catch (error) {
+    if (error instanceof z.ZodError) return { kind: "error", reason: "invalid-payload" };
+    return { kind: "error", reason: "api-unreachable" };
+  }
+}
+
+export async function triggerProjectDeployment(projectId: string, options: LoadAuthSessionOptions): Promise<MetadataApiResult<{ deployment: Deployment }>> {
+  if (!options.apiBaseUrl) return { kind: "error", reason: "api-unconfigured" };
+  try {
+    const response = await (options.fetchImpl ?? fetch)(createAuthApiUrl(metadataApiPaths.projectDeployments(projectId), options.apiBaseUrl), {
+      ...createAuthApiRequest({ method: "POST", body: {} }),
+      headers: { cookie: options.cookieHeader ?? "" }
+    });
+    if (!response.ok) return { kind: "error", reason: "api-rejected", status: response.status };
+    return parseApiEnvelope(await response.json(), z.object({ deployment: deploymentSchema }));
+  } catch {
+    return { kind: "error", reason: "api-unreachable" };
+  }
+}
+
+export async function upsertEnvVariable(projectId: string, input: { key: string; scope?: "project" | "deployment"; required?: boolean; description?: string | null }, options: LoadAuthSessionOptions): Promise<MetadataApiResult<{ envVariable: EnvVariableMetadata }>> {
+  if (!options.apiBaseUrl) return { kind: "error", reason: "api-unconfigured" };
+  try {
+    const response = await (options.fetchImpl ?? fetch)(createAuthApiUrl(metadataApiPaths.projectEnvVariables(projectId), options.apiBaseUrl), {
+      ...createAuthApiRequest({
+        method: "POST",
+        body: {
+          key: input.key,
+          scope: input.scope ?? "project",
+          required: input.required ?? false,
+          description: input.description ?? null
+        }
+      }),
+      headers: { cookie: options.cookieHeader ?? "" }
+    });
+    if (!response.ok) return { kind: "error", reason: "api-rejected", status: response.status };
+    return parseApiEnvelope(await response.json(), z.object({ envVariable: envVariableMetadataSchema }));
+  } catch {
+    return { kind: "error", reason: "api-unreachable" };
+  }
 }
 
 export function hasSessionCookie(cookieHeader: string | undefined, cookieName = defaultSessionCookieName): boolean {

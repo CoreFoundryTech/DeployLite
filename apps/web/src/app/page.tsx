@@ -3,6 +3,9 @@ import React from "react";
 import { InitialAdminSetupForm, LoginForm } from "./auth-controls";
 import { authApiPaths, bootstrapApiPaths, getAuthApiBaseUrl, type BootstrapApiResult } from "../lib/auth-boundary";
 import { loadRequestAuthSession, loadRequestBootstrapStatus } from "../lib/server-auth";
+import { Alert, AlertDescription, AlertTitle } from "@/components/ui/alert";
+import { Button } from "@/components/ui/button";
+import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card";
 
 export const dynamic = "force-dynamic";
 
@@ -12,52 +15,78 @@ export default async function LoginPage() {
 
   if (auth.kind === "authenticated") {
     return (
-      <main className="shell stack">
-        <section className="banner stack" aria-labelledby="login-title">
-          <span className="pill">Cookie session active</span>
-          <h1 id="login-title">DeployLite admin shell</h1>
-          <p className="muted">Signed in as {auth.user.email} with the canonical {auth.user.role} role.</p>
-          <Link className="button" href="/dashboard">Open dashboard</Link>
-        </section>
+      <main className="mx-auto flex min-h-screen w-full max-w-3xl items-center px-6 py-12">
+        <Card className="w-full">
+          <CardHeader>
+            <CardTitle>DeployLite admin shell</CardTitle>
+            <CardDescription>Signed in as {auth.user.email} with the canonical {auth.user.role} role.</CardDescription>
+          </CardHeader>
+          <CardContent>
+            <Link href="/dashboard">
+              <Button>Open dashboard</Button>
+            </Link>
+          </CardContent>
+        </Card>
       </main>
     );
   }
 
   if (bootstrap.kind === "error") {
     return (
-      <main className="shell stack">
-        <section className="banner stack" aria-labelledby="login-title">
-          <span className="pill">Bootstrap status unavailable</span>
-          <h1 id="login-title">DeployLite admin shell</h1>
-          <p className="alert-message" role="alert">{bootstrapGuidance(bootstrap)}</p>
-          <p className="muted">Retry after the local API is reachable and the Web app can call <code>{bootstrapApiPaths.status}</code>. No password or deployment secret is required for this check.</p>
-        </section>
+      <main className="mx-auto flex min-h-screen w-full max-w-3xl items-center px-6 py-12">
+        <Card className="w-full">
+          <CardHeader>
+            <CardTitle>DeployLite admin shell</CardTitle>
+            <CardDescription>Bootstrap status unavailable.</CardDescription>
+          </CardHeader>
+          <CardContent className="flex flex-col gap-4">
+            <Alert variant="destructive">
+              <AlertTitle>Local API unreachable</AlertTitle>
+              <AlertDescription>{bootstrapGuidance(bootstrap)}</AlertDescription>
+            </Alert>
+            <p className="text-sm text-muted-foreground">
+              Retry after the local API is reachable and the Web app can call <code>{bootstrapApiPaths.status}</code>. No password or deployment secret is required for this check.
+            </p>
+          </CardContent>
+        </Card>
       </main>
     );
   }
 
   if (bootstrap.data.setupRequired) {
     return (
-      <main className="shell stack">
-        <section className="banner stack" aria-labelledby="login-title">
-          <span className="pill">First-run setup required</span>
-          <h1 id="login-title">Create the first local admin</h1>
-          <p className="muted">No admin account exists yet. Normal sign-in stays unavailable until setup creates the first local admin through <code>{bootstrapApiPaths.initialAdmin}</code>.</p>
-          <InitialAdminSetupForm apiBaseUrl={apiBaseUrl} />
-        </section>
+      <main className="mx-auto flex min-h-screen w-full max-w-3xl items-center px-6 py-12">
+        <Card className="w-full">
+          <CardHeader>
+            <CardTitle>Create the first local admin</CardTitle>
+            <CardDescription>
+              No admin account exists yet. Normal sign-in stays unavailable until setup creates the first local admin through <code>{bootstrapApiPaths.initialAdmin}</code>.
+            </CardDescription>
+          </CardHeader>
+          <CardContent>
+            <InitialAdminSetupForm apiBaseUrl={apiBaseUrl} />
+          </CardContent>
+        </Card>
       </main>
     );
   }
 
   return (
-    <main className="shell stack">
-      <section className="banner stack" aria-labelledby="login-title">
-        <span className="pill">Setup complete</span>
-        <h1 id="login-title">DeployLite admin shell</h1>
-        <p className="muted">First-admin setup is complete. Sign in through the API session cookie before viewing protected local metadata. This is an MVP boundary, not a production auth claim.</p>
-        <LoginForm apiBaseUrl={apiBaseUrl} reason={auth.reason} />
-        <p className="muted">The web shell uses <code>{authApiPaths.me}</code> to validate the HttpOnly session. Reason shown here: {auth.reason}.</p>
-      </section>
+    <main className="mx-auto flex min-h-screen w-full max-w-3xl items-center px-6 py-12">
+      <Card className="w-full">
+        <CardHeader>
+          <CardTitle>DeployLite admin shell</CardTitle>
+          <CardDescription>
+            First-admin setup is complete. Sign in through the API session cookie before viewing protected local metadata. This is an MVP boundary, not a production auth claim.
+          </CardDescription>
+        </CardHeader>
+        <CardContent className="flex flex-col gap-4">
+          <LoginForm apiBaseUrl={apiBaseUrl} reason={auth.reason} />
+          <p className="text-sm text-muted-foreground">
+            The web shell uses <code>{authApiPaths.me}</code> to validate the HttpOnly session. Reason shown here: {auth.reason}.
+          </p>
+        </CardContent>
+      </Card>
     </main>
   );
 }
