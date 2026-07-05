@@ -534,6 +534,78 @@ describe("DeployLite API scaffold", () => {
     expect(missing.statusCode).toBe(404);
   });
 
+  it("updates project config partially, preserves omitted fields, and clears nullable runtime fields", async () => {
+    const { app } = await authFixture();
+    const cookie = await loginCookie(app);
+    const create = await app.inject({
+      method: "POST",
+      url: "/api/v1/projects",
+      headers: { ...contentHeaders, cookie },
+      payload: { name: "Editable", repoUrl: "https://github.com/example/editable", defaultBranch: "main", buildCommand: "pnpm build", runCommand: "node server.js", port: 4000 }
+    });
+    const projectId = create.json().data.project.id;
+
+    const update = await app.inject({
+      method: "PATCH",
+      url: `/api/v1/projects/${projectId}`,
+      headers: { ...contentHeaders, cookie, "x-request-id": "req_project_update_1" },
+      payload: { name: "Editable renamed", buildCommand: null, runCommand: null, port: null }
+    });
+
+    expect(update.statusCode).toBe(200);
+    expect(update.json().data.project).toMatchObject({
+      id: projectId,
+      name: "Editable renamed",
+      repoUrl: "https://github.com/example/editable",
+      defaultBranch: "main",
+      buildCommand: null,
+      runCommand: null,
+      port: null
+    });
+    expect(update.json().data.audit).toMatchObject({ action: "project.update", requestId: "req_project_update_1" });
+
+    const detail = await app.inject({ method: "GET", url: `/api/v1/projects/${projectId}`, headers: { cookie } });
+    expect(detail.json().data.project.runCommand).toBeNull();
+  });
+
+  it("rejects invalid project config updates, read-only callers, and missing projects", async () => {
+    const { app } = await authFixture();
+    const cookie = await loginCookie(app);
+    const create = await app.inject({
+      method: "POST",
+      url: "/api/v1/projects",
+      headers: { ...contentHeaders, cookie },
+      payload: { name: "Validation", repoUrl: "https://github.com/example/validation", defaultBranch: "main", port: 3000 }
+    });
+    const projectId = create.json().data.project.id;
+
+    const invalid = await app.inject({
+      method: "PATCH",
+      url: `/api/v1/projects/${projectId}`,
+      headers: { ...contentHeaders, cookie },
+      payload: { repoUrl: "not-a-url", port: 70000 }
+    });
+    expect(invalid.statusCode).toBe(400);
+
+    const missing = await app.inject({
+      method: "PATCH",
+      url: "/api/v1/projects/missing-project",
+      headers: { ...contentHeaders, cookie },
+      payload: { name: "Still missing" }
+    });
+    expect(missing.statusCode).toBe(404);
+
+    const readOnlyFixture = await authFixture({ user: { role: "read-only" } });
+    const readOnlyCookie = await loginCookie(readOnlyFixture.app);
+    const forbidden = await readOnlyFixture.app.inject({
+      method: "PATCH",
+      url: "/api/v1/projects/project_mock_1",
+      headers: { ...contentHeaders, cookie: readOnlyCookie },
+      payload: { name: "Denied" }
+    });
+    expect(forbidden.statusCode).toBe(403);
+  });
+
   it("manages env metadata as key-only records (no secret values) and never echoes them", async () => {
     const { app } = await authFixture();
     const cookie = await loginCookie(app);

@@ -9,6 +9,7 @@ import {
   envVariableMetadataUpsertRequestSchema,
   projectCreateRequestSchema,
   projectSchema,
+  projectUpdateRequestSchema,
   resourceSnapshotSchema,
   type Agent,
   type Deployment,
@@ -586,7 +587,7 @@ function registerCoreHooks(app: FastifyInstance, corsOrigin: string | null): voi
         .header("access-control-allow-origin", corsOrigin)
         .header("access-control-allow-credentials", "true")
         .header("access-control-allow-headers", "content-type,x-request-id")
-        .header("access-control-allow-methods", "GET,POST,OPTIONS")
+        .header("access-control-allow-methods", "GET,POST,PATCH,DELETE,OPTIONS")
         .header("vary", "Origin")
         .code(204)
         .send();
@@ -683,7 +684,7 @@ function registerRoutes(app: FastifyInstance, state: PlatformRepositories, adapt
     if (!existing) {
       return reply.code(404).send(errorEnvelope(request, "NOT_FOUND", "Project not found."));
     }
-    const body = parseBody(projectCreateRequestSchema.partial(), request.body);
+    const body = parseBody(projectUpdateRequestSchema, request.body);
     const next: Project = {
       ...existing,
       name: body.name ?? existing.name,

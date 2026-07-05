@@ -2,6 +2,7 @@ import { renderToStaticMarkup } from "react-dom/server";
 import React from "react";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { ProjectDetailActions, runProjectDeployTrigger, submitProjectDeployment } from "./project-detail-actions.js";
+import { ProjectConfigEditForm, submitProjectConfigUpdate } from "./project-config-edit-form.js";
 
 vi.mock("next/navigation", () => ({
   useRouter: () => ({ refresh: vi.fn(), push: vi.fn() })
@@ -134,6 +135,76 @@ describe("ProjectDetailActions render markup", () => {
     expect(html).toContain("id=\"deploy-actions\"");
     expect(html).not.toContain("deploy-triggered-status");
     expect(html).not.toContain("deploy-trigger-error");
+  });
+});
+
+describe("ProjectConfigEditForm", () => {
+  afterEach(() => {
+    vi.restoreAllMocks();
+  });
+
+  it("renders accessible project config edit controls and live status regions", () => {
+    const html = renderToStaticMarkup(React.createElement(ProjectConfigEditForm, {
+      project: projectFixture,
+      apiBaseUrl: "https://api.example.test",
+      cookieHeader: "deploylite_session=opaque"
+    }));
+
+    expect(html).toContain("Edit project configuration");
+    expect(html).toContain("name=\"name\"");
+    expect(html).toContain("name=\"repoUrl\"");
+    expect(html).toContain("name=\"defaultBranch\"");
+    expect(html).toContain("name=\"buildCommand\"");
+    expect(html).toContain("name=\"runCommand\"");
+    expect(html).toContain("name=\"port\"");
+    expect(html).toContain("aria-live=\"polite\"");
+    expect(html).toContain("Saved configuration only; no deployment started.");
+  });
+
+  it("submits project config updates with PATCH only and asks the caller to refresh on success", async () => {
+    const fetchImpl = vi.fn(async () => new Response(JSON.stringify({
+      data: { project: { ...projectFixture, name: "DeployLite Web" } },
+      error: null,
+      requestId: "req_update_1"
+    }), { status: 200 }));
+
+    const result = await submitProjectConfigUpdate({
+      projectId: projectFixture.id,
+      apiBaseUrl: "https://api.example.test",
+      cookieHeader: "deploylite_session=opaque",
+      payload: { name: "DeployLite Web" },
+      fetchImpl: fetchImpl as unknown as typeof fetch
+    });
+
+    expect(result).toEqual({ kind: "saved", message: "Project configuration saved. Saved configuration only; no deployment started." });
+    const firstCall = fetchImpl.mock.calls[0] as unknown as [unknown, RequestInit] | undefined;
+    expect(firstCall).toBeDefined();
+    expect(String(firstCall?.[0])).toBe("https://api.example.test/api/v1/projects/project-1");
+    expect(firstCall?.[1]).toMatchObject({ method: "PATCH", credentials: "include" });
+    expect(JSON.parse(String(firstCall?.[1].body))).toEqual({ name: "DeployLite Web" });
+  });
+
+  it("returns user-safe validation, rejected, and unreachable errors", async () => {
+    expect(await submitProjectConfigUpdate({ projectId: projectFixture.id, apiBaseUrl: null, cookieHeader: "deploylite_session=opaque", payload: { name: "X" } }))
+      .toEqual({ kind: "error", message: "Configure DEPLOYLITE_WEB_API_BASE_URL before saving project configuration." });
+
+    const rejected = await submitProjectConfigUpdate({
+      projectId: projectFixture.id,
+      apiBaseUrl: "https://api.example.test",
+      cookieHeader: "deploylite_session=opaque",
+      payload: { repoUrl: "not-a-url" },
+      fetchImpl: vi.fn(async () => new Response(JSON.stringify({ data: null, error: { code: "VALIDATION_ERROR", message: "Invalid", correlationId: "req_invalid" }, requestId: "req_invalid" }), { status: 400 })) as unknown as typeof fetch
+    });
+    expect(rejected).toEqual({ kind: "error", message: "Project configuration was rejected. Check the fields and try again." });
+
+    const unreachable = await submitProjectConfigUpdate({
+      projectId: projectFixture.id,
+      apiBaseUrl: "https://api.example.test",
+      cookieHeader: "deploylite_session=opaque",
+      payload: { name: "X" },
+      fetchImpl: vi.fn(async () => { throw new Error("ECONNREFUSED"); }) as unknown as typeof fetch
+    });
+    expect(unreachable).toEqual({ kind: "error", message: "The local API is unreachable. Start the API and try again." });
   });
 });
 
