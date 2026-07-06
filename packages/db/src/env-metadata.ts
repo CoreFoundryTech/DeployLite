@@ -1,6 +1,13 @@
 import type { NewEnvVariableMetadata } from "./schema.js";
 
-const blockedSecretValueFields = new Set(["value", "plaintextValue", "secret", "secretValue", "encryptedValue", "encrypted_value"]);
+const blockedSecretValueFields = new Set([
+  "value",
+  "plaintextValue",
+  "secret",
+  "secretValue",
+  "encryptedValue",
+  "encrypted_value"
+]);
 
 export type EnvVariableMetadataInput = Omit<NewEnvVariableMetadata, "id" | "createdAt" | "updatedAt" | "valuePresent" | "valueFingerprint"> & {
   valuePresent?: false;
@@ -27,4 +34,8 @@ export function assertEnvMetadataHasNoValueColumns(columnNames: readonly string[
     throw new Error(`Unsafe env value persistence column detected: ${unsafeColumn}`);
   }
   return true;
+}
+
+export function assertEnvSecretValuesInputHasNoRawValueColumns(columnNames: readonly string[]): true {
+  return assertEnvMetadataHasNoValueColumns(columnNames);
 }
