@@ -137,6 +137,29 @@ export const envVariableMetadataUpsertRequestSchema = z.object({
   description: z.string().max(512).nullable().optional()
 }).strict();
 
+export const envSecretValueWriteRequestSchema = z.object({
+  key: z.string().min(1).max(128),
+  scope: z.enum(["project", "deployment"]).default("project"),
+  value: z.string().min(1).max(8192)
+}).strict();
+
+export const envSecretValueSchema = z.object({
+  id: idSchema,
+  projectId: idSchema,
+  key: z.string().min(1),
+  scope: z.enum(["project", "deployment"]),
+  valuePresent: z.boolean(),
+  valueFingerprint: z.string().min(1),
+  keyVersion: z.number().int().positive(),
+  createdAt: isoDateSchema,
+  updatedAt: isoDateSchema
+});
+
+export const envSecretValueDeleteRequestSchema = z.object({
+  key: z.string().min(1),
+  scope: z.enum(["project", "deployment"]).default("project")
+}).strict();
+
 export const deployRequestSchema = z.object({
   agentId: idSchema.optional(),
   commitSha: z.string().regex(/^[a-f0-9]{7,40}$/).optional()
@@ -184,6 +207,9 @@ export type ProjectCreateRequest = z.infer<typeof projectCreateRequestSchema>;
 export type ProjectUpdateRequest = z.infer<typeof projectUpdateRequestSchema>;
 export type EnvVariableMetadata = z.infer<typeof envVariableMetadataSchema>;
 export type EnvVariableMetadataUpsertRequest = z.infer<typeof envVariableMetadataUpsertRequestSchema>;
+export type EnvSecretValue = z.infer<typeof envSecretValueSchema>;
+export type EnvSecretValueWriteRequest = z.infer<typeof envSecretValueWriteRequestSchema>;
+export type EnvSecretValueDeleteRequest = z.infer<typeof envSecretValueDeleteRequestSchema>;
 export type DeployRequest = z.infer<typeof deployRequestSchema>;
 export type ScaffoldUser = z.infer<typeof scaffoldUserSchema>;
 export type CanonicalRole = z.infer<typeof canonicalRoleSchema>;

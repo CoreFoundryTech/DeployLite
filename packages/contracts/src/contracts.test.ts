@@ -1,5 +1,17 @@
 import { describe, expect, it } from "vitest";
-import { agentHeartbeatSchema, bootstrapInitialAdminRequestSchema, bootstrapStatusSchema, logEventSchema, projectCreateRequestSchema, projectSchema, projectUpdateRequestSchema, sseEventSchema } from "./index.js";
+import {
+  agentHeartbeatSchema,
+  bootstrapInitialAdminRequestSchema,
+  bootstrapStatusSchema,
+  envSecretValueDeleteRequestSchema,
+  envSecretValueSchema,
+  envSecretValueWriteRequestSchema,
+  logEventSchema,
+  projectCreateRequestSchema,
+  projectSchema,
+  projectUpdateRequestSchema,
+  sseEventSchema
+} from "./index.js";
 
 const now = new Date().toISOString();
 
@@ -148,5 +160,60 @@ describe("contracts", () => {
 
     expect(projectUpdateRequestSchema.safeParse({ imageTag: "" }).success).toBe(false);
     expect(projectUpdateRequestSchema.safeParse({ imageTag: "x".repeat(257) }).success).toBe(false);
+  });
+
+  it("accepts an env secret value write payload with a non-empty value", () => {
+    const parsed = envSecretValueWriteRequestSchema.parse({
+      key: "DATABASE_URL",
+      scope: "project",
+      value: "postgres://user:pass@db:5432/app"
+    });
+    expect(parsed).toEqual({
+      key: "DATABASE_URL",
+      scope: "project",
+      value: "postgres://user:pass@db:5432/app"
+    });
+  });
+
+  it("rejects env secret value write payloads with empty values or unknown scopes", () => {
+    expect(envSecretValueWriteRequestSchema.safeParse({ key: "DATABASE_URL", value: "" }).success).toBe(false);
+    expect(envSecretValueWriteRequestSchema.safeParse({ key: "DATABASE_URL", value: "v", scope: "runtime" as never }).success).toBe(false);
+    expect(envSecretValueWriteRequestSchema.safeParse({ key: "", value: "v" }).success).toBe(false);
+  });
+
+  it("rejects env secret value write payloads that smuggle extra fields (strict mode)", () => {
+    expect(
+      envSecretValueWriteRequestSchema.safeParse({
+        key: "DATABASE_URL",
+        value: "v",
+        encryptedValue: "should-not-be-accepted-here"
+      }).success
+    ).toBe(false);
+  });
+
+  it("serializes the canonical env secret value schema without exposing any encrypted or raw value field", () => {
+    const parsed = envSecretValueSchema.parse({
+      id: "envv_1",
+      projectId: "project_1",
+      key: "DATABASE_URL",
+      scope: "project",
+      valuePresent: true,
+      valueFingerprint: "abcdef0123456789abcdef0123456789",
+      keyVersion: 1,
+      createdAt: "2026-01-01T00:00:00.000Z",
+      updatedAt: "2026-01-01T00:00:00.000Z"
+    });
+
+    expect(Object.keys(parsed)).not.toContain("encryptedValue");
+    expect(Object.keys(parsed)).not.toContain("value");
+    expect(Object.keys(parsed)).not.toContain("plaintextValue");
+    expect(parsed.valueFingerprint).toBe("abcdef0123456789abcdef0123456789");
+  });
+
+  it("accepts env secret value delete payloads with a default scope of project", () => {
+    const parsed = envSecretValueDeleteRequestSchema.parse({ key: "DATABASE_URL" });
+    expect(parsed).toEqual({ key: "DATABASE_URL", scope: "project" });
+    const explicit = envSecretValueDeleteRequestSchema.parse({ key: "DATABASE_URL", scope: "deployment" });
+    expect(explicit.scope).toBe("deployment");
   });
 });
