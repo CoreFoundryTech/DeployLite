@@ -1,10 +1,13 @@
-import { createAuditLogRecord, createCorrelationContext, createRequestId, parseDeployLiteEnv, type DeployLiteEnv } from "@deploylite/config";
+import { createAuditLogRecord, createCorrelationContext, createRequestId, parseDeployLiteEnv, type DeployLiteEnv, createEnvSecretCipher, EnvSecretKeyInvalidError, EnvSecretKeyMissingError, ENCRYPTION_KEY_VERSION, loadEnvSecretKey, type EnvSecretCipher } from "@deploylite/config";
 import {
   agentRegistrationSchema,
   authLoginRequestSchema,
   bootstrapInitialAdminRequestSchema,
   deployRequestSchema,
   deploymentSchema,
+  envSecretValueDeleteRequestSchema,
+  envSecretValueSchema,
+  envSecretValueWriteRequestSchema,
   envVariableMetadataSchema,
   envVariableMetadataUpsertRequestSchema,
   projectCreateRequestSchema,
@@ -13,16 +16,18 @@ import {
   resourceSnapshotSchema,
   type Agent,
   type Deployment,
+  type EnvSecretValue,
   type EnvVariableMetadata,
   type Project
 } from "@deploylite/contracts";
-import { BcryptPasswordHasher, bootstrapInitialAdmin, closeDbPool, createDbClient, createDbPool, createOpaqueSessionToken, DbAgentRepository, DbAuditRepository, DbAuthUserRepository, DbDeploymentRepository, DbEnvVariableMetadataRepository, DbProjectRepository, DbSessionRepository, hashSessionToken, type DeployLiteDb } from "@deploylite/db";
+import { BcryptPasswordHasher, bootstrapInitialAdmin, closeDbPool, createDbClient, createDbPool, createOpaqueSessionToken, DbAgentRepository, DbAuditRepository, DbAuthUserRepository, DbDeploymentRepository, DbEnvSecretValueRepository, DbEnvVariableMetadataRepository, DbProjectRepository, DbSessionRepository, hashSessionToken, type DeployLiteDb } from "@deploylite/db";
 import {
   AgentStatusService,
   authenticateLocalUser,
   getBootstrapStatus,
   InMemoryAgentRepository,
   InMemoryDeploymentRepository,
+  InMemoryEnvSecretValueRepository,
   InMemoryEnvVariableMetadataRepository,
   InitialAdminAlreadyExistsError,
   toSafeAuthUser,
@@ -35,6 +40,7 @@ import {
   type CanonicalRoleName,
   type CreateInitialAdminInput,
   type CreateSessionInput,
+  type EnvSecretValueRepository,
   type EnvVariableMetadataRepository,
   type PasswordHasher,
   type AgentRepository,
@@ -333,22 +339,35 @@ type PlatformRepositoryOptions = {
   deployments: DeploymentRepository;
   projects: ProjectRepository;
   envMetadata?: EnvVariableMetadataRepository;
+  envSecretValues?: EnvSecretValueRepository;
+  envSecretCipher?: EnvSecretCipher;
 };
 
 type PlatformRepositories = PlatformRepositoryOptions & {
   agentStatus: AgentStatusService;
   envMetadata: EnvVariableMetadataRepository;
+  envSecretValues: EnvSecretValueRepository;
+  envSecretCipher: EnvSecretCipher;
   deployRunner: DeployRunner;
 };
 
-function createApiState(overrides: Partial<PlatformRepositoryOptions> = {}): PlatformRepositories {
+type EnvSecretKeySource = NodeJS.ProcessEnv | Record<string, string | number | boolean | undefined>;
+
+function extractSecretKey(env: EnvSecretKeySource): string | undefined {
+  const value = (env as Record<string, unknown>)["DEPLOYLITE_SECRET_KEY"];
+  return typeof value === "string" ? value : undefined;
+}
+
+function createApiState(env: EnvSecretKeySource, overrides: Partial<PlatformRepositoryOptions> = {}): PlatformRepositories {
   const agents = overrides.agents ?? new InMemoryAgentRepository();
   const deployments = overrides.deployments ?? new InMemoryDeploymentRepository();
   const projects = overrides.projects ?? new InMemoryProjectRepository();
   const envMetadata = overrides.envMetadata ?? new InMemoryEnvVariableMetadataRepository();
+  const envSecretValues = overrides.envSecretValues ?? new InMemoryEnvSecretValueRepository();
+  const envSecretCipher = overrides.envSecretCipher ?? createEnvSecretCipher(loadEnvSecretKey(extractSecretKey(env)));
   const agentStatus = new AgentStatusService(agents);
   const deployRunner = new DeployRunner(deployments, envMetadata, agentStatus);
-  return { agents, deployments, projects, envMetadata, agentStatus, deployRunner };
+  return { agents, deployments, projects, envMetadata, envSecretValues, envSecretCipher, agentStatus, deployRunner };
 }
 
 class DeployRunner {
@@ -482,11 +501,13 @@ function createDbAuthAdapters(env: DeployLiteEnv, options: BuildApiAppOptions): 
     },
     close: options.db?.pool ? undefined : () => closePool(pool),
     shouldSeedMockData: false,
-    state: createApiState({
+    state: createApiState(env, {
       agents: options.state?.agents ?? new DbAgentRepository(db),
       deployments: options.state?.deployments ?? new DbDeploymentRepository(db),
       projects: options.state?.projects ?? new DbProjectRepository(db),
-      envMetadata: options.state?.envMetadata ?? new DbEnvVariableMetadataRepository(db)
+      envMetadata: options.state?.envMetadata ?? new DbEnvVariableMetadataRepository(db),
+      envSecretValues: options.state?.envSecretValues ?? new DbEnvSecretValueRepository(db),
+      envSecretCipher: options.state?.envSecretCipher
     })
   };
 }
@@ -500,7 +521,7 @@ async function createRuntimeRepositories(env: DeployLiteEnv, options: BuildApiAp
   return {
     auth: { ...(await createSeededInMemoryAuthAdapters(env)), ...options.auth },
     shouldSeedMockData: true,
-    state: createApiState(options.state)
+    state: createApiState(env, options.state)
   };
 }
 
@@ -760,6 +781,149 @@ function registerRoutes(app: FastifyInstance, state: PlatformRepositories, adapt
     return removed
       ? ok(request, { removed: true, audit: auditMutation(request, "project.env.delete", "project", params.projectId) })
       : reply.code(404).send(errorEnvelope(request, "NOT_FOUND", "Env metadata not found."));
+  });
+  app.get(`${API_PREFIX}/projects/:projectId/env-values`, { preHandler: requireAuth }, async (request, reply) => {
+    const params = z.object({ projectId: z.string().min(1) }).parse(request.params);
+    const project = await state.projects.findById(params.projectId);
+    if (!project) {
+      return reply.code(404).send(errorEnvelope(request, "NOT_FOUND", "Project not found."));
+    }
+    const records = await state.envSecretValues.listByProject(params.projectId);
+    return ok(request, { envValues: records.map((record) => envSecretValueSchema.parse(record)) });
+  });
+  app.post(`${API_PREFIX}/projects/:projectId/env-values`, { preHandler: [requireAuth, requireMutationRole] }, async (request, reply) => {
+    const params = z.object({ projectId: z.string().min(1) }).parse(request.params);
+    const body = parseBody(envSecretValueWriteRequestSchema, request.body);
+    const project = await state.projects.findById(params.projectId);
+    if (!project) {
+      return reply.code(404).send(errorEnvelope(request, "NOT_FOUND", "Project not found."));
+    }
+    const scope = body.scope ?? "project";
+
+    // Encrypt the raw value client-side of the database boundary. The encrypted
+    // payload is the only thing that touches the repository: the raw plaintext
+    // is intentionally never held past the encrypt() call and never appears in
+    // audit metadata, logs, or response bodies.
+    let encrypted: string;
+    let fingerprint: string;
+    try {
+      encrypted = state.envSecretCipher.encrypt(body.value);
+      fingerprint = state.envSecretCipher.fingerprint(body.value);
+    } catch (error) {
+      if (error instanceof EnvSecretKeyMissingError || error instanceof EnvSecretKeyInvalidError) {
+        await appendAudit(adapters.audit, request, {
+          actorUserId: request.auth?.user.id ?? null,
+          action: "project.env-value.upsert.rejected",
+          targetType: "env_value",
+          targetId: `${params.projectId}:${scope}:${body.key}`,
+          metadata: { reason: "secret-key-unavailable" }
+        });
+        return reply.code(503).send(errorEnvelope(request, "SECRET_KEY_UNAVAILABLE", "Env secret encryption is not configured. Set DEPLOYLITE_SECRET_KEY."));
+      }
+      throw error;
+    }
+
+    const saved = await state.envSecretValues.upsert({
+      projectId: params.projectId,
+      key: body.key,
+      scope,
+      encryptedValue: Buffer.from(encrypted, "base64"),
+      valueFingerprint: fingerprint,
+      keyVersion: ENCRYPTION_KEY_VERSION
+    });
+
+    // Reflect the new state on the metadata row so existing env-metadata
+    // listings (which are still value-less) can answer "does this key have a
+    // value yet?" without leaking the encrypted blob.
+    await state.envMetadata.upsert({
+      id: `env_${createRequestId()}`,
+      projectId: params.projectId,
+      key: body.key,
+      scope,
+      valuePresent: true,
+      valueFingerprint: fingerprint,
+      required: false,
+      description: null,
+      updatedAt: saved.updatedAt
+    });
+
+    await appendAudit(adapters.audit, request, {
+      actorUserId: request.auth?.user.id ?? null,
+      action: "project.env-value.upsert",
+      targetType: "env_value",
+      targetId: saved.id,
+      metadata: {
+        projectId: params.projectId,
+        key: body.key,
+        scope,
+        valueFingerprint: fingerprint,
+        keyVersion: saved.keyVersion
+      }
+    });
+
+    return ok(request, {
+      envValue: envSecretValueSchema.parse(saved),
+      audit: createAuditLogRecord({
+        actorId: request.auth?.user.id ?? SCAFFOLD_ACTOR,
+        action: "project.env-value.upsert",
+        targetType: "env_value",
+        targetId: saved.id,
+        ...request.correlationContext
+      })
+    });
+  });
+  app.delete(`${API_PREFIX}/projects/:projectId/env-values`, { preHandler: [requireAuth, requireMutationRole] }, async (request, reply) => {
+    const querySource = (request.query ?? {}) as Record<string, unknown>;
+    const parsed = envSecretValueDeleteRequestSchema.safeParse({
+      key: typeof querySource["key"] === "string" ? querySource["key"] : undefined,
+      scope: typeof querySource["scope"] === "string" ? querySource["scope"] : "project"
+    });
+    if (!parsed.success) {
+      return reply.code(400).send(errorEnvelope(request, "VALIDATION_ERROR", "Missing or invalid `key` (and optional `scope`) query parameter."));
+    }
+    const params = z.object({ projectId: z.string().min(1) }).parse(request.params);
+    const project = await state.projects.findById(params.projectId);
+    if (!project) {
+      return reply.code(404).send(errorEnvelope(request, "NOT_FOUND", "Project not found."));
+    }
+
+    const removed = await state.envSecretValues.remove(params.projectId, parsed.data.key, parsed.data.scope);
+    if (!removed) {
+      return reply.code(404).send(errorEnvelope(request, "NOT_FOUND", "Env value not found."));
+    }
+
+    // Also clear the corresponding metadata row's value marker so the public
+    // env-variables list does not keep reporting a now-stale fingerprint.
+    await state.envMetadata.upsert({
+      id: `env_${createRequestId()}`,
+      projectId: params.projectId,
+      key: parsed.data.key,
+      scope: parsed.data.scope,
+      valuePresent: false,
+      valueFingerprint: null,
+      required: false,
+      description: null,
+      updatedAt: new Date().toISOString()
+    });
+
+    await appendAudit(adapters.audit, request, {
+      actorUserId: request.auth?.user.id ?? null,
+      action: "project.env-value.delete",
+      targetType: "env_value",
+      targetId: `${params.projectId}:${parsed.data.scope}:${parsed.data.key}`,
+      metadata: { projectId: params.projectId, key: parsed.data.key, scope: parsed.data.scope }
+    });
+
+    return ok(request, {
+      removed: true,
+      audit: createAuditLogRecord({
+        actorId: request.auth?.user.id ?? SCAFFOLD_ACTOR,
+        action: "project.env-value.delete",
+        targetType: "env_value",
+        targetId: `${params.projectId}:${parsed.data.scope}:${parsed.data.key}`,
+        ...request.correlationContext
+      })
+    });
   });
   app.post(`${API_PREFIX}/projects/:projectId/deployments`, { preHandler: [requireAuth, requireMutationRole] }, async (request, reply) => {
     const params = z.object({ projectId: z.string().min(1) }).parse(request.params);

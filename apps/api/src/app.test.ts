@@ -1,6 +1,7 @@
 import { BcryptPasswordHasher, createOpaqueSessionToken, hashSessionToken } from "@deploylite/db";
 import {
   InitialAdminAlreadyExistsError,
+  InMemoryEnvSecretValueRepository,
   InMemoryEnvVariableMetadataRepository,
   type AgentRepository,
   type AuthUser,
@@ -11,11 +12,15 @@ import {
   type EnvVariableMetadataRepository,
   type ProjectRepository
 } from "@deploylite/domain";
+import { createEnvSecretCipher, loadEnvSecretKey } from "@deploylite/config";
 import { describe, expect, it } from "vitest";
 import { buildApiApp, createRuntimeRepositories, InMemoryAuditRepository, InMemoryAuthUserRepository, InMemorySessionRepository } from "./app.js";
 
 const contentHeaders = { "content-type": "application/json" };
 const password = "correct horse battery staple";
+const testEnvSecretKey = "deploylite-test-env-secret-key-1234567890";
+const testEnvSecretCipher = createEnvSecretCipher(loadEnvSecretKey(testEnvSecretKey));
+const testEnv: NodeJS.ProcessEnv = { ...process.env, DEPLOYLITE_SECRET_KEY: testEnvSecretKey };
 
 function projectFixture(id = "project-1") {
   return {
@@ -54,12 +59,17 @@ async function authFixture(options: AuthFixtureOptions = {}) {
   const audit = new InMemoryAuditRepository();
   const sessions = new InMemorySessionRepository();
   const users = new InMemoryAuthUserRepository([user]);
+  const state = options.state
+    ? { envSecretValues: new InMemoryEnvSecretValueRepository(), envSecretCipher: testEnvSecretCipher, ...options.state }
+    : undefined;
   const app = await buildApiApp({
     auth: { audit, hasher, sessions, users },
     authConfig: { cookieName: "dl_test_session", cookieSecure: false, sessionTtlSeconds: 3600 },
     db: options.dbMode ? { pool: {} as never, client: {} as never } : undefined,
-    env: options.dbMode ? { ...process.env, NODE_ENV: "test", DATABASE_URL: "postgres://user:pass@localhost:5432/deploylite" } : undefined,
-    state: options.state
+    env: options.dbMode
+      ? { ...testEnv, NODE_ENV: "test", DATABASE_URL: "postgres://user:pass@localhost:5432/deploylite" }
+      : testEnv,
+    state
   });
   return { app, audit, sessions, user };
 }
@@ -121,7 +131,7 @@ function metadataRepositories() {
     }
   };
 
-  return { calls, state: { agents, deployments, projects, envMetadata: new InMemoryEnvVariableMetadataRepository() } };
+  return { calls, state: { agents, deployments, projects, envMetadata: new InMemoryEnvVariableMetadataRepository(), envSecretValues: new InMemoryEnvSecretValueRepository(), envSecretCipher: testEnvSecretCipher } };
 }
 
 async function loginCookie(app: Awaited<ReturnType<typeof buildApiApp>>, email = "admin@example.test") {
@@ -186,7 +196,7 @@ describe("DeployLite API scaffold", () => {
 
   it("selects DB auth repositories when DATABASE_URL is configured", async () => {
     const repositories = await createRuntimeRepositories(
-      { NODE_ENV: "test", DEPLOYLITE_API_URL: "http://localhost:3001", DEPLOYLITE_API_HOST: "127.0.0.1", DEPLOYLITE_API_PORT: 3001, DATABASE_URL: "postgres://user:pass@localhost:5432/deploylite", DEPLOYLITE_SESSION_TTL_SECONDS: 3600, DEPLOYLITE_SESSION_COOKIE_NAME: "dl_test_session", DEPLOYLITE_BCRYPT_COST: 10 },
+      { NODE_ENV: "test", DEPLOYLITE_API_URL: "http://localhost:3001", DEPLOYLITE_API_HOST: "127.0.0.1", DEPLOYLITE_API_PORT: 3001, DATABASE_URL: "postgres://user:pass@localhost:5432/deploylite", DEPLOYLITE_SECRET_KEY: testEnvSecretKey, DEPLOYLITE_SESSION_TTL_SECONDS: 3600, DEPLOYLITE_SESSION_COOKIE_NAME: "dl_test_session", DEPLOYLITE_BCRYPT_COST: 10 },
       { db: { pool: {} as never, client: {} as never } }
     );
 
@@ -970,5 +980,210 @@ describe("DeployLite API scaffold", () => {
       payload: { imageTag: "x".repeat(257) }
     });
     expect(oversize.statusCode).toBe(400);
+  });
+
+  it("stores an env secret value as encrypted ciphertext, returns only the valueFingerprint, and audits the write without leaking the raw value", async () => {
+    const { app, audit } = await authFixture();
+    const cookie = await loginCookie(app);
+    const rawValue = "super-secret-token-abcdef1234567890";
+
+    const project = (await app.inject({
+      method: "POST",
+      url: "/api/v1/projects",
+      headers: { ...contentHeaders, cookie },
+      payload: { name: "SecretHolder", repoUrl: "https://github.com/example/secret-holder", defaultBranch: "main" }
+    })).json().data.project;
+
+    const write = await app.inject({
+      method: "POST",
+      url: `/api/v1/projects/${project.id}/env-values`,
+      headers: { ...contentHeaders, cookie, "x-request-id": "req_envv_write_1" },
+      payload: { key: "DATABASE_URL", scope: "project", value: rawValue }
+    });
+    expect(write.statusCode).toBe(200);
+    const data = write.json().data;
+    expect(data.envValue).toMatchObject({
+      projectId: project.id,
+      key: "DATABASE_URL",
+      scope: "project",
+      valuePresent: true,
+      keyVersion: 1
+    });
+    expect(data.envValue.valueFingerprint).toMatch(/^[0-9a-f]{32}$/);
+    expect(data.envValue.valueFingerprint).not.toBe(rawValue);
+    expect(data.envValue.valueFingerprint).not.toContain(rawValue);
+    expect(Object.keys(data.envValue)).not.toContain("encryptedValue");
+    expect(Object.keys(data.envValue)).not.toContain("value");
+    expect(JSON.stringify(write.json())).not.toContain(rawValue);
+    expect(write.json().data.audit).toMatchObject({ action: "project.env-value.upsert", requestId: "req_envv_write_1" });
+
+    const auditInput = audit.inputs.find((event) => event.action === "project.env-value.upsert" && event.requestId === "req_envv_write_1");
+    expect(auditInput?.metadata).toMatchObject({ projectId: project.id, key: "DATABASE_URL", scope: "project", keyVersion: 1 });
+    expect(JSON.stringify(auditInput?.metadata ?? {})).not.toContain(rawValue);
+    expect((auditInput?.metadata as Record<string, unknown> | undefined)?.["valueFingerprint"]).toBe(data.envValue.valueFingerprint);
+
+    const list = await app.inject({ method: "GET", url: `/api/v1/projects/${project.id}/env-values`, headers: { cookie } });
+    expect(list.statusCode).toBe(200);
+    expect(list.json().data.envValues).toHaveLength(1);
+    expect(list.json().data.envValues[0]).toMatchObject({ key: "DATABASE_URL", valuePresent: true, valueFingerprint: data.envValue.valueFingerprint });
+    expect(JSON.stringify(list.json())).not.toContain(rawValue);
+  });
+
+  it("updates the corresponding env metadata fingerprint when a secret value is written", async () => {
+    const { app } = await authFixture();
+    const cookie = await loginCookie(app);
+    const project = (await app.inject({
+      method: "POST",
+      url: "/api/v1/projects",
+      headers: { ...contentHeaders, cookie },
+      payload: { name: "Linked", repoUrl: "https://github.com/example/linked", defaultBranch: "main" }
+    })).json().data.project;
+
+    const write = await app.inject({
+      method: "POST",
+      url: `/api/v1/projects/${project.id}/env-values`,
+      headers: { ...contentHeaders, cookie },
+      payload: { key: "API_KEY", value: "token-1" }
+    });
+    const fingerprint = write.json().data.envValue.valueFingerprint;
+
+    const metadata = await app.inject({ method: "GET", url: `/api/v1/projects/${project.id}/env-variables`, headers: { cookie } });
+    expect(metadata.statusCode).toBe(200);
+    const record = metadata.json().data.envVariables.find((entry: { key: string }) => entry.key === "API_KEY");
+    expect(record).toMatchObject({ valuePresent: true, valueFingerprint: fingerprint });
+  });
+
+  it("treats subsequent env value writes as upserts: same (project, key, scope) updates the encrypted blob in place", async () => {
+    const { app } = await authFixture();
+    const cookie = await loginCookie(app);
+    const project = (await app.inject({
+      method: "POST",
+      url: "/api/v1/projects",
+      headers: { ...contentHeaders, cookie },
+      payload: { name: "Rotator", repoUrl: "https://github.com/example/rotator", defaultBranch: "main" }
+    })).json().data.project;
+
+    const first = await app.inject({
+      method: "POST",
+      url: `/api/v1/projects/${project.id}/env-values`,
+      headers: { ...contentHeaders, cookie },
+      payload: { key: "API_KEY", value: "first-secret" }
+    });
+    const second = await app.inject({
+      method: "POST",
+      url: `/api/v1/projects/${project.id}/env-values`,
+      headers: { ...contentHeaders, cookie },
+      payload: { key: "API_KEY", value: "second-secret" }
+    });
+    expect(first.statusCode).toBe(200);
+    expect(second.statusCode).toBe(200);
+    expect(first.json().data.envValue.id).toBe(second.json().data.envValue.id);
+    expect(first.json().data.envValue.valueFingerprint).not.toBe(second.json().data.envValue.valueFingerprint);
+
+    const list = await app.inject({ method: "GET", url: `/api/v1/projects/${project.id}/env-values`, headers: { cookie } });
+    expect(list.json().data.envValues).toHaveLength(1);
+    expect(list.json().data.envValues[0].valueFingerprint).toBe(second.json().data.envValue.valueFingerprint);
+  });
+
+  it("deletes an env secret value, clears the metadata fingerprint, and never echoes the raw value in the audit", async () => {
+    const { app, audit } = await authFixture();
+    const cookie = await loginCookie(app);
+    const project = (await app.inject({
+      method: "POST",
+      url: "/api/v1/projects",
+      headers: { ...contentHeaders, cookie },
+      payload: { name: "Removable", repoUrl: "https://github.com/example/removable", defaultBranch: "main" }
+    })).json().data.project;
+
+    await app.inject({
+      method: "POST",
+      url: `/api/v1/projects/${project.id}/env-values`,
+      headers: { ...contentHeaders, cookie },
+      payload: { key: "API_KEY", value: "deletable-secret-987654321" }
+    });
+
+    const remove = await app.inject({
+      method: "DELETE",
+      url: `/api/v1/projects/${project.id}/env-values?key=API_KEY&scope=project`,
+      headers: { cookie, "x-request-id": "req_envv_delete_1" }
+    });
+    expect(remove.statusCode).toBe(200);
+    expect(remove.json().data.removed).toBe(true);
+
+    const list = await app.inject({ method: "GET", url: `/api/v1/projects/${project.id}/env-values`, headers: { cookie } });
+    expect(list.json().data.envValues).toHaveLength(0);
+
+    const metadata = await app.inject({ method: "GET", url: `/api/v1/projects/${project.id}/env-variables`, headers: { cookie } });
+    const record = metadata.json().data.envVariables.find((entry: { key: string }) => entry.key === "API_KEY");
+    expect(record).toMatchObject({ valuePresent: false, valueFingerprint: null });
+
+    const deleteAudit = audit.inputs.find((event) => event.action === "project.env-value.delete" && event.requestId === "req_envv_delete_1");
+    expect(deleteAudit).toBeDefined();
+    expect(JSON.stringify(deleteAudit?.metadata ?? {})).not.toContain("deletable-secret-987654321");
+  });
+
+  it("rejects env value writes without a value, with invalid scopes, or when the project is missing", async () => {
+    const { app } = await authFixture();
+    const cookie = await loginCookie(app);
+
+    const emptyValue = await app.inject({
+      method: "POST",
+      url: `/api/v1/projects/project-does-not-exist/env-values`,
+      headers: { ...contentHeaders, cookie },
+      payload: { key: "API_KEY", value: "" }
+    });
+    expect(emptyValue.statusCode).toBe(400);
+
+    const badScope = await app.inject({
+      method: "POST",
+      url: `/api/v1/projects/project-does-not-exist/env-values`,
+      headers: { ...contentHeaders, cookie },
+      payload: { key: "API_KEY", value: "v", scope: "runtime" as never }
+    });
+    expect(badScope.statusCode).toBe(400);
+
+    const missingProject = await app.inject({
+      method: "POST",
+      url: `/api/v1/projects/project-does-not-exist/env-values`,
+      headers: { ...contentHeaders, cookie },
+      payload: { key: "API_KEY", value: "v" }
+    });
+    expect(missingProject.statusCode).toBe(404);
+  });
+
+  it("rejects env value writes for unauthenticated and read-only callers", async () => {
+    const { app } = await authFixture();
+    const noAuth = await app.inject({
+      method: "POST",
+      url: "/api/v1/projects/project-1/env-values",
+      headers: contentHeaders,
+      payload: { key: "API_KEY", value: "v" }
+    });
+    expect(noAuth.statusCode).toBe(401);
+  });
+
+  it("returns 404 when deleting a missing env value and 400 when the query key is empty", async () => {
+    const { app } = await authFixture();
+    const cookie = await loginCookie(app);
+    const project = (await app.inject({
+      method: "POST",
+      url: "/api/v1/projects",
+      headers: { ...contentHeaders, cookie },
+      payload: { name: "Empty", repoUrl: "https://github.com/example/empty", defaultBranch: "main" }
+    })).json().data.project;
+
+    const missing = await app.inject({
+      method: "DELETE",
+      url: `/api/v1/projects/${project.id}/env-values?key=NOT_THERE`,
+      headers: { cookie }
+    });
+    expect(missing.statusCode).toBe(404);
+
+    const emptyKey = await app.inject({
+      method: "DELETE",
+      url: `/api/v1/projects/${project.id}/env-values?key=`,
+      headers: { cookie }
+    });
+    expect(emptyKey.statusCode).toBe(400);
   });
 });
