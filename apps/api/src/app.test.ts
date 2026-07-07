@@ -38,6 +38,7 @@ function projectFixture(id = "project-1") {
 
 type AuthFixtureOptions = {
   dbMode?: boolean;
+  env?: NodeJS.ProcessEnv;
   state?: NonNullable<Parameters<typeof buildApiApp>[0]>["state"];
   user?: Partial<AuthUser>;
 };
@@ -66,9 +67,9 @@ async function authFixture(options: AuthFixtureOptions = {}) {
     auth: { audit, hasher, sessions, users },
     authConfig: { cookieName: "dl_test_session", cookieSecure: false, sessionTtlSeconds: 3600 },
     db: options.dbMode ? { pool: {} as never, client: {} as never } : undefined,
-    env: options.dbMode
+    env: options.env ?? (options.dbMode
       ? { ...testEnv, NODE_ENV: "test", DATABASE_URL: "postgres://user:pass@localhost:5432/deploylite" }
-      : testEnv,
+      : testEnv),
     state
   });
   return { app, audit, sessions, user };
@@ -1027,6 +1028,51 @@ describe("DeployLite API scaffold", () => {
     expect(list.json().data.envValues).toHaveLength(1);
     expect(list.json().data.envValues[0]).toMatchObject({ key: "DATABASE_URL", valuePresent: true, valueFingerprint: data.envValue.valueFingerprint });
     expect(JSON.stringify(list.json())).not.toContain(rawValue);
+  });
+
+  it("returns SECRET_KEY_UNAVAILABLE for env value writes when DEPLOYLITE_SECRET_KEY is missing or invalid", async () => {
+    const cases: Array<{ name: string; env: NodeJS.ProcessEnv }> = [
+      {
+        name: "missing",
+        env: (() => {
+          const envWithoutSecret: NodeJS.ProcessEnv = { ...testEnv };
+          delete envWithoutSecret.DEPLOYLITE_SECRET_KEY;
+          return envWithoutSecret;
+        })()
+      },
+      { name: "invalid", env: { ...testEnv, DEPLOYLITE_SECRET_KEY: "short" } }
+    ];
+
+    for (const { name, env } of cases) {
+      const { app, audit } = await authFixture({ env, state: { envSecretCipher: undefined as never } });
+      const cookie = await loginCookie(app);
+      const project = (await app.inject({
+        method: "POST",
+        url: "/api/v1/projects",
+        headers: { ...contentHeaders, cookie },
+        payload: { name: `SecretUnavailable-${name}`, repoUrl: "https://github.com/example/secret-unavailable", defaultBranch: "main" }
+      })).json().data.project;
+
+      const write = await app.inject({
+        method: "POST",
+        url: `/api/v1/projects/${project.id}/env-values`,
+        headers: { ...contentHeaders, cookie, "x-request-id": `req_secret_key_${name}` },
+        payload: { key: "API_KEY", value: "must-not-persist" }
+      });
+
+      expect(write.statusCode).toBe(503);
+      expect(write.json()).toMatchObject({
+        error: { code: "SECRET_KEY_UNAVAILABLE", message: "Env secret encryption is not configured. Set DEPLOYLITE_SECRET_KEY." }
+      });
+
+      const list = await app.inject({ method: "GET", url: `/api/v1/projects/${project.id}/env-values`, headers: { cookie } });
+      expect(list.statusCode).toBe(200);
+      expect(list.json().data.envValues).toHaveLength(0);
+
+      const rejectedAudit = audit.inputs.find((event) => event.action === "project.env-value.upsert.rejected" && event.requestId === `req_secret_key_${name}`);
+      expect(rejectedAudit?.metadata).toMatchObject({ reason: "secret-key-unavailable" });
+      expect(JSON.stringify(rejectedAudit?.metadata ?? {})).not.toContain("must-not-persist");
+    }
   });
 
   it("updates the corresponding env metadata fingerprint when a secret value is written", async () => {

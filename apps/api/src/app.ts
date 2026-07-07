@@ -358,13 +358,22 @@ function extractSecretKey(env: EnvSecretKeySource): string | undefined {
   return typeof value === "string" ? value : undefined;
 }
 
+function createLazyEnvSecretCipher(env: EnvSecretKeySource): EnvSecretCipher {
+  const loadCipher = () => createEnvSecretCipher(loadEnvSecretKey(extractSecretKey(env)));
+  return {
+    encrypt: (plaintext) => loadCipher().encrypt(plaintext),
+    decrypt: (ciphertext) => loadCipher().decrypt(ciphertext),
+    fingerprint: (plaintext) => loadCipher().fingerprint(plaintext)
+  };
+}
+
 function createApiState(env: EnvSecretKeySource, overrides: Partial<PlatformRepositoryOptions> = {}): PlatformRepositories {
   const agents = overrides.agents ?? new InMemoryAgentRepository();
   const deployments = overrides.deployments ?? new InMemoryDeploymentRepository();
   const projects = overrides.projects ?? new InMemoryProjectRepository();
   const envMetadata = overrides.envMetadata ?? new InMemoryEnvVariableMetadataRepository();
   const envSecretValues = overrides.envSecretValues ?? new InMemoryEnvSecretValueRepository();
-  const envSecretCipher = overrides.envSecretCipher ?? createEnvSecretCipher(loadEnvSecretKey(extractSecretKey(env)));
+  const envSecretCipher = overrides.envSecretCipher ?? createLazyEnvSecretCipher(env);
   const agentStatus = new AgentStatusService(agents);
   const deployRunner = new DeployRunner(deployments, envMetadata, agentStatus);
   return { agents, deployments, projects, envMetadata, envSecretValues, envSecretCipher, agentStatus, deployRunner };
