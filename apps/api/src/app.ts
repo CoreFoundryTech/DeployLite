@@ -606,6 +606,16 @@ async function findEnvMetadata(
   return records.find((record) => record.key === key && record.scope === scope) ?? null;
 }
 
+async function findEnvSecretValue(
+  repository: EnvSecretValueRepository,
+  projectId: string,
+  key: string,
+  scope: EnvVariableMetadata["scope"]
+): Promise<EnvSecretValue | null> {
+  const records = await repository.listByProject(projectId);
+  return records.find((record) => record.key === key && record.scope === scope) ?? null;
+}
+
 function isAllowedCorsRequest(request: FastifyRequest, corsOrigin: string | null): boolean {
   return Boolean(corsOrigin && getHeaderValue(request, "origin") === corsOrigin);
 }
@@ -778,14 +788,19 @@ function registerRoutes(app: FastifyInstance, state: PlatformRepositories, adapt
       return reply.code(404).send(errorEnvelope(request, "NOT_FOUND", "Project not found."));
     }
     const body = parseBody(envVariableMetadataUpsertRequestSchema, request.body);
+    const scope = body.scope ?? "project";
+    const existingMetadata = await findEnvMetadata(state.envMetadata, params.projectId, body.key, scope);
+    const existingSecretValue = existingMetadata
+      ? null
+      : await findEnvSecretValue(state.envSecretValues, params.projectId, body.key, scope);
     const now = new Date().toISOString();
     const record: EnvVariableMetadata = {
-      id: `env_${createRequestId()}`,
+      id: existingMetadata?.id ?? `env_${createRequestId()}`,
       projectId: params.projectId,
       key: body.key,
-      scope: body.scope ?? "project",
-      valuePresent: false,
-      valueFingerprint: null,
+      scope,
+      valuePresent: existingMetadata?.valuePresent ?? Boolean(existingSecretValue),
+      valueFingerprint: existingMetadata?.valueFingerprint ?? existingSecretValue?.valueFingerprint ?? null,
       required: body.required ?? false,
       description: body.description ?? null,
       updatedAt: now

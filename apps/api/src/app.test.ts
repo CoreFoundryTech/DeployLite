@@ -1099,6 +1099,45 @@ describe("DeployLite API scaffold", () => {
     expect(record).toMatchObject({ valuePresent: true, valueFingerprint: fingerprint });
   });
 
+  it("preserves env metadata value markers when metadata is edited after a secret value write", async () => {
+    const { app } = await authFixture();
+    const cookie = await loginCookie(app);
+    const project = (await app.inject({
+      method: "POST",
+      url: "/api/v1/projects",
+      headers: { ...contentHeaders, cookie },
+      payload: { name: "Metadata Editor", repoUrl: "https://github.com/example/metadata-editor", defaultBranch: "main" }
+    })).json().data.project;
+
+    const write = await app.inject({
+      method: "POST",
+      url: `/api/v1/projects/${project.id}/env-values`,
+      headers: { ...contentHeaders, cookie },
+      payload: { key: "API_KEY", value: "token-1" }
+    });
+    expect(write.statusCode).toBe(200);
+    const fingerprint = write.json().data.envValue.valueFingerprint;
+
+    const editMetadata = await app.inject({
+      method: "POST",
+      url: `/api/v1/projects/${project.id}/env-variables`,
+      headers: { ...contentHeaders, cookie },
+      payload: { key: "API_KEY", required: true, description: "Required API key" }
+    });
+    expect(editMetadata.statusCode).toBe(200);
+    expect(editMetadata.json().data.envVariable).toMatchObject({
+      key: "API_KEY",
+      required: true,
+      description: "Required API key",
+      valuePresent: true,
+      valueFingerprint: fingerprint
+    });
+
+    const metadata = await app.inject({ method: "GET", url: `/api/v1/projects/${project.id}/env-variables`, headers: { cookie } });
+    const record = metadata.json().data.envVariables.find((entry: { key: string }) => entry.key === "API_KEY");
+    expect(record).toMatchObject({ required: true, description: "Required API key", valuePresent: true, valueFingerprint: fingerprint });
+  });
+
   it("preserves existing env metadata policy fields when a secret value is written", async () => {
     const { app } = await authFixture();
     const cookie = await loginCookie(app);
