@@ -5,6 +5,10 @@ import { assertEnvMetadataHasNoValueColumns, toEnvVariableMetadataInsert } from 
 import { canonicalRoleNames } from "./schema.js";
 
 const migrationSql = readFileSync(new URL("../migrations/0000_auth_postgres_foundation.sql", import.meta.url), "utf8");
+const envSecretValuesMigrationSql = readFileSync(
+  new URL("../migrations/0004_env_secret_values.sql", import.meta.url),
+  "utf8"
+);
 
 describe("auth PostgreSQL schema foundation", () => {
   it("seeds only the canonical RBAC roles", () => {
@@ -51,3 +55,44 @@ describe("auth PostgreSQL schema foundation", () => {
     });
   });
 });
+
+describe("env secret values storage migration", () => {
+  it("creates the env_secret_values table with the encrypted bytea column and no plaintext value field", () => {
+    expect(envSecretValuesMigrationSql).toContain("CREATE TABLE env_secret_values");
+    expect(envSecretValuesMigrationSql).toContain("encrypted_value bytea NOT NULL");
+    expect(envSecretValuesMigrationSql).toContain("value_fingerprint text NOT NULL");
+    // The table must not declare any plaintext or raw-value column. We assert
+    // against the table body only (between CREATE TABLE and the closing
+    // semicolon) so the surrounding SQL documentation can still mention
+    // the concept of "raw values" and "plaintext values" without tripping
+    // the guard.
+    const tableBody = extractCreateTableBody(envSecretValuesMigrationSql, "env_secret_values");
+    expect(tableBody).not.toMatch(/\bvalue\s+text\b/);
+    expect(tableBody).not.toMatch(/\bplaintext_value\b/);
+    expect(tableBody).not.toMatch(/\bsecret_value\s+text\b/);
+    expect(tableBody).not.toMatch(/\braw_value\b/);
+  });
+
+  it("enforces a project FK, scope check, and unique project/key/scope constraint", () => {
+    expect(envSecretValuesMigrationSql).toContain("REFERENCES projects(id) ON UPDATE cascade ON DELETE cascade");
+    expect(envSecretValuesMigrationSql).toContain("CONSTRAINT env_secret_values_scope_valid CHECK (scope IN ('project', 'deployment'))");
+    expect(envSecretValuesMigrationSql).toMatch(/CREATE UNIQUE INDEX\s+env_secret_values_project_key_scope_unique\s+ON\s+env_secret_values\s+\(project_id,\s*key,\s*scope\)/);
+    expect(envSecretValuesMigrationSql).toMatch(/CREATE INDEX\s+env_secret_values_project_id_idx\s+ON\s+env_secret_values\s+\(project_id\)/);
+    expect(envSecretValuesMigrationSql).toContain("CONSTRAINT env_secret_values_key_version_positive CHECK (key_version > 0)");
+  });
+
+  it("rejects blank fingerprints and is forward-only", () => {
+    expect(envSecretValuesMigrationSql).toContain("CONSTRAINT env_secret_values_key_fingerprint_not_blank");
+    expect(envSecretValuesMigrationSql).not.toMatch(/\bDROP\b/);
+    expect(envSecretValuesMigrationSql).not.toMatch(/\bTRUNCATE\b/);
+    expect(envSecretValuesMigrationSql).not.toMatch(/\bALTER\s+TABLE\s+\w+\s+RENAME\b/i);
+  });
+});
+
+function extractCreateTableBody(sql: string, tableName: string): string {
+  const match = sql.match(new RegExp(`CREATE TABLE ${tableName}\\s*\\(([\\s\\S]*?)\\);`));
+  if (!match) {
+    throw new Error(`Could not find CREATE TABLE body for ${tableName}`);
+  }
+  return match[1] ?? "";
+}

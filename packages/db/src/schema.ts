@@ -1,5 +1,11 @@
 import { sql } from "drizzle-orm";
-import { boolean, check, index, integer, jsonb, pgTable, text, timestamp, uniqueIndex, uuid } from "drizzle-orm/pg-core";
+import { boolean, check, customType, index, integer, jsonb, pgTable, smallint, text, timestamp, uniqueIndex, uuid } from "drizzle-orm/pg-core";
+
+const bytea = customType<{ data: Buffer; notNull: false; default: false }>({
+  dataType() {
+    return "bytea";
+  }
+});
 
 export const canonicalRoleNames = ["admin", "operator", "read-only", "auditor"] as const;
 export type CanonicalRoleName = (typeof canonicalRoleNames)[number];
@@ -209,6 +215,30 @@ export const envVariableMetadata = pgTable(
   ]
 );
 
+export const envSecretValues = pgTable(
+  "env_secret_values",
+  {
+    id: uuid("id").primaryKey().defaultRandom(),
+    projectId: uuid("project_id").notNull().references(() => projects.id, { onDelete: "cascade", onUpdate: "cascade" }),
+    key: text("key").notNull(),
+    scope: text("scope").notNull().default("project"),
+    encryptedValue: bytea("encrypted_value").notNull(),
+    valueFingerprint: text("value_fingerprint").notNull(),
+    keyVersion: smallint("key_version").notNull().default(1),
+    ...timestamps
+  },
+  (table) => [
+    uniqueIndex("env_secret_values_project_key_scope_unique").on(table.projectId, table.key, table.scope),
+    index("env_secret_values_project_id_idx").on(table.projectId),
+    check("env_secret_values_scope_valid", sql`${table.scope} in ('project', 'deployment')`),
+    check(
+      "env_secret_values_key_fingerprint_not_blank",
+      sql`length(btrim(${table.valueFingerprint})) > 0`
+    ),
+    check("env_secret_values_key_version_positive", sql`${table.keyVersion} > 0`)
+  ]
+);
+
 export const domains = pgTable(
   "domains",
   {
@@ -263,3 +293,5 @@ export type NewDeploymentRow = typeof deployments.$inferInsert;
 export type DeploymentLogRow = typeof deploymentLogs.$inferSelect;
 export type NewDeploymentLogRow = typeof deploymentLogs.$inferInsert;
 export type NewEnvVariableMetadata = typeof envVariableMetadata.$inferInsert;
+export type EnvSecretValueRow = typeof envSecretValues.$inferSelect;
+export type NewEnvSecretValue = typeof envSecretValues.$inferInsert;

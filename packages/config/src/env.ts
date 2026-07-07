@@ -14,6 +14,7 @@ export const deployLiteEnvSchema = z.object({
   DEPLOYLITE_API_HOST: z.string().min(1).default("127.0.0.1"),
   DEPLOYLITE_API_PORT: z.coerce.number().int().min(1).max(65_535).default(3001),
   DATABASE_URL: z.string().url().optional(),
+  DEPLOYLITE_SECRET_KEY: z.string().min(1).optional(),
   DEPLOYLITE_SESSION_TTL_SECONDS: z.coerce.number().int().positive().default(60 * 60 * 8),
   DEPLOYLITE_SESSION_COOKIE_NAME: z.string().min(1).default("deploylite_session"),
   DEPLOYLITE_SESSION_COOKIE_SECURE: booleanString.optional(),
