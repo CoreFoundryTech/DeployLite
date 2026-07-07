@@ -1,4 +1,4 @@
-import { createCipheriv, createDecipheriv, createHash, randomBytes, timingSafeEqual } from "node:crypto";
+import { createCipheriv, createDecipheriv, createHash, createHmac, randomBytes, timingSafeEqual } from "node:crypto";
 
 /**
  * Fail-closed configuration for the env secret value encryption layer.
@@ -94,7 +94,7 @@ export function createEnvSecretCipher(key: Buffer): EnvSecretCipher {
     if (plaintext.length === 0) {
       throw new EnvSecretCipherError("plaintext must not be empty");
     }
-    return createHash("sha256").update(plaintext, "utf8").digest("hex").slice(0, FINGERPRINT_HEX_LENGTH);
+    return createHmac("sha256", key).update(plaintext, "utf8").digest("hex").slice(0, FINGERPRINT_HEX_LENGTH);
   };
 
   const encrypt = (plaintext: string): string => {

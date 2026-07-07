@@ -84,14 +84,16 @@ describe("env secret encryption", () => {
     expect(() => createEnvSecretCipher("not-a-buffer" as unknown as Buffer)).toThrow(EnvSecretKeyInvalidError);
   });
 
-  it("computes a stable, fixed-length hex fingerprint per plaintext", () => {
+  it("computes a stable, keyed, fixed-length hex fingerprint per plaintext", () => {
     const cipher = createEnvSecretCipher(loadEnvSecretKey(validKey));
+    const otherCipher = createEnvSecretCipher(loadEnvSecretKey("unit-test-secret-key-different-123456"));
     const left = cipher.fingerprint("api-token-1");
     const right = cipher.fingerprint("api-token-1");
     const other = cipher.fingerprint("api-token-2");
 
     expect(left).toBe(right);
     expect(left).not.toBe(other);
+    expect(left).not.toBe(otherCipher.fingerprint("api-token-1"));
     expect(left).toMatch(/^[0-9a-f]{32}$/);
     expect(safeEqualFingerprint(left, right)).toBe(true);
     expect(safeEqualFingerprint(left, other)).toBe(false);

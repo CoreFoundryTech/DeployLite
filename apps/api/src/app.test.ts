@@ -1099,6 +1099,36 @@ describe("DeployLite API scaffold", () => {
     expect(record).toMatchObject({ valuePresent: true, valueFingerprint: fingerprint });
   });
 
+  it("preserves existing env metadata policy fields when a secret value is written", async () => {
+    const { app } = await authFixture();
+    const cookie = await loginCookie(app);
+    const project = (await app.inject({
+      method: "POST",
+      url: "/api/v1/projects",
+      headers: { ...contentHeaders, cookie },
+      payload: { name: "Policy Keeper", repoUrl: "https://github.com/example/policy-keeper", defaultBranch: "main" }
+    })).json().data.project;
+
+    await app.inject({
+      method: "POST",
+      url: `/api/v1/projects/${project.id}/env-variables`,
+      headers: { ...contentHeaders, cookie },
+      payload: { key: "API_KEY", required: true, description: "Required API key" }
+    });
+
+    const write = await app.inject({
+      method: "POST",
+      url: `/api/v1/projects/${project.id}/env-values`,
+      headers: { ...contentHeaders, cookie },
+      payload: { key: "API_KEY", value: "token-1" }
+    });
+    expect(write.statusCode).toBe(200);
+
+    const metadata = await app.inject({ method: "GET", url: `/api/v1/projects/${project.id}/env-variables`, headers: { cookie } });
+    const record = metadata.json().data.envVariables.find((entry: { key: string }) => entry.key === "API_KEY");
+    expect(record).toMatchObject({ required: true, description: "Required API key", valuePresent: true });
+  });
+
   it("treats subsequent env value writes as upserts: same (project, key, scope) updates the encrypted blob in place", async () => {
     const { app } = await authFixture();
     const cookie = await loginCookie(app);
@@ -1166,6 +1196,61 @@ describe("DeployLite API scaffold", () => {
     const deleteAudit = audit.inputs.find((event) => event.action === "project.env-value.delete" && event.requestId === "req_envv_delete_1");
     expect(deleteAudit).toBeDefined();
     expect(JSON.stringify(deleteAudit?.metadata ?? {})).not.toContain("deletable-secret-987654321");
+  });
+
+  it("preserves existing env metadata policy fields when a secret value is deleted", async () => {
+    const { app } = await authFixture();
+    const cookie = await loginCookie(app);
+    const project = (await app.inject({
+      method: "POST",
+      url: "/api/v1/projects",
+      headers: { ...contentHeaders, cookie },
+      payload: { name: "Delete Policy Keeper", repoUrl: "https://github.com/example/delete-policy", defaultBranch: "main" }
+    })).json().data.project;
+
+    await app.inject({
+      method: "POST",
+      url: `/api/v1/projects/${project.id}/env-variables`,
+      headers: { ...contentHeaders, cookie },
+      payload: { key: "API_KEY", required: true, description: "Keep after delete" }
+    });
+    await app.inject({
+      method: "POST",
+      url: `/api/v1/projects/${project.id}/env-values`,
+      headers: { ...contentHeaders, cookie },
+      payload: { key: "API_KEY", value: "delete-me" }
+    });
+
+    const remove = await app.inject({ method: "DELETE", url: `/api/v1/projects/${project.id}/env-values?key=API_KEY`, headers: { cookie } });
+    expect(remove.statusCode).toBe(200);
+
+    const metadata = await app.inject({ method: "GET", url: `/api/v1/projects/${project.id}/env-variables`, headers: { cookie } });
+    const record = metadata.json().data.envVariables.find((entry: { key: string }) => entry.key === "API_KEY");
+    expect(record).toMatchObject({ required: true, description: "Keep after delete", valuePresent: false, valueFingerprint: null });
+  });
+
+  it("removes the encrypted env secret value when its metadata row is deleted", async () => {
+    const { app } = await authFixture();
+    const cookie = await loginCookie(app);
+    const project = (await app.inject({
+      method: "POST",
+      url: "/api/v1/projects",
+      headers: { ...contentHeaders, cookie },
+      payload: { name: "Metadata Delete", repoUrl: "https://github.com/example/metadata-delete", defaultBranch: "main" }
+    })).json().data.project;
+
+    await app.inject({
+      method: "POST",
+      url: `/api/v1/projects/${project.id}/env-values`,
+      headers: { ...contentHeaders, cookie },
+      payload: { key: "API_KEY", value: "orphan-candidate" }
+    });
+
+    const removeMetadata = await app.inject({ method: "DELETE", url: `/api/v1/projects/${project.id}/env-variables?key=API_KEY&scope=project`, headers: { cookie } });
+    expect(removeMetadata.statusCode).toBe(200);
+
+    const values = await app.inject({ method: "GET", url: `/api/v1/projects/${project.id}/env-values`, headers: { cookie } });
+    expect(values.json().data.envValues).toHaveLength(0);
   });
 
   it("rejects env value writes without a value, with invalid scopes, or when the project is missing", async () => {

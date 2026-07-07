@@ -596,6 +596,16 @@ function auditMutation(request: FastifyRequest, action: string, targetType: stri
   return createAuditLogRecord({ actorId: request.auth?.user.id ?? SCAFFOLD_ACTOR, action, targetType, targetId, ...request.correlationContext });
 }
 
+async function findEnvMetadata(
+  repository: EnvVariableMetadataRepository,
+  projectId: string,
+  key: string,
+  scope: EnvVariableMetadata["scope"]
+): Promise<EnvVariableMetadata | null> {
+  const records = await repository.listByProject(projectId);
+  return records.find((record) => record.key === key && record.scope === scope) ?? null;
+}
+
 function isAllowedCorsRequest(request: FastifyRequest, corsOrigin: string | null): boolean {
   return Boolean(corsOrigin && getHeaderValue(request, "origin") === corsOrigin);
 }
@@ -784,9 +794,16 @@ function registerRoutes(app: FastifyInstance, state: PlatformRepositories, adapt
     return ok(request, { envVariable: envVariableMetadataSchema.parse(saved), audit: auditMutation(request, "project.env.upsert", "project", params.projectId) });
   });
   app.delete(`${API_PREFIX}/projects/:projectId/env-variables`, { preHandler: [requireAuth, requireMutationRole] }, async (request, reply) => {
-    const params = z.object({ projectId: z.string().min(1), key: z.string().min(1), scope: z.enum(["project", "deployment"]).default("project") })
-      .parse({ ...(request.params as Record<string, string>), scope: (request.query as { scope?: string } | undefined)?.scope ?? "project" });
+    const query = (request.query ?? {}) as Record<string, unknown>;
+    const params = z.object({ projectId: z.string().min(1), key: z.string().min(1), scope: z.enum(["project", "deployment"]).default("project") }).parse({
+      ...(request.params as Record<string, string>),
+      key: typeof query.key === "string" ? query.key : undefined,
+      scope: typeof query.scope === "string" ? query.scope : "project"
+    });
     const removed = await state.envMetadata.remove(params.projectId, params.key, params.scope);
+    if (removed) {
+      await state.envSecretValues.remove(params.projectId, params.key, params.scope);
+    }
     return removed
       ? ok(request, { removed: true, audit: auditMutation(request, "project.env.delete", "project", params.projectId) })
       : reply.code(404).send(errorEnvelope(request, "NOT_FOUND", "Env metadata not found."));
@@ -844,15 +861,16 @@ function registerRoutes(app: FastifyInstance, state: PlatformRepositories, adapt
     // Reflect the new state on the metadata row so existing env-metadata
     // listings (which are still value-less) can answer "does this key have a
     // value yet?" without leaking the encrypted blob.
+    const existingMetadata = await findEnvMetadata(state.envMetadata, params.projectId, body.key, scope);
     await state.envMetadata.upsert({
-      id: `env_${createRequestId()}`,
+      id: existingMetadata?.id ?? `env_${createRequestId()}`,
       projectId: params.projectId,
       key: body.key,
       scope,
       valuePresent: true,
       valueFingerprint: fingerprint,
-      required: false,
-      description: null,
+      required: existingMetadata?.required ?? false,
+      description: existingMetadata?.description ?? null,
       updatedAt: saved.updatedAt
     });
 
@@ -903,15 +921,16 @@ function registerRoutes(app: FastifyInstance, state: PlatformRepositories, adapt
 
     // Also clear the corresponding metadata row's value marker so the public
     // env-variables list does not keep reporting a now-stale fingerprint.
+    const existingMetadata = await findEnvMetadata(state.envMetadata, params.projectId, parsed.data.key, parsed.data.scope);
     await state.envMetadata.upsert({
-      id: `env_${createRequestId()}`,
+      id: existingMetadata?.id ?? `env_${createRequestId()}`,
       projectId: params.projectId,
       key: parsed.data.key,
       scope: parsed.data.scope,
       valuePresent: false,
       valueFingerprint: null,
-      required: false,
-      description: null,
+      required: existingMetadata?.required ?? false,
+      description: existingMetadata?.description ?? null,
       updatedAt: new Date().toISOString()
     });
 
