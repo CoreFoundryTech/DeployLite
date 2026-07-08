@@ -1,7 +1,7 @@
 import Link from "next/link";
 import { cookies } from "next/headers";
-import { getAuthApiBaseUrl } from "@/lib/auth-boundary";
-import { loadRequestAuthSession, loadRequestProjectDetailMetadata, loadRequestProjectEnvValues } from "@/lib/server-auth";
+import { getAuthApiBaseUrl, loadProjectDetailMetadata, loadProjectEnvValues } from "@/lib/auth-boundary";
+import { loadRequestAuthSession } from "@/lib/server-auth";
 import { ProjectConfigEditForm } from "./project-config-edit-form";
 import { ProjectDetailActions } from "./project-detail-actions";
 import { ProjectDeleteDialog } from "@/components/project-delete-dialog";
@@ -39,7 +39,21 @@ export default async function ProjectDetailPage({ params }: { params: Promise<Pa
     );
   }
 
-  const result = await loadRequestProjectDetailMetadata(projectId);
+  // Read the request cookie header once (B2) and reuse it for every downstream
+  // metadata loader and client component. Awaiting cookies() multiple times —
+  // once per request loader plus once for the client props — is wasteful and
+  // forces a sequential waterfall (B1). A single read paired with Promise.all
+  // parallelizes the detail payload and the env-values payload.
+  const cookieStore = await cookies();
+  const cookieHeader = cookieStore.getAll().map((c) => `${c.name}=${c.value}`).join("; ");
+  const apiBaseUrl = getAuthApiBaseUrl();
+  const requestOptions = { apiBaseUrl: apiBaseUrl ?? undefined, cookieHeader };
+
+  const [result, envValuesResult] = await Promise.all([
+    loadProjectDetailMetadata(projectId, requestOptions),
+    loadProjectEnvValues(projectId, requestOptions)
+  ]);
+
   if (result.kind === "error") {
     if (result.status === 404) {
       return (
@@ -74,15 +88,10 @@ export default async function ProjectDetailPage({ params }: { params: Promise<Pa
   const launchChecklist = buildLaunchChecklist(project, envVariables, deployments);
   const latestDeployment = getLatestDeployment(deployments);
   const readyCount = launchChecklist.filter((item) => item.state === "ready").length;
-  const cookieStore = await cookies();
-  const cookieHeader = cookieStore.getAll().map((c) => `${c.name}=${c.value}`).join("; ");
-  const apiBaseUrl = getAuthApiBaseUrl();
 
-  // Env secret values (encrypted-at-rest) live in a separate table; load in
-  // parallel with the detail payload and degrade gracefully if the call
-  // fails (e.g. encryption key unconfigured) so the rest of the page still
-  // renders. The table itself handles the empty / errored list states.
-  const envValuesResult = await loadRequestProjectEnvValues(projectId);
+  // Env secret values (encrypted-at-rest) degrade gracefully if the call fails
+  // (e.g. encryption key unconfigured) so the rest of the page still renders.
+  // The table itself handles the empty / errored list states.
   const envValues: EnvSecretValue[] = envValuesResult.kind === "ready" ? envValuesResult.data.envValues : [];
 
   return (
