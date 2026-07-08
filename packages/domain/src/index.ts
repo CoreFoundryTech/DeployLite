@@ -71,6 +71,31 @@ export type AuditEvent = {
   timestamp: string;
 };
 
+/**
+ * Public, metadata-free list shape for the audit events API. The list surface
+ * intentionally omits the per-row `metadata` object so the GET response can
+ * never echo secret keys, fingerprints, or any other sensitive detail by
+ * accident. The metadata is still persisted on each event for the in-memory
+ * `inputs` mirror and DB row, but the API only returns it to the caller if a
+ * future, narrower endpoint opts in.
+ */
+export type AuditEventListItem = Pick<AuditEvent, "id" | "actorId" | "action" | "targetType" | "targetId" | "requestId" | "correlationId" | "timestamp">;
+
+export type AuditEventListFilter = {
+  actorUserId?: string;
+  action?: string;
+  projectId?: string;
+  limit?: number;
+  offset?: number;
+};
+
+export type AuditEventListPage = {
+  events: AuditEventListItem[];
+  total: number;
+  limit: number;
+  offset: number;
+};
+
 export type AgentRepository = {
   save(agent: Agent): Promise<Agent>;
   findById(id: string): Promise<Agent | null>;
@@ -148,6 +173,7 @@ export type SessionRepository = {
 
 export type AuditRepository = {
   append(input: AuditEventInput): Promise<AuditEvent>;
+  list(filter?: AuditEventListFilter): Promise<AuditEventListPage>;
 };
 
 export type PasswordHasher = {

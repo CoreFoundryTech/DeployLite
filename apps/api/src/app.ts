@@ -33,6 +33,7 @@ import {
   toSafeAuthUser,
   type AuditEvent,
   type AuditEventInput,
+  type AuditEventListItem,
   type AuditRepository,
   type AuthSession,
   type AuthUser,
@@ -240,6 +241,82 @@ class InMemoryAuditRepository implements AuditRepository {
     this.events.push(event);
     return event;
   }
+
+  async list(filter: { actorUserId?: string; action?: string; projectId?: string; limit?: number; offset?: number } = {}): Promise<{ events: AuditEventListItem[]; total: number; limit: number; offset: number }> {
+    const limit = clampListLimit(filter.limit);
+    const offset = clampListOffset(filter.offset);
+    const filtered = this.events.filter((event) => matchesAuditFilter(event, this.inputs, filter));
+    return {
+      events: filtered.slice(offset, offset + limit).map(toAuditListItem),
+      total: filtered.length,
+      limit,
+      offset
+    };
+  }
+}
+
+const MAX_AUDIT_LIST_LIMIT = 200;
+const DEFAULT_AUDIT_LIST_LIMIT = 50;
+const MAX_AUDIT_LIST_OFFSET = 10_000;
+
+type AuditListFilter = {
+  actorUserId?: string;
+  action?: string;
+  projectId?: string;
+  limit?: number;
+  offset?: number;
+};
+
+function clampListLimit(raw: number | undefined): number {
+  if (raw === undefined) return DEFAULT_AUDIT_LIST_LIMIT;
+  if (!Number.isInteger(raw) || raw < 1) return 1;
+  if (raw > MAX_AUDIT_LIST_LIMIT) return MAX_AUDIT_LIST_LIMIT;
+  return raw;
+}
+
+function clampListOffset(raw: number | undefined): number {
+  if (raw === undefined) return 0;
+  if (!Number.isInteger(raw) || raw < 0) return 0;
+  if (raw > MAX_AUDIT_LIST_OFFSET) return MAX_AUDIT_LIST_OFFSET;
+  return raw;
+}
+
+function toAuditListItem(event: AuditEvent): AuditEventListItem {
+  return {
+    id: event.id,
+    actorId: event.actorId,
+    action: event.action,
+    targetType: event.targetType,
+    targetId: event.targetId,
+    requestId: event.requestId,
+    correlationId: event.correlationId,
+    timestamp: event.timestamp
+  };
+}
+
+function matchesAuditFilter(event: AuditEvent, inputs: AuditEventInput[], filter: AuditListFilter): boolean {
+  if (filter.actorUserId) {
+    if (event.actorId !== filter.actorUserId && event.actorId !== "anonymous" && event.actorId !== "system") {
+      return false;
+    }
+  }
+  if (filter.action && !event.action.startsWith(filter.action)) {
+    return false;
+  }
+  if (filter.projectId) {
+    const prefix = `${filter.projectId}:`;
+    const matchesTargetPrefix = event.targetId === filter.projectId || event.targetId.startsWith(prefix);
+    if (matchesTargetPrefix) {
+      return true;
+    }
+    // Fall back to the metadata.projectId mirror so events whose targetId is
+    // opaque (e.g. an env_secret_values row id) still get filtered correctly.
+    const input = inputs.find((candidate) => candidate.requestId === event.requestId && candidate.correlationId === event.correlationId);
+    if (!input || !input.metadata || (input.metadata as Record<string, unknown>)["projectId"] !== filter.projectId) {
+      return false;
+    }
+  }
+  return true;
 }
 
 function ok<Data>(request: FastifyRequest, data: Data): ApiEnvelope<Data> {
@@ -662,6 +739,9 @@ function registerCoreHooks(app: FastifyInstance, corsOrigin: string | null): voi
 function registerRoutes(app: FastifyInstance, state: PlatformRepositories, adapters: AuthAdapters, authConfig: AuthConfig): void {
   const requireAuth = createAuthPreHandler(adapters, authConfig);
   const requireMutationRole = createRolePreHandler(adapters, ["admin", "operator"]);
+  // Audit history is an operator/admin concern. Read-only sessions are denied
+  // by design so a passive role cannot enumerate every project + key change.
+  const requireAuditReadRole = createRolePreHandler(adapters, ["admin", "operator"]);
 
   app.get(`${API_PREFIX}/health`, async (request) => ok(request, { status: "ok", service: "deploylite-api", auth: "cookie-session" }));
   app.get(`${API_PREFIX}/bootstrap/status`, async (request) => ok(request, await getBootstrapStatus(adapters.users)));
@@ -1007,6 +1087,45 @@ function registerRoutes(app: FastifyInstance, state: PlatformRepositories, adapt
     return deployment ? ok(request, { deployment }) : reply.code(404).send(errorEnvelope(request, "NOT_FOUND", "Deployment not found."));
   });
   app.get(`${API_PREFIX}/deployments`, { preHandler: requireAuth }, async (request) => ok(request, { deployments: await state.deployments.list() }));
+  // Audit history list — operator/admin only. The response shape strips
+  // per-row metadata so the API can never echo secret keys, fingerprints, or
+  // other sensitive detail by accident (Task 4.6: safe metadata only).
+  app.get(`${API_PREFIX}/audit-events`, { preHandler: [requireAuth, requireAuditReadRole] }, async (request, reply) => {
+    const raw = (request.query ?? {}) as Record<string, unknown>;
+    const parsed = z
+      .object({
+        actor: z.string().min(1).max(128).optional(),
+        action: z.string().min(1).max(128).optional(),
+        projectId: z.string().min(1).max(128).optional(),
+        limit: z.coerce.number().int().min(1).max(MAX_AUDIT_LIST_LIMIT).optional(),
+        offset: z.coerce.number().int().min(0).max(MAX_AUDIT_LIST_OFFSET).optional()
+      })
+      .safeParse({
+        actor: typeof raw["actor"] === "string" && raw["actor"].length > 0 ? raw["actor"] : undefined,
+        action: typeof raw["action"] === "string" && raw["action"].length > 0 ? raw["action"] : undefined,
+        projectId: typeof raw["projectId"] === "string" && raw["projectId"].length > 0 ? raw["projectId"] : undefined,
+        limit: typeof raw["limit"] === "string" && raw["limit"].length > 0 ? raw["limit"] : undefined,
+        offset: typeof raw["offset"] === "string" && raw["offset"].length > 0 ? raw["offset"] : undefined
+      });
+    if (!parsed.success) {
+      await appendAudit(adapters.audit, request, {
+        actorUserId: request.auth?.user.id ?? null,
+        action: "audit.list.rejected",
+        targetType: "audit_events",
+        targetId: "list",
+        metadata: { reason: "invalid-query" }
+      });
+      return reply.code(400).send(errorEnvelope(request, "VALIDATION_ERROR", "Invalid audit-events query parameters."));
+    }
+    const page = await adapters.audit.list({
+      actorUserId: parsed.data.actor,
+      action: parsed.data.action,
+      projectId: parsed.data.projectId,
+      limit: parsed.data.limit,
+      offset: parsed.data.offset
+    });
+    return ok(request, page);
+  });
   app.get(`${API_PREFIX}/deployments/:deploymentId/logs`, { preHandler: requireAuth }, async (request) => {
     const params = z.object({ deploymentId: z.string().min(1) }).parse(request.params);
     return ok(request, { events: await state.deployments.listLogs(params.deploymentId) });
