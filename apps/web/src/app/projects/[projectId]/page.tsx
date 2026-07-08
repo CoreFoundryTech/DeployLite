@@ -1,17 +1,18 @@
 import Link from "next/link";
 import { cookies } from "next/headers";
 import { getAuthApiBaseUrl } from "@/lib/auth-boundary";
-import { loadRequestAuthSession, loadRequestProjectDetailMetadata } from "@/lib/server-auth";
+import { loadRequestAuthSession, loadRequestProjectDetailMetadata, loadRequestProjectEnvValues } from "@/lib/server-auth";
 import { ProjectConfigEditForm } from "./project-config-edit-form";
 import { ProjectDetailActions } from "./project-detail-actions";
 import { ProjectDeleteDialog } from "@/components/project-delete-dialog";
+import { ProjectEnvValuesTable } from "@/components/project-env-values-table";
 import { AppShell } from "@/components/app-shell";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card";
 import { Separator } from "@/components/ui/separator";
 import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from "@/components/ui/table";
-import type { Deployment, EnvVariableMetadata, Project } from "@deploylite/contracts";
+import type { Deployment, EnvSecretValue, EnvVariableMetadata, Project } from "@deploylite/contracts";
 
 export const dynamic = "force-dynamic";
 
@@ -76,6 +77,13 @@ export default async function ProjectDetailPage({ params }: { params: Promise<Pa
   const cookieStore = await cookies();
   const cookieHeader = cookieStore.getAll().map((c) => `${c.name}=${c.value}`).join("; ");
   const apiBaseUrl = getAuthApiBaseUrl();
+
+  // Env secret values (encrypted-at-rest) live in a separate table; load in
+  // parallel with the detail payload and degrade gracefully if the call
+  // fails (e.g. encryption key unconfigured) so the rest of the page still
+  // renders. The table itself handles the empty / errored list states.
+  const envValuesResult = await loadRequestProjectEnvValues(projectId);
+  const envValues: EnvSecretValue[] = envValuesResult.kind === "ready" ? envValuesResult.data.envValues : [];
 
   return (
     <AppShell email={auth.user.email}>
@@ -213,6 +221,23 @@ export default async function ProjectDetailPage({ params }: { params: Promise<Pa
             />
           </div>
         </div>
+
+        <Card id="env-values">
+          <CardHeader>
+            <CardTitle>Env secret values</CardTitle>
+            <CardDescription>
+              Encrypted at rest. The UI never receives the raw value — only a fingerprint, scope, and timestamps. Paste a new value to set or rotate; the previous value is overwritten.
+            </CardDescription>
+          </CardHeader>
+          <CardContent>
+            <ProjectEnvValuesTable
+              projectId={project.id}
+              apiBaseUrl={apiBaseUrl}
+              cookieHeader={cookieHeader}
+              envValues={envValues}
+            />
+          </CardContent>
+        </Card>
       </div>
     </AppShell>
   );

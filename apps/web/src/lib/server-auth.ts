@@ -8,6 +8,7 @@ import {
   loadDashboardMetadata,
   loadDeploymentLogMetadata,
   loadProjectDetailMetadata,
+  loadProjectEnvValues,
   triggerProjectDeployment,
   upsertEnvVariable
 } from "./auth-boundary";
@@ -47,6 +48,11 @@ export async function loadRequestDeploymentLogMetadata(deploymentId: string) {
 export async function loadRequestProjectDetailMetadata(projectId: string) {
   const cookieHeader = await getRequestCookieHeader();
   return loadProjectDetailMetadata(projectId, { apiBaseUrl: getAuthApiBaseUrl() ?? undefined, cookieHeader });
+}
+
+export async function loadRequestProjectEnvValues(projectId: string) {
+  const cookieHeader = await getRequestCookieHeader();
+  return loadProjectEnvValues(projectId, { apiBaseUrl: getAuthApiBaseUrl() ?? undefined, cookieHeader });
 }
 
 export async function createRequestProject(input: Parameters<typeof createProject>[0]) {
