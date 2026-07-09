@@ -147,6 +147,81 @@ describe("redactEnvFileForLog", () => {
     const redacted = redactEnvFileForLog(sample);
     expect(redacted).toBe("user=[REDACTED]");
   });
+
+  it("scrubs every continuation line of a multiline secret value so PEM private keys and certs never leak", () => {
+    // A PEM private key laid out unquoted across multiple lines. Every
+    // continuation chunk (the base64 body + the END marker) must be
+    // redacted in full — not merely routed through the platform
+    // pattern-based scrubber, which would only catch token-shaped
+    // values.
+    const rendered = [
+      "PRIVATE_KEY=-----BEGIN PRIVATE KEY-----",
+      "MIIEvAIBADANBgkqhkiG9w0BAQEFAASCBKYwggSiAgEAAoIBAQ",
+      "Cj4x3p7cQ4y2VCHl8pF8n6fL3T2gUw0c1A2b3C4d5E6F7G8H9I0J1K2L3M4N5O6",
+      "-----END PRIVATE KEY-----",
+      "API_KEY=sk_test_abcdefghijklmnop"
+    ].join("\n");
+
+    const redacted = redactEnvFileForLog(rendered);
+
+    // The full base64 body and the PEM markers are scrubbed in full —
+    // the base64 chunks in particular are not relying on the platform
+    // pattern matcher, which would otherwise miss anything below the
+    // 32-char detection threshold.
+    expect(redacted).not.toContain("MIIEvAIBADANBgkqhkiG9w0BAQEFAASCBKYwggSiAgEAAoIBAQ");
+    expect(redacted).not.toContain("Cj4x3p7cQ4y2VCHl8pF8n6fL3T2gUw0c1A2b3C4d5E6F7G8H9I0J1K2L3M4N5O6");
+    expect(redacted).not.toContain("BEGIN PRIVATE KEY");
+    expect(redacted).not.toContain("END PRIVATE KEY");
+    // The first and last KEY= lines keep their keys visible.
+    expect(redacted).toContain("PRIVATE_KEY=[REDACTED]");
+    expect(redacted).toContain("API_KEY=[REDACTED]");
+    // The intermediate continuation rows are dropped to [REDACTED] so
+    // no base64 chunk can survive the projection.
+    expect(redacted).toBe(
+      [
+        "PRIVATE_KEY=[REDACTED]",
+        "[REDACTED]",
+        "[REDACTED]",
+        "[REDACTED]",
+        "API_KEY=[REDACTED]"
+      ].join("\n")
+    );
+  });
+
+  it("scrubs a certificate chain that spans multiple KEY= blocks without leaking the chain", () => {
+    // A more realistic case: two KEY= blocks back-to-back, each with a
+    // multiline PEM body. The state machine must reset after each
+    // `KEY=` line so the second key's body is also fully scrubbed.
+    const rendered = [
+      "TLS_CERT=-----BEGIN CERTIFICATE-----",
+      "MIIB+TCCAaCgAwIBAgIJAKnK",
+      "-----END CERTIFICATE-----",
+      "TLS_KEY=-----BEGIN PRIVATE KEY-----",
+      "MIIEvQIBADANBgkqhkiG9w0BAQEFAA==",
+      "-----END PRIVATE KEY-----"
+    ].join("\n");
+
+    const redacted = redactEnvFileForLog(rendered);
+
+    expect(redacted).not.toContain("MIIB+TCCAaCgAwIBAgIJAKnK");
+    expect(redacted).not.toContain("MIIEvQIBADANBgkqhkiG9w0BAQEFAA==");
+    expect(redacted.split("\n").filter((line) => line === "[REDACTED]")).toHaveLength(4);
+    expect(redacted).toContain("TLS_CERT=[REDACTED]");
+    expect(redacted).toContain("TLS_KEY=[REDACTED]");
+  });
+
+  it("does not scrub standalone comment lines outside of a multiline value", () => {
+    // The contract: a line without `=` that follows another line
+    // without `=` (and is not inside a multiline value) still falls
+    // through to the platform's pattern-based scrubber. This keeps
+    // comments and stray log lines readable while guaranteeing that
+    // continuation chunks of a secret value are dropped entirely.
+    const rendered = "user=alice\n# next: rotate TOKEN sk_test_abcdefghijklmnop every 30d";
+    const redacted = redactEnvFileForLog(rendered);
+    // The KEY= line is fully redacted; the comment line keeps its
+    // structure but the token-shaped substring is replaced.
+    expect(redacted).toBe("user=[REDACTED]\n# next: rotate TOKEN [REDACTED] every 30d");
+  });
 });
 
 describe("EnvMaterializedEntry shape", () => {

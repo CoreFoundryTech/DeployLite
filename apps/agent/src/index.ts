@@ -204,15 +204,65 @@ export function materializeMockDeploy(options: MaterializeDeployOptions): EnvMat
  * layer is still applied first to handle non-`KEY=VALUE` substrings (e.g.
  * embedded fingerprints in error messages) so the projection composes
  * cleanly with the rest of the log pipeline.
+ *
+ * Multiline secret handling: a value that contains a newline (e.g. an
+ * unquoted PEM private key or certificate blob) puts every continuation
+ * line in scope of the same redaction. The naive per-line rule would let
+ * a base64 continuation chunk pass through to `redactSecrets`, where it
+ * is only matched when it happens to look like a token-shaped value. To
+ * avoid that, once we redacted a `KEY=…` line we redact every following
+ * line that does not look like a new `KEY=` declaration or a `#`-led
+ * comment — a deterministic state machine that keeps operators able to
+ * read the key list while guaranteeing that no continuation chunk leaks.
+ *
+ * The new-key detector matches the POSIX convention: `[A-Z_][A-Z0-9_]*`.
+ * That deliberately excludes lowercase keys, but the project standard
+ * is uppercase (DATABASE_URL, API_KEY, …) and the constraint also
+ * rejects base64 chunks (which mix upper/lower + `+`/`/`/`=`), so a
+ * PEM continuation line is correctly treated as a continuation rather
+ * than a false-positive new declaration.
  */
+const ENV_NEW_KEY_PATTERN = /^[A-Z_][A-Z0-9_]{0,63}=/;
+
 export function redactEnvFileForLog(contents: string): string {
-  return contents
-    .split("\n")
-    .map((line) => {
-      const eq = line.indexOf("=");
-      if (eq === -1) return redactSecrets(line);
+  const lines = contents.split("\n");
+  const redacted: string[] = [];
+  let redactingMultilineValue = false;
+  for (const line of lines) {
+    const eq = line.indexOf("=");
+    if (eq === -1) {
+      // Continuation line. If we are still inside a redacted multiline
+      // value, drop the body entirely so a base64 / PEM chunk can never
+      // leak. Otherwise fall back to the platform redaction for stray
+      // substrings (e.g. an inline fingerprint in a comment).
+      redacted.push(redactingMultilineValue ? "[REDACTED]" : redactSecrets(line));
+      continue;
+    }
+    // A new `KEY=` declaration closes any open multiline block. This
+    // handles a string of PEM blocks back-to-back: each `KEY=...` line
+    // starts a fresh redaction window.
+    if (eq > 0 && ENV_NEW_KEY_PATTERN.test(line)) {
       const key = line.slice(0, eq);
-      return `${key}=[REDACTED]`;
-    })
-    .join("\n");
+      redacted.push(`${key}=[REDACTED]`);
+      redactingMultilineValue = line.slice(eq + 1).length > 0;
+      continue;
+    }
+    // The first `=` does not look like a standard KEY=VALUE declaration.
+    // The two shapes we have to defend against here are:
+    //   1. A list-style value with a `=` somewhere inside the body, e.g.
+    //      `user=alice; token=…`. The "key" portion is just the leading
+    //      token, so we redact the body but keep the visible token.
+    //   2. A base64 / PEM continuation line where the first `=` is the
+    //      padding at the end of a base64 chunk (`ABCDEF==`). In this
+    //      case the `key` portion is the entire chunk, which would leak
+    //      the secret. To guarantee no chunk survives, we collapse the
+    //      line down to `[REDACTED]` and continue the redaction window.
+    if (redactingMultilineValue) {
+      redacted.push("[REDACTED]");
+    } else {
+      const key = line.slice(0, eq);
+      redacted.push(`${key}=[REDACTED]`);
+    }
+  }
+  return redacted.join("\n");
 }
