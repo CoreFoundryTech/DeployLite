@@ -744,6 +744,18 @@ describe("DeployLite API scaffold", () => {
     expect(initialEvents.some((e: { message: string }) => e.message.includes("Build command: pnpm build"))).toBe(true);
     expect(initialEvents.some((e: { message: string }) => e.message.includes("Run command: node server.js"))).toBe(true);
 
+    // The dry-run materialization step wires the agent module's
+    // `materializeMockDeploy` + `redactEnvFileForLog` pipeline into
+    // the deploy path. The plaintext is never logged — only the
+    // redacted projection (KEY=[REDACTED]) survives. The key list
+    // must still be visible so operators can confirm what was wired.
+    const materialized = initialEvents.find((e: { message: string }) => e.message.includes("Materialized env (mock, redacted):")) as { message: string } | undefined;
+    expect(materialized).toBeDefined();
+    expect(materialized!.message).toContain("DATABASE_URL=[REDACTED]");
+    expect(materialized!.message).toContain("API_KEY=[REDACTED]");
+    expect(materialized!.message).not.toContain("postgres://dry-run:placeholder@db.invalid:5432/dryrun");
+    expect(materialized!.message).not.toContain("sk_dry_run_placeholder");
+
     await new Promise((resolve) => setTimeout(resolve, 350));
 
     const finalDetail = await app.inject({ method: "GET", url: `/api/v1/deployments/${deployment.id}`, headers: { cookie } });
@@ -1355,5 +1367,236 @@ describe("DeployLite API scaffold", () => {
       headers: { cookie }
     });
     expect(emptyKey.statusCode).toBe(400);
+  });
+
+  describe("GET /api/v1/audit-events", () => {
+    it("requires authentication", async () => {
+      const app = await buildApiApp();
+      const response = await app.inject({ method: "GET", url: "/api/v1/audit-events" });
+      expect(response.statusCode).toBe(401);
+    });
+
+    it("returns the full list of audit events with safe metadata when no filter is supplied", async () => {
+      const { app, audit } = await authFixture();
+      const cookie = await loginCookie(app);
+      // Seed a deterministic series of audit events so the list query is
+      // exercised on real shape data, not just an empty list.
+      audit.events.push(
+        { id: "ev_1", actorId: "user_test_1", action: "project.create", targetType: "project", targetId: "project_alpha", requestId: "req_1", correlationId: "corr_1", timestamp: "2026-01-01T00:00:00.000Z" },
+        { id: "ev_2", actorId: "user_test_1", action: "project.env-value.upsert", targetType: "env_value", targetId: "project_alpha:project:DB_URL", requestId: "req_2", correlationId: "corr_2", timestamp: "2026-01-01T00:01:00.000Z" },
+        { id: "ev_3", actorId: "user_test_1", action: "project.env-value.delete", targetType: "env_value", targetId: "project_beta:project:API_KEY", requestId: "req_3", correlationId: "corr_3", timestamp: "2026-01-01T00:02:00.000Z" }
+      );
+
+      const response = await app.inject({ method: "GET", url: "/api/v1/audit-events", headers: { cookie } });
+      expect(response.statusCode).toBe(200);
+      const body = response.json();
+      const listed = body.data.events as Array<{ id: string; action: string; targetType: string; targetId: string; metadata?: unknown }>;
+      const seeded = listed.filter((event) => ["ev_1", "ev_2", "ev_3"].includes(event.id));
+      const seededIds = seeded.map((event) => event.id);
+      // The list surface sorts by `timestamp desc` (mirroring the DB
+      // `desc(auditEvents.createdAt)`), so the most recent seeded event
+      // comes back first. Slot-order is now a contract the in-memory
+      // path honors, not an artifact of insertion order.
+      expect(seededIds).toEqual(["ev_3", "ev_2", "ev_1"]);
+      // Metadata is never echoed in the public list response — only the safe
+      // event shape is exposed.
+      const ev1 = seeded.find((event) => event.id === "ev_1");
+      expect(ev1?.action).toBe("project.create");
+      expect(ev1?.targetType).toBe("project");
+      expect(ev1?.targetId).toBe("project_alpha");
+      expect(ev1?.metadata).toBeUndefined();
+    });
+
+    it("filters events by action prefix", async () => {
+      const { app, audit } = await authFixture();
+      const cookie = await loginCookie(app);
+      audit.events.push(
+        { id: "ev_1", actorId: "user_test_1", action: "project.create", targetType: "project", targetId: "project_alpha", requestId: "req_1", correlationId: "corr_1", timestamp: "2026-01-01T00:00:00.000Z" },
+        { id: "ev_2", actorId: "user_test_1", action: "project.env-value.upsert", targetType: "env_value", targetId: "project_alpha:project:DB_URL", requestId: "req_2", correlationId: "corr_2", timestamp: "2026-01-01T00:01:00.000Z" }
+      );
+
+      const response = await app.inject({
+        method: "GET",
+        url: "/api/v1/audit-events?action=project.env-value",
+        headers: { cookie }
+      });
+      expect(response.statusCode).toBe(200);
+      const body = response.json();
+      const actions = (body.data.events as Array<{ action: string }>).map((event) => event.action);
+      expect(actions).toEqual(["project.env-value.upsert"]);
+    });
+
+    it("filters events by actorUserId with an exact match — system/anonymous placeholders are not folded in", async () => {
+      const { app, audit } = await authFixture();
+      const cookie = await loginCookie(app);
+      audit.events.push(
+        { id: "ev_1", actorId: "user_test_1", action: "project.create", targetType: "project", targetId: "project_alpha", requestId: "req_1", correlationId: "corr_1", timestamp: "2026-01-01T00:00:00.000Z" },
+        { id: "ev_2", actorId: "user_other", action: "project.create", targetType: "project", targetId: "project_beta", requestId: "req_2", correlationId: "corr_2", timestamp: "2026-01-01T00:01:00.000Z" },
+        { id: "ev_3", actorId: "system", action: "system.bootstrap", targetType: "system", targetId: "system", requestId: "req_3", correlationId: "corr_3", timestamp: "2026-01-01T00:02:00.000Z" },
+        { id: "ev_4", actorId: "anonymous", action: "auth.login.failed", targetType: "user", targetId: "anon@example.test", requestId: "req_4", correlationId: "corr_4", timestamp: "2026-01-01T00:03:00.000Z" }
+      );
+
+      // `?actor=user_other` matches the single user_other row.
+      const userOther = await app.inject({
+        method: "GET",
+        url: "/api/v1/audit-events?actor=user_other",
+        headers: { cookie }
+      });
+      expect(userOther.statusCode).toBe(200);
+      const userOtherBody = userOther.json();
+      expect(userOtherBody.data.events).toHaveLength(1);
+      expect(userOtherBody.data.events[0].actorId).toBe("user_other");
+
+      // `?actor=system` matches only the explicit system row, not the
+      // user-scoped rows that were previously folded in by the in-memory
+      // repository. This is the round 1 fix that aligns the in-memory
+      // implementation with the DB's `eq(auditEvents.actorUserId, …)`
+      // exact-match contract.
+      const systemOnly = await app.inject({
+        method: "GET",
+        url: "/api/v1/audit-events?actor=system",
+        headers: { cookie }
+      });
+      const systemIds = (systemOnly.json().data.events as Array<{ id: string }>).map((event) => event.id);
+      expect(systemIds).toEqual(["ev_3"]);
+
+      // `?actor=anonymous` matches only the explicit anonymous row.
+      const anonOnly = await app.inject({
+        method: "GET",
+        url: "/api/v1/audit-events?actor=anonymous",
+        headers: { cookie }
+      });
+      const anonIds = (anonOnly.json().data.events as Array<{ id: string }>).map((event) => event.id);
+      expect(anonIds).toEqual(["ev_4"]);
+
+      // `?actor=does_not_exist` returns zero rows, not the entire system
+      // set — this is the regression the in-memory filter was triggering.
+      const miss = await app.inject({
+        method: "GET",
+        url: "/api/v1/audit-events?actor=does_not_exist",
+        headers: { cookie }
+      });
+      expect(miss.json().data.events).toEqual([]);
+    });
+
+    it("filters events by projectId through the targetId prefix and the metadata projectId field", async () => {
+      const { app, audit } = await authFixture();
+      const cookie = await loginCookie(app);
+      audit.events.push(
+        { id: "ev_1", actorId: "user_test_1", action: "project.create", targetType: "project", targetId: "project_alpha", requestId: "req_1", correlationId: "corr_1", timestamp: "2026-01-01T00:00:00.000Z" },
+        { id: "ev_2", actorId: "user_test_1", action: "project.env-value.upsert", targetType: "env_value", targetId: "project_alpha:project:DB_URL", requestId: "req_2", correlationId: "corr_2", timestamp: "2026-01-01T00:01:00.000Z" },
+        { id: "ev_3", actorId: "user_test_1", action: "project.env-value.upsert", targetType: "env_value", targetId: "envv_project_beta_1", requestId: "req_3", correlationId: "corr_3", timestamp: "2026-01-01T00:02:00.000Z" }
+      );
+      audit.inputs.push(
+        { actorUserId: "user_test_1", action: "project.env-value.upsert", targetType: "env_value", targetId: "envv_project_beta_1", requestId: "req_3", correlationId: "corr_3", metadata: { projectId: "project_beta" } }
+      );
+
+      const alpha = await app.inject({
+        method: "GET",
+        url: "/api/v1/audit-events?projectId=project_alpha",
+        headers: { cookie }
+      });
+      const alphaIds = (alpha.json().data.events as Array<{ id: string }>).map((event) => event.id);
+      expect(alphaIds.sort()).toEqual(["ev_1", "ev_2"]);
+
+      const beta = await app.inject({
+        method: "GET",
+        url: "/api/v1/audit-events?projectId=project_beta",
+        headers: { cookie }
+      });
+      const betaIds = (beta.json().data.events as Array<{ id: string }>).map((event) => event.id);
+      expect(betaIds).toEqual(["ev_3"]);
+    });
+
+    it("paginates results using limit and offset and orders most-recent-first", async () => {
+      const { app, audit } = await authFixture();
+      const cookie = await loginCookie(app);
+      for (let i = 0; i < 5; i++) {
+        audit.events.push({
+          id: `ev_${i}`,
+          actorId: "user_test_1",
+          action: "project.create",
+          targetType: "project",
+          targetId: `project_${i}`,
+          requestId: `req_${i}`,
+          correlationId: `corr_${i}`,
+          timestamp: `2026-01-01T00:0${i}:00.000Z`
+        });
+      }
+
+      // Filter on the seeded `project.create` action so the implicit
+      // `auth.login.succeeded` audit event from `loginCookie` is excluded
+      // from the page — this lets the assertion read the slot positions
+      // exactly. The in-memory mirror now sorts by `timestamp desc` to
+      // match the DB's `desc(auditEvents.createdAt)`, so the first page
+      // is the two most recent events (ev_4, ev_3), not the oldest.
+      const first = await app.inject({
+        method: "GET",
+        url: "/api/v1/audit-events?action=project.create&limit=2&offset=0",
+        headers: { cookie }
+      });
+      const firstBody = first.json();
+      expect(first.statusCode).toBe(200);
+      expect(firstBody.data.events).toHaveLength(2);
+      const firstIds = (firstBody.data.events as Array<{ id: string }>).map((event) => event.id);
+      expect(firstIds).toEqual(["ev_4", "ev_3"]);
+
+      const second = await app.inject({
+        method: "GET",
+        url: "/api/v1/audit-events?action=project.create&limit=2&offset=2",
+        headers: { cookie }
+      });
+      const secondBody = second.json();
+      expect(secondBody.data.events).toHaveLength(2);
+      const secondIds = (secondBody.data.events as Array<{ id: string }>).map((event) => event.id);
+      expect(secondIds).toEqual(["ev_2", "ev_1"]);
+
+      // The total count is the number of filtered rows, not the page
+      // size. The DB path returns the same `total` regardless of limit
+      // and offset, so the in-memory path has to as well.
+      const totalProbe = await app.inject({
+        method: "GET",
+        url: "/api/v1/audit-events?action=project.create&limit=200&offset=0",
+        headers: { cookie }
+      });
+      expect(totalProbe.json().data.total).toBe(5);
+    });
+
+    it("rejects invalid query parameters with 400", async () => {
+      const { app } = await authFixture();
+      const cookie = await loginCookie(app);
+      const response = await app.inject({
+        method: "GET",
+        url: "/api/v1/audit-events?limit=not-a-number",
+        headers: { cookie }
+      });
+      expect(response.statusCode).toBe(400);
+      expect(response.json().error.code).toBe("VALIDATION_ERROR");
+    });
+
+    it("denies read-only callers because audit events are operator/admin scoped", async () => {
+      const users = new InMemoryAuthUserRepository([
+        { id: "user_readonly_1", email: "reader@example.test", emailNormalized: "reader@example.test", passwordHash: "x", role: "read-only", status: "active", createdAt: new Date(), updatedAt: new Date() }
+      ]);
+      // Stub the hasher so the password "x" validates against the in-memory
+      // user record without needing a real bcrypt roundtrip here.
+      const { default: _ignored } = { default: null } as never;
+      void _ignored;
+      const hasher = {
+        hash: async () => "x",
+        verify: async (password: string, hash: string) => password === "x" && hash === "x"
+      } as unknown as BcryptPasswordHasher;
+      const audit = new InMemoryAuditRepository();
+      const sessions = new InMemorySessionRepository();
+      const app = await buildApiApp({
+        auth: { audit, hasher, sessions, users },
+        authConfig: { cookieName: "dl_test_session", cookieSecure: false, sessionTtlSeconds: 3600 },
+        env: testEnv
+      });
+      const login = await app.inject({ method: "POST", url: "/api/v1/auth/login", headers: contentHeaders, payload: { email: "reader@example.test", password: "x" } });
+      const cookie = login.headers["set-cookie"] as string;
+      const list = await app.inject({ method: "GET", url: "/api/v1/audit-events", headers: { cookie } });
+      expect(list.statusCode).toBe(403);
+    });
   });
 });

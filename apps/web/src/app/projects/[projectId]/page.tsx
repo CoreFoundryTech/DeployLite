@@ -1,10 +1,15 @@
 import Link from "next/link";
 import { cookies } from "next/headers";
-import { getAuthApiBaseUrl, loadProjectDetailMetadata, loadProjectEnvValues } from "@/lib/auth-boundary";
-import { loadRequestAuthSession } from "@/lib/server-auth";
+import { getAuthApiBaseUrl, loadAuditEvents } from "@/lib/auth-boundary";
+import {
+  loadRequestAuthSession,
+  loadRequestProjectDetailMetadata,
+  loadRequestProjectEnvValues
+} from "@/lib/server-auth";
 import { ProjectConfigEditForm } from "./project-config-edit-form";
 import { ProjectDetailActions } from "./project-detail-actions";
 import { ProjectDeleteDialog } from "@/components/project-delete-dialog";
+import { ProjectAuditHistoryPanel } from "./project-audit-history-panel";
 import { ProjectEnvValuesTable } from "@/components/project-env-values-table";
 import { AppShell } from "@/components/app-shell";
 import { Badge } from "@/components/ui/badge";
@@ -12,7 +17,7 @@ import { Button } from "@/components/ui/button";
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card";
 import { Separator } from "@/components/ui/separator";
 import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from "@/components/ui/table";
-import type { Deployment, EnvSecretValue, EnvVariableMetadata, Project } from "@deploylite/contracts";
+import type { AuditEventListItem, Deployment, EnvSecretValue, EnvVariableMetadata, Project } from "@deploylite/contracts";
 
 export const dynamic = "force-dynamic";
 
@@ -47,11 +52,10 @@ export default async function ProjectDetailPage({ params }: { params: Promise<Pa
   const cookieStore = await cookies();
   const cookieHeader = cookieStore.getAll().map((c) => `${c.name}=${c.value}`).join("; ");
   const apiBaseUrl = getAuthApiBaseUrl();
-  const requestOptions = { apiBaseUrl: apiBaseUrl ?? undefined, cookieHeader };
 
   const [result, envValuesResult] = await Promise.all([
-    loadProjectDetailMetadata(projectId, requestOptions),
-    loadProjectEnvValues(projectId, requestOptions)
+    loadRequestProjectDetailMetadata(projectId),
+    loadRequestProjectEnvValues(projectId)
   ]);
 
   if (result.kind === "error") {
@@ -93,6 +97,23 @@ export default async function ProjectDetailPage({ params }: { params: Promise<Pa
   // (e.g. encryption key unconfigured) so the rest of the page still renders.
   // The table itself handles the empty / errored list states.
   const envValues: EnvSecretValue[] = envValuesResult.kind === "ready" ? envValuesResult.data.envValues : [];
+
+  // Audit history is loaded alongside the project detail so the panel can
+  // render without a second client roundtrip. The list is metadata-stripped
+  // server-side, so we only ever see the safe envelope.
+  const auditResult = await loadAuditEvents({
+    apiBaseUrl: apiBaseUrl ?? undefined,
+    cookieHeader,
+    projectId: project.id,
+    limit: 50,
+    offset: 0
+  });
+  const initialAuditEvents: AuditEventListItem[] = auditResult.kind === "ready" ? auditResult.data.events : [];
+  const initialAuditTotal = auditResult.kind === "ready" ? auditResult.data.total : 0;
+  const initialAuditState: { kind: "ready" } | { kind: "error"; reason: "api-unconfigured" | "api-rejected" | "api-unreachable" | "invalid-payload" | "forbidden"; status?: number } =
+    auditResult.kind === "ready"
+      ? { kind: "ready" }
+      : { kind: "error", reason: auditResult.reason, status: auditResult.status };
 
   return (
     <AppShell email={auth.user.email}>
@@ -244,6 +265,23 @@ export default async function ProjectDetailPage({ params }: { params: Promise<Pa
               apiBaseUrl={apiBaseUrl}
               cookieHeader={cookieHeader}
               envValues={envValues}
+            />
+          </CardContent>
+        </Card>
+
+        <Card id="audit-history">
+          <CardHeader>
+            <CardTitle>Audit history</CardTitle>
+            <CardDescription>Privileged actions on this project. Metadata is filtered server-side; only the safe event envelope is shown.</CardDescription>
+          </CardHeader>
+          <CardContent>
+            <ProjectAuditHistoryPanel
+              apiBaseUrl={apiBaseUrl}
+              cookieHeader={cookieHeader}
+              projectId={project.id}
+              initialEvents={initialAuditEvents}
+              initialTotal={initialAuditTotal}
+              initialState={initialAuditState}
             />
           </CardContent>
         </Card>

@@ -48,6 +48,9 @@ importers:
 
   apps/api:
     dependencies:
+      '@deploylite/agent':
+        specifier: workspace:*
+        version: link:../agent
       '@deploylite/config':
         specifier: workspace:*
         version: link:../../packages/config

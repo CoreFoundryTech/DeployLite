@@ -217,3 +217,28 @@ export type SafeAuthUserDto = z.infer<typeof safeAuthUserSchema>;
 export type AuthResponse = z.infer<typeof authResponseSchema>;
 export type BootstrapStatus = z.infer<typeof bootstrapStatusSchema>;
 export type BootstrapInitialAdminRequest = z.infer<typeof bootstrapInitialAdminRequestSchema>;
+
+// Public audit list surface. The metadata column on the audit_events DB row
+// stays a free-form JSONB, but the API response strips it so the UI can never
+// accidentally render secret keys, fingerprints, or any other sensitive
+// detail. The web layer only ever sees this metadata-free shape.
+export const auditEventListItemSchema = z.object({
+  id: idSchema,
+  actorId: z.string().min(1),
+  action: z.string().min(1),
+  targetType: z.string().min(1),
+  targetId: z.string().min(1),
+  requestId: idSchema,
+  correlationId: idSchema,
+  timestamp: isoDateSchema
+});
+
+export const auditEventListPageSchema = z.object({
+  events: z.array(auditEventListItemSchema),
+  total: z.number().int().nonnegative(),
+  limit: z.number().int().positive(),
+  offset: z.number().int().nonnegative()
+});
+
+export type AuditEventListItem = z.infer<typeof auditEventListItemSchema>;
+export type AuditEventListPage = z.infer<typeof auditEventListPageSchema>;

@@ -1,5 +1,6 @@
 import {
   agentSchema,
+  auditEventListPageSchema,
   authResponseSchema,
   bootstrapInitialAdminRequestSchema,
   bootstrapStatusSchema,
@@ -14,6 +15,7 @@ import {
   projectUpdateRequestSchema,
   responseEnvelopeSchema,
   type Agent,
+  type AuditEventListPage,
   type AuthResponse,
   type BootstrapInitialAdminRequest,
   type BootstrapStatus,
@@ -48,7 +50,8 @@ export const metadataApiPaths = {
   projectDeployments: (projectId: string) => `/api/v1/projects/${encodeURIComponent(projectId)}/deployments`,
   deployments: "/api/v1/deployments",
   deployment: (deploymentId: string) => `/api/v1/deployments/${encodeURIComponent(deploymentId)}`,
-  deploymentLogs: (deploymentId: string) => `/api/v1/deployments/${encodeURIComponent(deploymentId)}/logs`
+  deploymentLogs: (deploymentId: string) => `/api/v1/deployments/${encodeURIComponent(deploymentId)}/logs`,
+  auditEvents: "/api/v1/audit-events"
 } as const;
 
 export type AuthApiRequestMethod = "GET" | "POST" | "PATCH" | "DELETE";
@@ -356,6 +359,56 @@ export async function deleteProject(projectId: string, options: LoadAuthSessionO
     }
     return { kind: "deleted" };
   } catch {
+    return { kind: "error", reason: "api-unreachable" };
+  }
+}
+
+export type AuditListFailureReason = "api-unconfigured" | "api-rejected" | "api-unreachable" | "invalid-payload" | "forbidden";
+
+export type AuditListResult =
+  | { kind: "ready"; data: AuditEventListPage; requestId: string }
+  | { kind: "error"; reason: AuditListFailureReason; status?: number };
+
+export type AuditListOptions = {
+  actor?: string;
+  action?: string;
+  projectId?: string;
+  limit?: number;
+  offset?: number;
+};
+
+/**
+ * Fetch the audit event history. The public response shape is metadata-stripped
+ * by API contract, so the web layer never sees secret keys, fingerprints, or
+ * other sensitive detail — only the safe event envelope (id, actor, action,
+ * target, requestId, correlationId, timestamp).
+ *
+ * A 403 from the API (e.g. a read-only session) is surfaced as the
+ * `forbidden` reason so the UI can render an actionable empty state instead
+ * of collapsing it into a generic error.
+ */
+export async function loadAuditEvents(options: LoadAuthSessionOptions & AuditListOptions): Promise<AuditListResult> {
+  if (!options.apiBaseUrl) return { kind: "error", reason: "api-unconfigured" };
+  const url = new URL(metadataApiPaths.auditEvents, options.apiBaseUrl);
+  if (options.actor) url.searchParams.set("actor", options.actor);
+  if (options.action) url.searchParams.set("action", options.action);
+  if (options.projectId) url.searchParams.set("projectId", options.projectId);
+  if (options.limit !== undefined) url.searchParams.set("limit", String(options.limit));
+  if (options.offset !== undefined) url.searchParams.set("offset", String(options.offset));
+  try {
+    const response = await (options.fetchImpl ?? fetch)(url.toString(), {
+      ...createAuthApiRequest({ method: "GET" }),
+      headers: { cookie: options.cookieHeader ?? "" }
+    });
+    if (response.status === 403) {
+      return { kind: "error", reason: "forbidden", status: 403 };
+    }
+    if (!response.ok) {
+      return { kind: "error", reason: "api-rejected", status: response.status };
+    }
+    return parseApiEnvelope(await response.json(), auditEventListPageSchema);
+  } catch (error) {
+    if (error instanceof z.ZodError) return { kind: "error", reason: "invalid-payload" };
     return { kind: "error", reason: "api-unreachable" };
   }
 }

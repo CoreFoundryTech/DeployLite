@@ -1,4 +1,5 @@
 import { createAuditLogRecord, createCorrelationContext, createRequestId, parseDeployLiteEnv, type DeployLiteEnv, createEnvSecretCipher, EnvSecretKeyInvalidError, EnvSecretKeyMissingError, ENCRYPTION_KEY_VERSION, loadEnvSecretKey, type EnvSecretCipher } from "@deploylite/config";
+import { materializeMockDeploy, redactEnvFileForLog, type EncryptedEnvRecord } from "@deploylite/agent";
 import {
   agentRegistrationSchema,
   authLoginRequestSchema,
@@ -33,6 +34,7 @@ import {
   toSafeAuthUser,
   type AuditEvent,
   type AuditEventInput,
+  type AuditEventListItem,
   type AuditRepository,
   type AuthSession,
   type AuthUser,
@@ -240,6 +242,95 @@ class InMemoryAuditRepository implements AuditRepository {
     this.events.push(event);
     return event;
   }
+
+  async list(filter: { actorUserId?: string; action?: string; projectId?: string; limit?: number; offset?: number } = {}): Promise<{ events: AuditEventListItem[]; total: number; limit: number; offset: number }> {
+    const limit = clampListLimit(filter.limit);
+    const offset = clampListOffset(filter.offset);
+    // Mirror the DB behavior: order by timestamp desc so the most recent
+    // event appears first. The DB uses `desc(auditEvents.createdAt)`; the
+    // in-memory mirror sorts by the same field exposed on the API surface
+    // (`timestamp`).
+    const sorted = [...this.events].sort((a, b) => b.timestamp.localeCompare(a.timestamp));
+    const filtered = sorted.filter((event) => matchesAuditFilter(event, this.inputs, filter));
+    return {
+      events: filtered.slice(offset, offset + limit).map(toAuditListItem),
+      total: filtered.length,
+      limit,
+      offset
+    };
+  }
+}
+
+const MAX_AUDIT_LIST_LIMIT = 200;
+const DEFAULT_AUDIT_LIST_LIMIT = 50;
+const MAX_AUDIT_LIST_OFFSET = 10_000;
+
+type AuditListFilter = {
+  actorUserId?: string;
+  action?: string;
+  projectId?: string;
+  limit?: number;
+  offset?: number;
+};
+
+function clampListLimit(raw: number | undefined): number {
+  if (raw === undefined) return DEFAULT_AUDIT_LIST_LIMIT;
+  if (!Number.isInteger(raw) || raw < 1) return 1;
+  if (raw > MAX_AUDIT_LIST_LIMIT) return MAX_AUDIT_LIST_LIMIT;
+  return raw;
+}
+
+function clampListOffset(raw: number | undefined): number {
+  if (raw === undefined) return 0;
+  if (!Number.isInteger(raw) || raw < 0) return 0;
+  if (raw > MAX_AUDIT_LIST_OFFSET) return MAX_AUDIT_LIST_OFFSET;
+  return raw;
+}
+
+function toAuditListItem(event: AuditEvent): AuditEventListItem {
+  return {
+    id: event.id,
+    actorId: event.actorId,
+    action: event.action,
+    targetType: event.targetType,
+    targetId: event.targetId,
+    requestId: event.requestId,
+    correlationId: event.correlationId,
+    timestamp: event.timestamp
+  };
+}
+
+function matchesAuditFilter(event: AuditEvent, inputs: AuditEventInput[], filter: AuditListFilter): boolean {
+  if (filter.actorUserId) {
+    // Mirror the DB behavior: exact match on the persisted actor id. The
+    // API surface resolves null/missing actor to "anonymous" / "system"
+    // on the response, but the filter is applied against the raw
+    // `event.actorId` (which is what the DB's `actorUserId` column would
+    // round-trip to). A `?actor=system` query therefore matches only the
+    // rows that were written with that literal placeholder; the in-memory
+    // path used to fold anonymous/system in unconditionally, which
+    // diverged from the DB and inflated counts.
+    if (event.actorId !== filter.actorUserId) {
+      return false;
+    }
+  }
+  if (filter.action && !event.action.startsWith(filter.action)) {
+    return false;
+  }
+  if (filter.projectId) {
+    const prefix = `${filter.projectId}:`;
+    const matchesTargetPrefix = event.targetId === filter.projectId || event.targetId.startsWith(prefix);
+    if (matchesTargetPrefix) {
+      return true;
+    }
+    // Fall back to the metadata.projectId mirror so events whose targetId is
+    // opaque (e.g. an env_secret_values row id) still get filtered correctly.
+    const input = inputs.find((candidate) => candidate.requestId === event.requestId && candidate.correlationId === event.correlationId);
+    if (!input || !input.metadata || (input.metadata as Record<string, unknown>)["projectId"] !== filter.projectId) {
+      return false;
+    }
+  }
+  return true;
 }
 
 function ok<Data>(request: FastifyRequest, data: Data): ApiEnvelope<Data> {
@@ -375,9 +466,24 @@ function createApiState(env: EnvSecretKeySource, overrides: Partial<PlatformRepo
   const envSecretValues = overrides.envSecretValues ?? new InMemoryEnvSecretValueRepository();
   const envSecretCipher = overrides.envSecretCipher ?? createLazyEnvSecretCipher(env);
   const agentStatus = new AgentStatusService(agents);
-  const deployRunner = new DeployRunner(deployments, envMetadata, agentStatus);
+  const deployRunner = new DeployRunner(deployments, envMetadata, agentStatus, envSecretCipher);
   return { agents, deployments, projects, envMetadata, envSecretValues, envSecretCipher, agentStatus, deployRunner };
 }
+
+/**
+ * Deterministic set of mock env secret values used by the API's
+ * dry-run materialization step. The values are intentionally
+ * harmless (no real credentials) but they exercise the full
+ * encrypt → decrypt → redact pipeline so the agent's
+ * `materializeMockDeploy` is actually wired into the deploy path.
+ * The plaintext is held only for the duration of the encrypt call
+ * and never written to a log or a response — only the redacted
+ * projection reaches the deployment log.
+ */
+const DRY_RUN_MOCK_VALUES: ReadonlyArray<{ key: string; scope: "project" | "deployment"; value: string }> = [
+  { key: "DATABASE_URL", scope: "project", value: "postgres://dry-run:placeholder@db.invalid:5432/dryrun" },
+  { key: "API_KEY", scope: "project", value: "sk_dry_run_placeholder" }
+];
 
 class DeployRunner {
   #sequenceByDeployment = new Map<string, number>();
@@ -386,7 +492,8 @@ class DeployRunner {
   constructor(
     private readonly deployments: DeploymentRepository,
     private readonly envMetadata: EnvVariableMetadataRepository,
-    private readonly agentStatus: AgentStatusService
+    private readonly agentStatus: AgentStatusService,
+    private readonly envSecretCipher?: EnvSecretCipher
   ) {}
 
   /**
@@ -409,6 +516,21 @@ class DeployRunner {
       return { deployment: failed, logs };
     }
 
+    // Dry-run materialization. The agent module's
+    // `materializeMockDeploy` is invoked with a deterministic mock
+    // set of `EncryptedEnvRecord` values, encrypted in-process with
+    // the API's own cipher. The agent then decrypts them, renders a
+    // `.env` string, and `redactEnvFileForLog` collapses every value
+    // to `[REDACTED]` so the plaintext never reaches the log. The
+    // step is wired into the deploy path so the agent module is not
+    // inert (round-1 finding: the helper was defined but never
+    // called). Failures are swallowed — a missing cipher must not
+    // break the deploy — and the deploy still proceeds.
+    const projection = await this.materializeDryRun(project);
+    if (projection) {
+      await this.appendLog(deployment, "info", `Materialized env (mock, redacted):\n${projection}`, requestId, correlationId);
+    }
+
     if (!project.buildCommand) {
       await this.appendLog(deployment, "warn", "No build command configured; skipping build step.", requestId, correlationId);
     } else {
@@ -423,6 +545,40 @@ class DeployRunner {
     this.scheduleAdvance(deployment.id, "running", 50);
     this.scheduleAdvance(deployment.id, "succeeded", 250);
     return { deployment, logs };
+  }
+
+  /**
+   * Build a deterministic mock `EncryptedEnvRecord[]` and round-trip
+   * it through the agent module's `materializeMockDeploy` +
+   * `redactEnvFileForLog` pipeline. The output is the redacted
+   * `.env` projection suitable for the deploy log; plaintext is
+   * never returned. Returns null when no cipher is configured (so
+   * the deploy can still proceed) or when the agent module refuses
+   * to materialize (e.g. key version mismatch).
+   */
+  async materializeDryRun(project: Project): Promise<string | null> {
+    if (!this.envSecretCipher) return null;
+    try {
+      const records: EncryptedEnvRecord[] = DRY_RUN_MOCK_VALUES.map((mock) => {
+        const encryptedValue = Buffer.from(this.envSecretCipher!.encrypt(mock.value), "base64");
+        return {
+          key: mock.key,
+          scope: mock.scope,
+          encryptedValue,
+          valueFingerprint: this.envSecretCipher!.fingerprint(mock.value),
+          keyVersion: ENCRYPTION_KEY_VERSION
+        };
+      });
+      const entry = materializeMockDeploy({
+        projectId: project.id,
+        agentId: "agent_dry_run",
+        records,
+        cipher: this.envSecretCipher
+      });
+      return redactEnvFileForLog(entry.contents);
+    } catch {
+      return null;
+    }
   }
 
   async appendLog(deployment: Deployment, level: "debug" | "info" | "warn" | "error", message: string, requestId: string, correlationId: string) {
@@ -662,6 +818,9 @@ function registerCoreHooks(app: FastifyInstance, corsOrigin: string | null): voi
 function registerRoutes(app: FastifyInstance, state: PlatformRepositories, adapters: AuthAdapters, authConfig: AuthConfig): void {
   const requireAuth = createAuthPreHandler(adapters, authConfig);
   const requireMutationRole = createRolePreHandler(adapters, ["admin", "operator"]);
+  // Audit history is an operator/admin concern. Read-only sessions are denied
+  // by design so a passive role cannot enumerate every project + key change.
+  const requireAuditReadRole = createRolePreHandler(adapters, ["admin", "operator"]);
 
   app.get(`${API_PREFIX}/health`, async (request) => ok(request, { status: "ok", service: "deploylite-api", auth: "cookie-session" }));
   app.get(`${API_PREFIX}/bootstrap/status`, async (request) => ok(request, await getBootstrapStatus(adapters.users)));
@@ -1007,6 +1166,45 @@ function registerRoutes(app: FastifyInstance, state: PlatformRepositories, adapt
     return deployment ? ok(request, { deployment }) : reply.code(404).send(errorEnvelope(request, "NOT_FOUND", "Deployment not found."));
   });
   app.get(`${API_PREFIX}/deployments`, { preHandler: requireAuth }, async (request) => ok(request, { deployments: await state.deployments.list() }));
+  // Audit history list — operator/admin only. The response shape strips
+  // per-row metadata so the API can never echo secret keys, fingerprints, or
+  // other sensitive detail by accident (Task 4.6: safe metadata only).
+  app.get(`${API_PREFIX}/audit-events`, { preHandler: [requireAuth, requireAuditReadRole] }, async (request, reply) => {
+    const raw = (request.query ?? {}) as Record<string, unknown>;
+    const parsed = z
+      .object({
+        actor: z.string().min(1).max(128).optional(),
+        action: z.string().min(1).max(128).optional(),
+        projectId: z.string().min(1).max(128).optional(),
+        limit: z.coerce.number().int().min(1).max(MAX_AUDIT_LIST_LIMIT).optional(),
+        offset: z.coerce.number().int().min(0).max(MAX_AUDIT_LIST_OFFSET).optional()
+      })
+      .safeParse({
+        actor: typeof raw["actor"] === "string" && raw["actor"].length > 0 ? raw["actor"] : undefined,
+        action: typeof raw["action"] === "string" && raw["action"].length > 0 ? raw["action"] : undefined,
+        projectId: typeof raw["projectId"] === "string" && raw["projectId"].length > 0 ? raw["projectId"] : undefined,
+        limit: typeof raw["limit"] === "string" && raw["limit"].length > 0 ? raw["limit"] : undefined,
+        offset: typeof raw["offset"] === "string" && raw["offset"].length > 0 ? raw["offset"] : undefined
+      });
+    if (!parsed.success) {
+      await appendAudit(adapters.audit, request, {
+        actorUserId: request.auth?.user.id ?? null,
+        action: "audit.list.rejected",
+        targetType: "audit_events",
+        targetId: "list",
+        metadata: { reason: "invalid-query" }
+      });
+      return reply.code(400).send(errorEnvelope(request, "VALIDATION_ERROR", "Invalid audit-events query parameters."));
+    }
+    const page = await adapters.audit.list({
+      actorUserId: parsed.data.actor,
+      action: parsed.data.action,
+      projectId: parsed.data.projectId,
+      limit: parsed.data.limit,
+      offset: parsed.data.offset
+    });
+    return ok(request, page);
+  });
   app.get(`${API_PREFIX}/deployments/:deploymentId/logs`, { preHandler: requireAuth }, async (request) => {
     const params = z.object({ deploymentId: z.string().min(1) }).parse(request.params);
     return ok(request, { events: await state.deployments.listLogs(params.deploymentId) });
