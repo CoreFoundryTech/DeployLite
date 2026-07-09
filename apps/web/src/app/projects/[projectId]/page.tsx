@@ -1,17 +1,23 @@
 import Link from "next/link";
 import { cookies } from "next/headers";
-import { getAuthApiBaseUrl } from "@/lib/auth-boundary";
-import { loadRequestAuthSession, loadRequestProjectDetailMetadata } from "@/lib/server-auth";
+import { getAuthApiBaseUrl, loadAuditEvents } from "@/lib/auth-boundary";
+import {
+  loadRequestAuthSession,
+  loadRequestProjectDetailMetadata,
+  loadRequestProjectEnvValues
+} from "@/lib/server-auth";
 import { ProjectConfigEditForm } from "./project-config-edit-form";
 import { ProjectDetailActions } from "./project-detail-actions";
 import { ProjectDeleteDialog } from "@/components/project-delete-dialog";
+import { ProjectAuditHistoryPanel } from "./project-audit-history-panel";
+import { ProjectEnvValuesTable } from "@/components/project-env-values-table";
 import { AppShell } from "@/components/app-shell";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card";
 import { Separator } from "@/components/ui/separator";
 import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from "@/components/ui/table";
-import type { Deployment, EnvVariableMetadata, Project } from "@deploylite/contracts";
+import type { AuditEventListItem, Deployment, EnvSecretValue, EnvVariableMetadata, Project } from "@deploylite/contracts";
 
 export const dynamic = "force-dynamic";
 
@@ -38,7 +44,20 @@ export default async function ProjectDetailPage({ params }: { params: Promise<Pa
     );
   }
 
-  const result = await loadRequestProjectDetailMetadata(projectId);
+  // Read the request cookie header once (B2) and reuse it for every downstream
+  // metadata loader and client component. Awaiting cookies() multiple times —
+  // once per request loader plus once for the client props — is wasteful and
+  // forces a sequential waterfall (B1). A single read paired with Promise.all
+  // parallelizes the detail payload and the env-values payload.
+  const cookieStore = await cookies();
+  const cookieHeader = cookieStore.getAll().map((c) => `${c.name}=${c.value}`).join("; ");
+  const apiBaseUrl = getAuthApiBaseUrl();
+
+  const [result, envValuesResult] = await Promise.all([
+    loadRequestProjectDetailMetadata(projectId),
+    loadRequestProjectEnvValues(projectId)
+  ]);
+
   if (result.kind === "error") {
     if (result.status === 404) {
       return (
@@ -73,9 +92,28 @@ export default async function ProjectDetailPage({ params }: { params: Promise<Pa
   const launchChecklist = buildLaunchChecklist(project, envVariables, deployments);
   const latestDeployment = getLatestDeployment(deployments);
   const readyCount = launchChecklist.filter((item) => item.state === "ready").length;
-  const cookieStore = await cookies();
-  const cookieHeader = cookieStore.getAll().map((c) => `${c.name}=${c.value}`).join("; ");
-  const apiBaseUrl = getAuthApiBaseUrl();
+
+  // Env secret values (encrypted-at-rest) degrade gracefully if the call fails
+  // (e.g. encryption key unconfigured) so the rest of the page still renders.
+  // The table itself handles the empty / errored list states.
+  const envValues: EnvSecretValue[] = envValuesResult.kind === "ready" ? envValuesResult.data.envValues : [];
+
+  // Audit history is loaded alongside the project detail so the panel can
+  // render without a second client roundtrip. The list is metadata-stripped
+  // server-side, so we only ever see the safe envelope.
+  const auditResult = await loadAuditEvents({
+    apiBaseUrl: apiBaseUrl ?? undefined,
+    cookieHeader,
+    projectId: project.id,
+    limit: 50,
+    offset: 0
+  });
+  const initialAuditEvents: AuditEventListItem[] = auditResult.kind === "ready" ? auditResult.data.events : [];
+  const initialAuditTotal = auditResult.kind === "ready" ? auditResult.data.total : 0;
+  const initialAuditState: { kind: "ready" } | { kind: "error"; reason: "api-unconfigured" | "api-rejected" | "api-unreachable" | "invalid-payload" | "forbidden"; status?: number } =
+    auditResult.kind === "ready"
+      ? { kind: "ready" }
+      : { kind: "error", reason: auditResult.reason, status: auditResult.status };
 
   return (
     <AppShell email={auth.user.email}>
@@ -213,6 +251,40 @@ export default async function ProjectDetailPage({ params }: { params: Promise<Pa
             />
           </div>
         </div>
+
+        <Card id="env-values">
+          <CardHeader>
+            <CardTitle>Env secret values</CardTitle>
+            <CardDescription>
+              Encrypted at rest. The UI never receives the raw value — only a fingerprint, scope, and timestamps. Paste a new value to set or rotate; the previous value is overwritten.
+            </CardDescription>
+          </CardHeader>
+          <CardContent>
+            <ProjectEnvValuesTable
+              projectId={project.id}
+              apiBaseUrl={apiBaseUrl}
+              cookieHeader={cookieHeader}
+              envValues={envValues}
+            />
+          </CardContent>
+        </Card>
+
+        <Card id="audit-history">
+          <CardHeader>
+            <CardTitle>Audit history</CardTitle>
+            <CardDescription>Privileged actions on this project. Metadata is filtered server-side; only the safe event envelope is shown.</CardDescription>
+          </CardHeader>
+          <CardContent>
+            <ProjectAuditHistoryPanel
+              apiBaseUrl={apiBaseUrl}
+              cookieHeader={cookieHeader}
+              projectId={project.id}
+              initialEvents={initialAuditEvents}
+              initialTotal={initialAuditTotal}
+              initialState={initialAuditState}
+            />
+          </CardContent>
+        </Card>
       </div>
     </AppShell>
   );

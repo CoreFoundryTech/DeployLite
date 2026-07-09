@@ -1,4 +1,4 @@
-import type { Agent, AgentHeartbeat, Deployment, EnvVariableMetadata, LogEvent, Project, ScaffoldUser } from "@deploylite/contracts";
+import type { Agent, AgentHeartbeat, Deployment, EnvSecretValue, EnvVariableMetadata, LogEvent, Project, ScaffoldUser } from "@deploylite/contracts";
 import { redactLogMessage } from "@deploylite/config";
 
 export const canonicalRoleNames = ["admin", "operator", "read-only", "auditor"] as const;
@@ -71,6 +71,31 @@ export type AuditEvent = {
   timestamp: string;
 };
 
+/**
+ * Public, metadata-free list shape for the audit events API. The list surface
+ * intentionally omits the per-row `metadata` object so the GET response can
+ * never echo secret keys, fingerprints, or any other sensitive detail by
+ * accident. The metadata is still persisted on each event for the in-memory
+ * `inputs` mirror and DB row, but the API only returns it to the caller if a
+ * future, narrower endpoint opts in.
+ */
+export type AuditEventListItem = Pick<AuditEvent, "id" | "actorId" | "action" | "targetType" | "targetId" | "requestId" | "correlationId" | "timestamp">;
+
+export type AuditEventListFilter = {
+  actorUserId?: string;
+  action?: string;
+  projectId?: string;
+  limit?: number;
+  offset?: number;
+};
+
+export type AuditEventListPage = {
+  events: AuditEventListItem[];
+  total: number;
+  limit: number;
+  offset: number;
+};
+
 export type AgentRepository = {
   save(agent: Agent): Promise<Agent>;
   findById(id: string): Promise<Agent | null>;
@@ -98,6 +123,23 @@ export type EnvVariableMetadataRepository = {
   listByProject(projectId: string): Promise<EnvVariableMetadataRecord[]>;
   upsert(record: EnvVariableMetadataRecord): Promise<EnvVariableMetadataRecord>;
   remove(projectId: string, key: string, scope: EnvVariableMetadataRecord["scope"]): Promise<boolean>;
+};
+
+export type EnvSecretValueRecord = EnvSecretValue;
+
+export type EnvSecretValueInput = {
+  projectId: string;
+  key: string;
+  scope: EnvSecretValueRecord["scope"];
+  encryptedValue: Buffer;
+  valueFingerprint: string;
+  keyVersion: number;
+};
+
+export type EnvSecretValueRepository = {
+  listByProject(projectId: string): Promise<EnvSecretValueRecord[]>;
+  upsert(record: EnvSecretValueInput): Promise<EnvSecretValueRecord>;
+  remove(projectId: string, key: string, scope: EnvSecretValueRecord["scope"]): Promise<boolean>;
 };
 
 export type UserRepository = {
@@ -131,6 +173,7 @@ export type SessionRepository = {
 
 export type AuditRepository = {
   append(input: AuditEventInput): Promise<AuditEvent>;
+  list(filter?: AuditEventListFilter): Promise<AuditEventListPage>;
 };
 
 export type PasswordHasher = {
@@ -267,6 +310,52 @@ export class InMemoryEnvVariableMetadataRepository implements EnvVariableMetadat
   }
 
   async remove(projectId: string, key: string, scope: EnvVariableMetadataRecord["scope"]): Promise<boolean> {
+    return this.#records.delete(this.#key(projectId, key, scope));
+  }
+}
+
+export class InMemoryEnvSecretValueRepository implements EnvSecretValueRepository {
+  readonly #records = new Map<string, EnvSecretValueRecord>();
+  #seq = 0;
+
+  #key(projectId: string, key: string, scope: EnvSecretValueRecord["scope"]): string {
+    return `${projectId}::${scope}::${key}`;
+  }
+
+  async listByProject(projectId: string): Promise<EnvSecretValueRecord[]> {
+    return [...this.#records.values()]
+      .filter((record) => record.projectId === projectId)
+      .map((record) => ({ ...record }));
+  }
+
+  async upsert(record: EnvSecretValueInput): Promise<EnvSecretValueRecord> {
+    if (!Buffer.isBuffer(record.encryptedValue) || record.encryptedValue.length === 0) {
+      throw new Error("env secret value encryptedValue must be a non-empty Buffer");
+    }
+    if (typeof record.valueFingerprint !== "string" || record.valueFingerprint.length === 0) {
+      throw new Error("env secret value valueFingerprint must be a non-empty string");
+    }
+    if (!Number.isInteger(record.keyVersion) || record.keyVersion <= 0) {
+      throw new Error("env secret value keyVersion must be a positive integer");
+    }
+    const now = new Date().toISOString();
+    const existing = this.#records.get(this.#key(record.projectId, record.key, record.scope));
+    const next: EnvSecretValueRecord = {
+      id: existing?.id ?? `envv_${++this.#seq}`,
+      projectId: record.projectId,
+      key: record.key,
+      scope: record.scope,
+      valuePresent: true,
+      valueFingerprint: record.valueFingerprint,
+      keyVersion: record.keyVersion,
+      createdAt: existing?.createdAt ?? now,
+      updatedAt: now
+    };
+    this.#records.set(this.#key(record.projectId, record.key, record.scope), next);
+    return { ...next };
+  }
+
+  async remove(projectId: string, key: string, scope: EnvSecretValueRecord["scope"]): Promise<boolean> {
     return this.#records.delete(this.#key(projectId, key, scope));
   }
 }

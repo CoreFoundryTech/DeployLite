@@ -36,4 +36,26 @@ describe("redaction helpers", () => {
 
     expect(record.metadata).toEqual({ authorization: "[REDACTED]" });
   });
+
+  it("preserves non-reversible identifiers such as hex fingerprints, checksums, and UUIDs", () => {
+    const fingerprint = "abcdef0123456789abcdef0123456789";
+    const checksum = "9f86d081884c7d659a2feaa0c55ad015a3bf4f1b2b0b822cd15d6c15b0f00a08";
+    const uuid = "123e4567-e89b-12d3-a456-426614174000";
+
+    const redacted = redactSecrets({
+      valueFingerprint: fingerprint,
+      valueChecksum: checksum,
+      sha256: checksum,
+      deploymentId: uuid,
+      unrelated: "x".repeat(64)
+    });
+
+    expect(redacted).toEqual({
+      valueFingerprint: fingerprint,
+      valueChecksum: checksum,
+      sha256: checksum,
+      deploymentId: uuid,
+      unrelated: "[REDACTED]"
+    });
+  });
 });

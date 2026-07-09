@@ -1,8 +1,91 @@
 # DeployLite
 
-Initial scaffold for DeployLite, a self-hosted deployment platform. This chain establishes TypeScript workspace boundaries, shared contracts, domain foundations, mock API/web/agent surfaces, and read-only MCP tools only.
+**DeployLite is a lightweight, self-hosted deployment control plane built for small teams, solo builders, and AI-assisted development workflows.** It aims to make a clean VPS feel like a simple deployment target: install once, create an owner account, connect a project, manage environment values safely, and let an agent handle the deployment work.
 
-The current auth foundation is intentionally narrow: API sessions are opaque HttpOnly cookies with canonical roles. The first VPS slice now provides Docker images, Compose wiring, and a local plug-and-play installer. TLS, domains, Traefik, and deployment-agent behavior remain deferred.
+DeployLite is intentionally smaller than a platform like Dokploy, Coolify, or a full Kubernetes stack. The goal is not to become another heavy platform. The goal is to provide a clear, hackable, AI-friendly deployment layer that is easy to inspect, easy to automate, and safe enough to run on a modest VPS.
+
+## Why DeployLite?
+
+- **Lightweight by default** — designed for one VPS, one Postgres database, and a small set of services.
+- **AI-first operations** — includes read-only MCP tooling and API boundaries that are safe for agents to inspect before they act.
+- **Self-hosted and transparent** — no hidden control plane; the code, migrations, installer, and runtime are in this repository.
+- **Operator-safe secrets** — environment values are stored encrypted, shown as metadata/fingerprints, and never returned as plaintext.
+- **Reviewable architecture** — TypeScript monorepo, shared contracts, explicit domain boundaries, and tests for every slice.
+
+## Project status
+
+DeployLite is under active build-out. The installer, owner setup, project configuration, encrypted environment value foundation, masked env UI, and audit/materialization work are in progress through small chained PRs.
+
+| Area | Status |
+|---|---|
+| VPS installer | Implemented and tested for HTTP-first setup. |
+| First-owner setup | Implemented with cookie sessions and RBAC. |
+| Project configuration | Implemented for create/edit/delete and app metadata. |
+| Encrypted env values | In progress on the `feat/env-secrets-ui` tracker branch. |
+| Real deployment executor | Planned next; current deployment flow is still mock/control-plane oriented. |
+| Domains, Traefik, ACME/HTTPS | Planned; not enabled by default yet. |
+| MCP tools | Read-only status/deployment/log inspection. |
+
+> **Important:** until the real deployment executor and VPS smoke phases are complete, treat DeployLite as an installable control-plane build, not a finished production deploy platform.
+
+## Quick start on a VPS
+
+For a clean Ubuntu/Debian VPS, the reviewed bootstrap path is:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/CoreFoundryTech/DeployLite/main/scripts/bootstrap.sh | sudo bash
+```
+
+For a stable public IP or hostname, pass it explicitly:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/CoreFoundryTech/DeployLite/main/scripts/bootstrap.sh | sudo DEPLOYLITE_PUBLIC_HOST=<ip-or-host> bash
+```
+
+After installation, open the printed URL and create the first owner account. There are no default admin credentials.
+
+## AI-assisted workflow
+
+DeployLite is designed so AI tools can help operate it without getting broad destructive power by default:
+
+- MCP tools are read-only.
+- Secret-like values pass through shared redaction helpers before leaving a boundary.
+- Deployment control surfaces are split so the API/web/MCP layers do not need direct Docker socket access.
+- Agent-facing work is developed in isolated, reviewable slices before host mutation is enabled.
+
+This is the architectural point: **AI can inspect, summarize, and recommend first; privileged execution stays gated and explicit.**
+
+## Current architecture
+
+DeployLite is a private TypeScript monorepo today, structured so the repository can be opened later without leaking local AI/tooling artifacts.
+
+- `apps/api` — Fastify control-plane API.
+- `apps/web` — Next.js 15 App Router UI.
+- `apps/agent` — deployment agent surface; real executor work is still gated.
+- `apps/mcp` — read-only MCP adapter.
+- `packages/config` — environment parsing, redaction, crypto helpers.
+- `packages/contracts` — shared Zod contracts.
+- `packages/db` — PostgreSQL schema, migrations, repositories.
+- `packages/domain` — domain ports and use-case types.
+
+## Safety guardrails
+
+- API, web, and MCP do not get direct host mutation powers by default.
+- MCP tools are read-only and non-destructive: `deploylite_get_server_status`, `deploylite_list_deployments`, and `deploylite_get_deployment_logs`.
+- Auth is an MVP cookie-session boundary for local administration. It is not a production hardening claim yet.
+- Secret-like values must pass through shared redaction helpers before leaving a boundary.
+- Traefik, ACME, production auth claims, and real Docker execution remain gated until their dedicated phases land.
+
+## Development checks
+
+```bash
+pnpm install
+pnpm --filter @deploylite/db db:check
+pnpm --filter @deploylite/web test
+pnpm check
+```
+
+`pnpm check` runs build, lint/typecheck, and tests across the workspace. Integration checks that require a live PostgreSQL instance are opt-in so the default workflow stays deterministic.
 
 ## Scaffold chain
 

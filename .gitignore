@@ -8,4 +8,17 @@ coverage/
 .env.*
 !.env.example
 .DS_Store
+
+# Local AI / agent tooling artifacts
 .codegraph/
+.atl/
+.claude/
+.codex/
+.opencode/
+.cursor/
+.continue/
+.aider*
+
+# Local/private planning documents
+PRD - DeployLite.pdf
+*.rtf

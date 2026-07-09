@@ -1,8 +1,11 @@
-import { and, count as sqlCount, eq, gt, isNull, sql } from "drizzle-orm";
+import { and, count as sqlCount, desc, eq, gt, isNull, like, or, sql } from "drizzle-orm";
 import { redactSecrets } from "@deploylite/config";
 import type {
   AuditEvent,
   AuditEventInput,
+  AuditEventListFilter,
+  AuditEventListItem,
+  AuditEventListPage,
   AuditRepository,
   AuthRole,
   AuthSession,
@@ -135,6 +138,10 @@ export class DbSessionRepository implements SessionRepository {
   }
 }
 
+const MAX_DB_AUDIT_LIMIT = 200;
+const DEFAULT_DB_AUDIT_LIMIT = 50;
+const MAX_DB_AUDIT_OFFSET = 10_000;
+
 export class DbAuditRepository implements AuditRepository {
   constructor(private readonly db: DeployLiteDb) {}
 
@@ -158,6 +165,82 @@ export class DbAuditRepository implements AuditRepository {
 
     return toAuditEvent(created);
   }
+
+  async list(filter: AuditEventListFilter = {}): Promise<AuditEventListPage> {
+    const limit = clampDbLimit(filter.limit);
+    const offset = clampDbOffset(filter.offset);
+    const conditions = [];
+    if (filter.actorUserId) {
+      conditions.push(eq(auditEvents.actorUserId, filter.actorUserId));
+    }
+    if (filter.action) {
+      // action filter is a prefix match (e.g. "project.env-value") so the
+      // client can scope to a logical group without enumerating every action.
+      conditions.push(like(auditEvents.action, `${filter.action}%`));
+    }
+    if (filter.projectId) {
+      const targetId = `${filter.projectId}`;
+      const targetPrefix = `${filter.projectId}:`;
+      // Either the row's target_id is the project id directly, or it starts
+      // with `<projectId>:` (the convention used for env-value and
+      // env-metadata actions), or the JSON metadata column carries a
+      // `projectId` property (used by events whose target_id is opaque, e.g.
+      // the env_secret_values row id).
+      const targetCondition = or(eq(auditEvents.targetId, targetId), like(auditEvents.targetId, `${targetPrefix}%`));
+      const metadataCondition = sql`${auditEvents.metadata} ->> 'projectId' = ${filter.projectId}`;
+      conditions.push(or(targetCondition, metadataCondition));
+    }
+    const where = conditions.length === 0 ? undefined : conditions.length === 1 ? conditions[0] : and(...conditions);
+
+    const [rows, totalRow] = await Promise.all([
+      this.db
+        .select()
+        .from(auditEvents)
+        .where(where)
+        .orderBy(desc(auditEvents.createdAt))
+        .limit(limit)
+        .offset(offset),
+      this.db
+        .select({ value: sqlCount() })
+        .from(auditEvents)
+        .where(where)
+    ]);
+
+    const total = Number(totalRow[0]?.value ?? 0);
+    return {
+      events: rows.map(toAuditListItem),
+      total,
+      limit,
+      offset
+    };
+  }
+}
+
+function clampDbLimit(raw: number | undefined): number {
+  if (raw === undefined) return DEFAULT_DB_AUDIT_LIMIT;
+  if (!Number.isInteger(raw) || raw < 1) return 1;
+  if (raw > MAX_DB_AUDIT_LIMIT) return MAX_DB_AUDIT_LIMIT;
+  return raw;
+}
+
+function clampDbOffset(raw: number | undefined): number {
+  if (raw === undefined) return 0;
+  if (!Number.isInteger(raw) || raw < 0) return 0;
+  if (raw > MAX_DB_AUDIT_OFFSET) return MAX_DB_AUDIT_OFFSET;
+  return raw;
+}
+
+function toAuditListItem(row: AuditEventRow): AuditEventListItem {
+  return {
+    id: row.id,
+    actorId: row.actorUserId === null ? "anonymous" : row.actorUserId ?? "system",
+    action: row.action,
+    targetType: row.targetType,
+    targetId: row.targetId,
+    requestId: row.requestId,
+    correlationId: row.correlationId,
+    timestamp: row.createdAt.toISOString()
+  };
 }
 
 export function normalizeEmail(email: string): string {
