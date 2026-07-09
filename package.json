@@ -1,6 +1,7 @@
 {
   "name": "deploylite",
   "version": "0.1.0",
+  "description": "Lightweight self-hosted deployment control plane for AI-assisted VPS workflows.",
   "private": true,
   "type": "module",
   "packageManager": "pnpm@9.15.4",
