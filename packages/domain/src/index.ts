@@ -1,4 +1,4 @@
-import type { Agent, AgentHeartbeat, Deployment, EnvSecretValue, EnvVariableMetadata, LogEvent, Project, ScaffoldUser } from "@deploylite/contracts";
+import type { Agent, AgentHeartbeat, Deployment, DeploymentCommand, DeploymentCommandKind, DeploymentCommandState, EnvSecretValue, EnvVariableMetadata, LogEvent, Project, ScaffoldUser } from "@deploylite/contracts";
 import { redactLogMessage } from "@deploylite/config";
 
 export const canonicalRoleNames = ["admin", "operator", "read-only", "auditor"] as const;
@@ -102,6 +102,12 @@ export type AgentRepository = {
   list(): Promise<Agent[]>;
 };
 
+// Re-exported for the executor port: the deployment executor
+// operates on a `Deployment` and resolves a `Project` from the
+// command payload. Both types live in `@deploylite/contracts` so
+// the API and the (future) agent share one source of truth.
+export type { Deployment, Project } from "@deploylite/contracts";
+
 export type DeploymentRepository = {
   save(deployment: Deployment): Promise<Deployment>;
   findById(id: string): Promise<Deployment | null>;
@@ -109,6 +115,108 @@ export type DeploymentRepository = {
   appendLog(event: LogEvent): Promise<LogEvent>;
   listLogs(deploymentId: string, afterSequence?: number): Promise<LogEvent[]>;
 };
+
+// =====================================================================
+// Deployment command bus port.
+//
+// Slice 1 introduces the typed control-plane surface that will eventually
+// carry cancel / restart / rollback commands from the API to the (real)
+// deployment agent. The port is intentionally socket-free: the only
+// side effects are the `DeploymentCommandRepository` write path and the
+// in-process event listener registry. The agent is the consumer (the
+// `DeploymentExecutor` in `apps/api/src/commands` for now; the real
+// agent in a later slice) and the only component that owns the privileged
+// execution path.
+// =====================================================================
+
+export type DeploymentCommandRecord = DeploymentCommand;
+
+export type DeploymentCommandEventType =
+  | "deployment.command.submitted"
+  | "deployment.command.claimed"
+  | "deployment.command.completed"
+  | "deployment.command.failed"
+  | "deployment.command.cancelled";
+
+export type DeploymentCommandEvent = {
+  type: DeploymentCommandEventType;
+  command: DeploymentCommandRecord;
+  occurredAt: string;
+};
+
+export type DeploymentCommandEventListener = (event: DeploymentCommandEvent) => void | Promise<void>;
+
+export type DeploymentCommandBusSubmitInput = {
+  deploymentId: string;
+  agentId: string;
+  kind: DeploymentCommandKind;
+  payload?: Record<string, unknown>;
+  requestedBy: string | null;
+  requestId: string;
+  correlationId: string;
+};
+
+export type DeploymentCommandBus = {
+  submit(input: DeploymentCommandBusSubmitInput): Promise<DeploymentCommandRecord>;
+  claim(commandId: string, agentId: string): Promise<DeploymentCommandRecord | null>;
+  complete(commandId: string, output?: Record<string, unknown>): Promise<DeploymentCommandRecord | null>;
+  fail(commandId: string, reason: string): Promise<DeploymentCommandRecord | null>;
+  cancel(commandId: string, requestedBy: string | null): Promise<DeploymentCommandRecord | null>;
+  list(): Promise<DeploymentCommandRecord[]>;
+  findById(commandId: string): Promise<DeploymentCommandRecord | null>;
+  findActiveForDeployment(deploymentId: string): Promise<DeploymentCommandRecord | null>;
+  dispatch(command: DeploymentCommandRecord): Promise<DeploymentCommandRecord | null>;
+  onEvent(listener: DeploymentCommandEventListener): () => void;
+};
+
+export type DeploymentExecutor = {
+  /**
+   * Drive the side effects for a freshly-claimed deployment command.
+   * The executor is the ONLY component allowed to mutate the
+   * deployment status, append deployment logs, or touch the host. The
+   * bus dispatches `execute` after a successful `claim`; the executor
+   * is responsible for calling `complete` / `fail` on the bus when it
+   * finishes.
+   */
+  execute(command: DeploymentCommandRecord): Promise<void>;
+  cancelTimers(): void;
+};
+
+export type DeploymentCommandRepository = {
+  save(command: DeploymentCommandRecord): Promise<DeploymentCommandRecord>;
+  findById(id: string): Promise<DeploymentCommandRecord | null>;
+  findActiveForDeployment(deploymentId: string): Promise<DeploymentCommandRecord | null>;
+  list(): Promise<DeploymentCommandRecord[]>;
+};
+
+// =====================================================================
+// Public helpers around the deployment command state machine.
+//
+// The state machine is intentionally strict: only the documented
+// transitions are accepted, every other request returns the existing
+// row unchanged. This keeps the API surface idempotent and lets
+// later slices (cancel / restart / rollback UI) reuse the same rules.
+// =====================================================================
+
+const ALLOWED_COMMAND_TRANSITIONS: Readonly<Record<DeploymentCommandState, ReadonlyArray<DeploymentCommandState>>> = {
+  pending: ["claimed", "cancelled", "failed"],
+  claimed: ["completed", "failed", "cancelled"],
+  completed: [],
+  cancelled: [],
+  failed: []
+};
+
+export function isDeploymentCommandTransitionAllowed(from: DeploymentCommandState, to: DeploymentCommandState): boolean {
+  if (from === to) return true;
+  return ALLOWED_COMMAND_TRANSITIONS[from].includes(to);
+}
+
+export class IllegalDeploymentCommandTransitionError extends Error {
+  constructor(public readonly from: DeploymentCommandState, public readonly to: DeploymentCommandState, public readonly commandId: string) {
+    super(`Illegal deployment command transition for ${commandId}: ${from} -> ${to}`);
+    this.name = "IllegalDeploymentCommandTransitionError";
+  }
+}
 
 export type ProjectRepository = {
   save(project: Project): Promise<Project>;
@@ -289,6 +397,34 @@ export class InMemoryDeploymentRepository implements DeploymentRepository {
 
   async listLogs(deploymentId: string, afterSequence = -1): Promise<LogEvent[]> {
     return (this.#logs.get(deploymentId) ?? []).filter((event) => event.sequence > afterSequence);
+  }
+}
+
+export class InMemoryDeploymentCommandRepository implements DeploymentCommandRepository {
+  readonly #commands = new Map<string, DeploymentCommandRecord>();
+
+  async save(command: DeploymentCommandRecord): Promise<DeploymentCommandRecord> {
+    const clone = structuredClone(command);
+    this.#commands.set(clone.id, clone);
+    return clone;
+  }
+
+  async findById(id: string): Promise<DeploymentCommandRecord | null> {
+    const existing = this.#commands.get(id);
+    return existing ? structuredClone(existing) : null;
+  }
+
+  async findActiveForDeployment(deploymentId: string): Promise<DeploymentCommandRecord | null> {
+    for (const command of this.#commands.values()) {
+      if (command.deploymentId === deploymentId && (command.state === "pending" || command.state === "claimed")) {
+        return structuredClone(command);
+      }
+    }
+    return null;
+  }
+
+  async list(): Promise<DeploymentCommandRecord[]> {
+    return [...this.#commands.values()].map((command) => structuredClone(command));
   }
 }
 

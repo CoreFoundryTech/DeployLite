@@ -3,6 +3,10 @@ import {
   agentHeartbeatSchema,
   bootstrapInitialAdminRequestSchema,
   bootstrapStatusSchema,
+  deploymentCommandEventTypeSchema,
+  deploymentCommandKindSchema,
+  deploymentCommandSchema,
+  deploymentCommandStateSchema,
   envSecretValueDeleteRequestSchema,
   envSecretValueSchema,
   envSecretValueWriteRequestSchema,
@@ -215,5 +219,61 @@ describe("contracts", () => {
     expect(parsed).toEqual({ key: "DATABASE_URL", scope: "project" });
     const explicit = envSecretValueDeleteRequestSchema.parse({ key: "DATABASE_URL", scope: "deployment" });
     expect(explicit.scope).toBe("deployment");
+  });
+
+  it("exposes the deployment command bus state and kind enums and rejects unknown values", () => {
+    expect(deploymentCommandStateSchema.options).toEqual(["pending", "claimed", "completed", "cancelled", "failed"]);
+    expect(deploymentCommandKindSchema.options).toEqual(["start", "cancel", "restart", "rollback"]);
+
+    expect(deploymentCommandStateSchema.safeParse("queued").success).toBe(false);
+    expect(deploymentCommandKindSchema.safeParse("teardown").success).toBe(false);
+  });
+
+  it("parses a well-formed deployment command and rejects commands missing request context", () => {
+    const now = "2026-01-01T00:00:00.000Z";
+    const parsed = deploymentCommandSchema.parse({
+      id: "cmd_1",
+      deploymentId: "dep_1",
+      agentId: "agent_1",
+      kind: "start",
+      state: "pending",
+      payload: { commitSha: "abcdef1" },
+      requestedBy: null,
+      requestId: "req_1",
+      correlationId: "corr_1",
+      issuedAt: now,
+      claimedAt: null,
+      completedAt: null,
+      failureReason: null
+    });
+
+    expect(parsed.state).toBe("pending");
+    expect(parsed.payload).toEqual({ commitSha: "abcdef1" });
+
+    const missingContext = deploymentCommandSchema.safeParse({
+      id: "cmd_2",
+      deploymentId: "dep_1",
+      agentId: "agent_1",
+      kind: "start",
+      state: "pending",
+      payload: {},
+      requestedBy: null,
+      issuedAt: now,
+      claimedAt: null,
+      completedAt: null,
+      failureReason: null
+    });
+    expect(missingContext.success).toBe(false);
+  });
+
+  it("exposes the deployment command bus event type enum covering the lifecycle transitions", () => {
+    expect(deploymentCommandEventTypeSchema.options).toEqual([
+      "deployment.command.submitted",
+      "deployment.command.claimed",
+      "deployment.command.completed",
+      "deployment.command.failed",
+      "deployment.command.cancelled"
+    ]);
+    expect(deploymentCommandEventTypeSchema.safeParse("deployment.command.unknown").success).toBe(false);
   });
 });

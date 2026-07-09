@@ -177,6 +177,53 @@ export const deploymentSchema = z.object({
   finishedAt: isoDateSchema.nullable()
 });
 
+// =====================================================================
+// Deployment command bus contracts.
+//
+// The command bus is the control-plane channel that lets the API publish
+// deployment intent (start / cancel / restart / rollback) and lets an
+// agent (or a mock executor) claim and resolve them. The API/web/MCP
+// surface never touches Docker, the host shell, or any socket directly:
+// commands flow through the bus and the executor is the only component
+// that owns the privileged side effects. The schema below is the
+// serialized shape; the lifecycle invariants are documented at the
+// bus port (`DeploymentCommandBus` in `packages/domain`).
+//
+// State machine:
+//   pending  -> claimed   -> completed
+//                        -> failed
+//           -> cancelled
+//   claimed  -> cancelled (handled by the executor mid-flight)
+// =====================================================================
+
+export const deploymentCommandStateSchema = z.enum(["pending", "claimed", "completed", "cancelled", "failed"]);
+
+export const deploymentCommandKindSchema = z.enum(["start", "cancel", "restart", "rollback"]);
+
+export const deploymentCommandSchema = z.object({
+  id: idSchema,
+  deploymentId: idSchema,
+  agentId: idSchema,
+  kind: deploymentCommandKindSchema,
+  state: deploymentCommandStateSchema,
+  payload: z.record(z.unknown()).default({}),
+  requestedBy: idSchema.nullable(),
+  requestId: idSchema,
+  correlationId: idSchema,
+  issuedAt: isoDateSchema,
+  claimedAt: isoDateSchema.nullable(),
+  completedAt: isoDateSchema.nullable(),
+  failureReason: z.string().nullable()
+});
+
+export const deploymentCommandEventTypeSchema = z.enum([
+  "deployment.command.submitted",
+  "deployment.command.claimed",
+  "deployment.command.completed",
+  "deployment.command.failed",
+  "deployment.command.cancelled"
+]);
+
 export const logEventSchema = requestContextSchema.extend({
   id: idSchema,
   deploymentId: idSchema,
@@ -201,6 +248,10 @@ export const mcpToolResultSchema = requestContextSchema.extend({
 export type AgentHeartbeat = z.infer<typeof agentHeartbeatSchema>;
 export type Agent = z.infer<typeof agentSchema>;
 export type Deployment = z.infer<typeof deploymentSchema>;
+export type DeploymentCommand = z.infer<typeof deploymentCommandSchema>;
+export type DeploymentCommandState = z.infer<typeof deploymentCommandStateSchema>;
+export type DeploymentCommandKind = z.infer<typeof deploymentCommandKindSchema>;
+export type DeploymentCommandEventType = z.infer<typeof deploymentCommandEventTypeSchema>;
 export type LogEvent = z.infer<typeof logEventSchema>;
 export type Project = z.infer<typeof projectSchema>;
 export type ProjectCreateRequest = z.infer<typeof projectCreateRequestSchema>;

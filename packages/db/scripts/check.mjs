@@ -74,7 +74,8 @@ function assertRequiredFoundation(sql) {
     "deployment_logs",
     "env_variable_metadata",
     "domains",
-    "certificates"
+    "certificates",
+    "deployment_commands"
   ];
 
   for (const table of requiredTables) {
@@ -87,7 +88,11 @@ function assertRequiredFoundation(sql) {
     "CREATE INDEX user_sessions_user_id_idx ON user_sessions (user_id)",
     "CREATE INDEX deployments_project_id_idx ON deployments (project_id)",
     "CREATE INDEX audit_events_actor_user_id_idx ON audit_events (actor_user_id)",
-    "CREATE INDEX certificates_domain_id_idx ON certificates (domain_id)"
+    "CREATE INDEX certificates_domain_id_idx ON certificates (domain_id)",
+    "CONSTRAINT deployment_commands_kind_valid CHECK (kind IN ('start', 'cancel', 'restart', 'rollback'))",
+    "CONSTRAINT deployment_commands_state_valid CHECK (state IN ('pending', 'claimed', 'completed', 'cancelled', 'failed'))",
+    "CREATE INDEX deployment_commands_state_idx ON deployment_commands (state)",
+    "CREATE INDEX deployment_commands_agent_id_idx ON deployment_commands (agent_id)"
   ];
 
   for (const fragment of requiredFragments) {

@@ -2,6 +2,7 @@ import type {
   AgentRepository,
   AuditRepository,
   AuthUserRepository,
+  DeploymentCommandRepository,
   DeploymentRepository,
   EnvSecretValueRepository,
   ProjectRepository,
@@ -26,6 +27,7 @@ export * from "./schema.js";
 export type DeployLiteRepositories = {
   agents: AgentRepository;
   audit: AuditRepository;
+  deploymentCommands: DeploymentCommandRepository;
   deployments: DeploymentRepository;
   envSecretValues: EnvSecretValueRepository;
   projects: ProjectRepository;
