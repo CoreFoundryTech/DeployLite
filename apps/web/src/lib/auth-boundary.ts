@@ -5,10 +5,10 @@ import {
   bootstrapInitialAdminRequestSchema,
   bootstrapStatusSchema,
   deploymentSchema,
-  envVariableMetadataSchema,
   envSecretValueDeleteRequestSchema,
   envSecretValueSchema,
   envSecretValueWriteRequestSchema,
+  envVariableMetadataSchema,
   logEventSchema,
   projectCreateRequestSchema,
   projectSchema,
@@ -407,6 +407,93 @@ export async function loadAuditEvents(options: LoadAuthSessionOptions & AuditLis
       return { kind: "error", reason: "api-rejected", status: response.status };
     }
     return parseApiEnvelope(await response.json(), auditEventListPageSchema);
+  } catch (error) {
+    if (error instanceof z.ZodError) return { kind: "error", reason: "invalid-payload" };
+    return { kind: "error", reason: "api-unreachable" };
+  }
+}
+
+// Env secret values (encrypted-at-rest) — read returns ONLY metadata +
+// valueFingerprint, never the raw plaintext. The web layer therefore must
+// never attempt to GET the raw value: by API contract, the plaintext is
+// write-only and round-trips exclusively through the agent at deploy time.
+export type EnvValueWriteRequest = {
+  key: string;
+  scope: "project" | "deployment";
+  value: string;
+};
+
+export async function loadProjectEnvValues(projectId: string, options: LoadAuthSessionOptions): Promise<MetadataApiResult<{ envValues: EnvSecretValue[] }>> {
+  return fetchMetadataEnvelope<{ envValues: EnvSecretValue[] }>({
+    ...options,
+    path: metadataApiPaths.projectEnvValues(projectId),
+    schema: z.object({ envValues: z.array(envSecretValueSchema) })
+  });
+}
+
+export async function writeProjectEnvValue(
+  projectId: string,
+  input: EnvValueWriteRequest,
+  options: LoadAuthSessionOptions
+): Promise<MetadataApiResult<{ envValue: EnvSecretValue }>> {
+  if (!options.apiBaseUrl) return { kind: "error", reason: "api-unconfigured" };
+  try {
+    const response = await (options.fetchImpl ?? fetch)(createAuthApiUrl(metadataApiPaths.projectEnvValues(projectId), options.apiBaseUrl), {
+      ...createAuthApiRequest({
+        method: "POST",
+        body: envSecretValueWriteRequestSchema.parse({
+          key: input.key,
+          scope: input.scope,
+          value: input.value
+        })
+      }),
+      headers: { cookie: options.cookieHeader ?? "" }
+    });
+    if (!response.ok) return { kind: "error", reason: "api-rejected", status: response.status };
+    return parseApiEnvelope(await response.json(), z.object({ envValue: envSecretValueSchema }));
+  } catch (error) {
+    if (error instanceof z.ZodError) return { kind: "error", reason: "invalid-payload" };
+    return { kind: "error", reason: "api-unreachable" };
+  }
+}
+
+export type EnvValueDeleteRequest = {
+  key: string;
+  scope: "project" | "deployment";
+};
+
+export type EnvValueDeleteFailureReason = "api-unconfigured" | "api-rejected" | "api-unreachable" | "not-found" | "invalid-payload";
+
+export type EnvValueDeleteResult =
+  | { kind: "deleted" }
+  | { kind: "error"; reason: EnvValueDeleteFailureReason; status?: number };
+
+export async function deleteProjectEnvValue(
+  projectId: string,
+  input: EnvValueDeleteRequest,
+  options: LoadAuthSessionOptions
+): Promise<EnvValueDeleteResult> {
+  if (!options.apiBaseUrl) return { kind: "error", reason: "api-unconfigured" };
+  try {
+    const validated = envSecretValueDeleteRequestSchema.parse({ key: input.key, scope: input.scope });
+    const url = new URL(metadataApiPaths.projectEnvValues(projectId), options.apiBaseUrl);
+    url.searchParams.set("key", validated.key);
+    url.searchParams.set("scope", validated.scope);
+    const response = await (options.fetchImpl ?? fetch)(url.toString(), {
+      ...createAuthApiRequest({ method: "DELETE" }),
+      headers: { cookie: options.cookieHeader ?? "" }
+    });
+    if (response.status === 404) {
+      return { kind: "error", reason: "not-found", status: 404 };
+    }
+    if (!response.ok) {
+      return { kind: "error", reason: "api-rejected", status: response.status };
+    }
+    const envelope = responseEnvelopeSchema(z.object({ removed: z.boolean() })).safeParse(await response.json());
+    if (!envelope.success || !envelope.data.data?.removed) {
+      return { kind: "error", reason: "invalid-payload" };
+    }
+    return { kind: "deleted" };
   } catch (error) {
     if (error instanceof z.ZodError) return { kind: "error", reason: "invalid-payload" };
     return { kind: "error", reason: "api-unreachable" };
