@@ -3,7 +3,7 @@
 import { useState } from "react";
 import type { AuditEventListItem } from "@deploylite/contracts";
 import { loadAuditEvents, type AuditListFailureReason } from "@/lib/auth-boundary";
-import { AuditDrawer, type AuditDrawerState } from "@/components/audit-drawer";
+import { AuditDrawer, type AuditDrawerState, type AuditRefreshHandler } from "@/components/audit-drawer";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { Card, CardContent } from "@/components/ui/card";
@@ -42,7 +42,12 @@ export function ProjectAuditHistoryPanel({
   const [limit] = useState(50);
   const [offset] = useState(0);
 
-  async function onRefresh(filter: { actor?: string; action?: string }): Promise<void> {
+  // The drawer accepts a sync OR async refresh callback; this handler is
+  // async because the API roundtrip awaits the response before the
+  // preview state can be updated. The drawer swallows the returned
+  // promise internally, so the parent does not need a fire-and-forget
+  // wrapper.
+  const onRefresh: AuditRefreshHandler = async (filter) => {
     const result = await loadAuditEvents({
       apiBaseUrl: apiBaseUrl ?? undefined,
       cookieHeader,
@@ -61,7 +66,7 @@ export function ProjectAuditHistoryPanel({
       setTotal(0);
       setState({ kind: "error", reason: result.reason, status: result.status });
     }
-  }
+  };
 
   if (initialState.kind === "error" && initialState.reason === "forbidden") {
     return (
@@ -124,7 +129,7 @@ export function ProjectAuditHistoryPanel({
         total={total}
         limit={limit}
         offset={offset}
-        onRefresh={onRefresh as unknown as (filter: { actor?: string; action?: string }) => void}
+        onRefresh={onRefresh}
       />
     </div>
   );

@@ -36,6 +36,17 @@ export type AuditDrawerState =
   | { kind: "ready" }
   | { kind: "error"; reason: AuditListFailureReason; status?: number };
 
+/**
+ * Refresh callback signature. The callback may return synchronously or
+ * asynchronously — the parent panel performs the actual API roundtrip and
+ * the drawer is intentionally agnostic to the await chain. Accepting
+ * `void | Promise<void>` lets a typed async callback be passed without
+ * the caller having to write a fire-and-forget wrapper, and the click
+ * handlers below swallow the returned promise so an unhandled rejection
+ * in the parent (e.g. an unreachable API) never escapes the render path.
+ */
+export type AuditRefreshHandler = (filter: { actor?: string; action?: string }) => void | Promise<void>;
+
 export type AuditDrawerProps = {
   apiBaseUrl: string | null;
   cookieHeader: string;
@@ -47,7 +58,7 @@ export type AuditDrawerProps = {
   total: number;
   limit: number;
   offset: number;
-  onRefresh?: (filter: { actor?: string; action?: string }) => void;
+  onRefresh?: AuditRefreshHandler;
 };
 
 export type AuditDrawerContentProps = {
@@ -56,7 +67,7 @@ export type AuditDrawerContentProps = {
   total: number;
   limit: number;
   offset: number;
-  onRefresh?: (filter: { actor?: string; action?: string }) => void;
+  onRefresh?: AuditRefreshHandler;
 };
 
 export function maskAuditActor(actorId: string): string {
@@ -73,7 +84,9 @@ export function maskAuditActor(actorId: string): string {
 export function maskAuditTarget(targetId: string): string {
   // Targets are public project / env references, not secrets. They are shown
   // in full so the operator can correlate with the project detail page.
-  return targetId;
+  // The fingerprint scrubber below still passes over them as a belt-and-
+  // suspenders guard against a future API regression.
+  return scrubFingerprintLikeValues(targetId);
 }
 
 export function renderAuditTimestamp(value: string | null | undefined): string {
@@ -92,6 +105,78 @@ export function describeAuditListFailure(result: Extract<AuditListResult, { kind
 }
 
 /**
+ * Defensive scrubber for any 32+ char hex substring (the shape of a
+ * SHA-256 fingerprint). The API contract strips `metadata` from the
+ * public list response, but a future regression could surface a raw
+ * `valueFingerprint` (or any other digest-shaped string) inside one of
+ * the visible columns. This helper collapses every hex digest in any
+ * rendered field to `[REDACTED]` so a leaked digest never reaches the
+ * DOM. UUID-shaped ids are passed through untouched (they are
+ * intentionally preview-masked by `maskAuditActor`, not by this scrub).
+ *
+ * The pattern matches 32+ hex characters anchored on non-hex
+ * boundaries so a `req_<32-hex>` style request id (where the `_` is a
+ * word character) is still caught — word boundaries alone would miss
+ * the leading underscore.
+ */
+const HEX_DIGEST_PATTERN = /(?<![0-9a-f])[0-9a-f]{32,}(?![0-9a-f])/gi;
+
+export function scrubFingerprintLikeValues(value: string): string {
+  if (!value) return value;
+  return value.replace(HEX_DIGEST_PATTERN, "[REDACTED]");
+}
+
+/**
+ * Pure helper that maps a filter input id + value pair to the filter
+ * object forwarded to `onRefresh`. Extracted so the wiring can be unit
+ * tested without a DOM: a click on the actor input's Apply button must
+ * produce `{ actor }`, a click on the action input's Apply button must
+ * produce `{ action }`, and an empty value must be normalized to
+ * `undefined` (so the server-side handler does not see a meaningless
+ * empty-string match).
+ */
+export function resolveAuditFilterApply(filterId: string, value: string): { actor?: string; action?: string } {
+  const trimmed = value.trim();
+  const normalized = trimmed.length === 0 ? undefined : trimmed;
+  if (filterId === "audit-drawer-actor") {
+    return { actor: normalized };
+  }
+  if (filterId === "audit-drawer-action") {
+    return { action: normalized };
+  }
+  // Defensive default: an unknown filter id forwards both fields as
+  // undefined so the parent can still decide what to do.
+  return {};
+}
+
+/**
+ * Fire a refresh callback and swallow any returned promise. The drawer
+ * does not own the refresh lifecycle, so it does not need to await
+ * async work; it only needs to make sure a rejection from a parent
+ * implementation cannot bubble up through the click handler and crash
+ * the render tree.
+ *
+ * Exported so the click handler wiring is testable without a DOM: a
+ * static `renderToStaticMarkup` render cannot exercise `onClick`, so
+ * the only honest way to assert "clicking Apply calls onRefresh with
+ * the resolved filter" is to invoke the helper directly.
+ */
+export function fireRefresh(handler: AuditRefreshHandler, filter: { actor?: string; action?: string }): void {
+  try {
+    const result = handler(filter);
+    if (result && typeof (result as Promise<void>).then === "function") {
+      (result as Promise<void>).catch(() => {
+        // Intentionally swallowed: the parent owns error UX. A failure
+        // here must not surface as an unhandled promise rejection.
+      });
+    }
+  } catch {
+    // Same rationale: a synchronous throw from the parent must not
+    // break the click handler contract.
+  }
+}
+
+/**
  * Pure, side-effect-free body of the audit drawer. Extracted so unit tests can
  * exercise the markup without the Sheet portal (which does not render under
  * `renderToStaticMarkup`). The interactive wrapper in `<AuditDrawer>` is
@@ -99,14 +184,16 @@ export function describeAuditListFailure(result: Extract<AuditListResult, { kind
  */
 export function AuditDrawerContent({ state, events, total, limit, offset, onRefresh }: AuditDrawerContentProps) {
   // The list is metadata-stripped server-side, but we still run a defensive
-  // pass over the rendered text to drop any substring that could resemble a
-  // 32+ char hex digest (which is the shape of a fingerprint). The API
-  // contract is the primary guarantee; this is a belt-and-suspenders redaction
-  // so a future API regression cannot leak a fingerprint into the UI.
+  // pass over every rendered field. The scrubber drops any 32+ char hex
+  // digest (the shape of a SHA-256 fingerprint) so a future API regression
+  // cannot leak a fingerprint into the UI through the actor, target, or
+  // request id columns. The API contract is the primary guarantee; this is
+  // a belt-and-suspenders redaction.
   const safeEvents = useMemo(() => events.map((event) => ({
     ...event,
-    actorId: maskAuditActor(event.actorId),
-    targetId: maskAuditTarget(event.targetId)
+    actorId: maskAuditActor(scrubFingerprintLikeValues(event.actorId)),
+    targetId: maskAuditTarget(event.targetId),
+    requestId: scrubFingerprintLikeValues(event.requestId)
   })), [events]);
 
   return (
@@ -126,7 +213,7 @@ export function AuditDrawerContent({ state, events, total, limit, offset, onRefr
               type="button"
               variant="outline"
               size="sm"
-              onClick={() => onRefresh({})}
+              onClick={() => fireRefresh(onRefresh, {})}
               data-testid="audit-drawer-refresh"
             >
               {auditDrawerCopy.refresh}
@@ -174,10 +261,12 @@ export function AuditDrawerContent({ state, events, total, limit, offset, onRefr
   );
 }
 
-function AuditFilterInput({ filterId, placeholder, onRefresh }: { filterId: string; placeholder: string; onRefresh: (filter: { actor?: string; action?: string }) => void }) {
+function AuditFilterInput({ filterId, placeholder, onRefresh }: { filterId: string; placeholder: string; onRefresh: AuditRefreshHandler }) {
   // The actual interactive filter state lives in the wrapper component so it
   // persists across re-renders. This inner input is uncontrolled on purpose:
-  // it forwards its value to the parent only when the user clicks Refresh.
+  // it forwards its value to the parent only when the user clicks Apply.
+  // The filter resolution is delegated to `resolveAuditFilterApply` so the
+  // wiring is testable as a pure helper.
   const [value, setValue] = useState("");
   return (
     <div className="flex items-center gap-2">
@@ -192,7 +281,7 @@ function AuditFilterInput({ filterId, placeholder, onRefresh }: { filterId: stri
         type="button"
         variant="ghost"
         size="sm"
-        onClick={() => onRefresh(filterId === "audit-drawer-actor" ? { actor: value || undefined } : { action: value || undefined })}
+        onClick={() => fireRefresh(onRefresh, resolveAuditFilterApply(filterId, value))}
         data-testid={`${filterId}-apply`}
       >
         Apply
