@@ -13,7 +13,9 @@ const AGENT_SECRET_BASE = "/run/deploylite/secrets";
 const BUILDKIT_CONFIG_PATH = "/etc/deploylite/buildkitd.toml";
 const CLEANUP_ATTEMPTS = 4;
 const CLEANUP_BACKOFF_MS = [250, 500, 1_000] as const;
+const REPAIR_RECORDS_PER_PASS = 16;
 const MANAGED_LABEL = "com.deploylite.managed=true";
+const MANAGED_PROJECT_LABEL = "com.deploylite.project-slug";
 export const DEPLOYLITE_RUNTIME_NETWORK = "deploylite-runtime";
 const SAFE_REF = /^[A-Za-z0-9][A-Za-z0-9._/-]{0,127}$/;
 const SAFE_ID = /^[a-z0-9][a-z0-9-]{0,62}$/;
@@ -46,6 +48,8 @@ export type CleanupRepairStore = {
   load(): Promise<CleanupRepairRecord[]>;
   put(record: CleanupRepairRecord): Promise<void>;
   remove(commandId: string): Promise<void>;
+  recoveryRequired?(): Promise<boolean>;
+  completeRecovery?(records: CleanupRepairRecord[]): Promise<void>;
 };
 
 export type ExecutorConfig = { workspaceRoot: string; secretRoot: string };
@@ -256,13 +260,26 @@ export class AgentDeploymentExecutor {
       : "Agent restarted with an owned claimed command; managed resource cleanup incomplete; repair remains scheduled.", plans);
   }
 
-  async reconcilePending(): Promise<boolean> {
-    let complete = true;
-    for (const record of await this.cleanupRepairs.load()) {
-      const input = repairInput(record);
-      if (!(await this.reconcileRuntime(input, true))) complete = false;
+  async reconcilePending(signal?: AbortSignal): Promise<boolean> {
+    if (signal?.aborted) return false;
+    const recoveryRequired = this.cleanupRepairs.recoveryRequired && await this.cleanupRepairs.recoveryRequired();
+    if (recoveryRequired) {
+      const reconstructed = await this.discoverRecoveryRecords(signal);
+      if (reconstructed === null || !this.cleanupRepairs.completeRecovery) {
+        await this.safeLog("error", "Managed cleanup repair recovery discovery failed; recovery will retry.");
+        return false;
+      }
+      try { await this.cleanupRepairs.completeRecovery(reconstructed); }
+      catch { await this.safeLog("error", "Managed cleanup repair recovery state could not be persisted; recovery will retry."); return false; }
     }
-    return complete;
+    let complete = true;
+    const records = await this.cleanupRepairs.load();
+    for (const record of records.slice(0, REPAIR_RECORDS_PER_PASS)) {
+      if (signal?.aborted) return false;
+      const input = repairInput(record);
+      if (!(await this.reconcileRuntime(input, true, signal))) complete = false;
+    }
+    return complete && records.length <= REPAIR_RECORDS_PER_PASS;
   }
 
   private async run(plan: CommandPlan, signal?: AbortSignal): Promise<void> {
@@ -293,7 +310,7 @@ export class AgentDeploymentExecutor {
     return cleanupError;
   }
 
-  private async reconcileRuntime(input: DeploymentExecutionInput, includeRuntime: boolean): Promise<boolean> {
+  private async reconcileRuntime(input: DeploymentExecutionInput, includeRuntime: boolean, signal?: AbortSignal): Promise<boolean> {
     const record = cleanupRepairRecord(input);
     try { await this.cleanupRepairs.put(record); }
     catch {
@@ -302,7 +319,8 @@ export class AgentDeploymentExecutor {
     }
     let consecutiveAbsent = 0;
     for (let attempt = 0; attempt < CLEANUP_ATTEMPTS; attempt += 1) {
-      const discovered = await this.discoverManagedResources(input, includeRuntime);
+      if (signal?.aborted) return false;
+      const discovered = await this.discoverManagedResources(input, includeRuntime, signal);
       if (discovered === null) {
         consecutiveAbsent = 0;
       } else if (discovered.length === 0) {
@@ -313,7 +331,10 @@ export class AgentDeploymentExecutor {
         }
       } else {
         consecutiveAbsent = 0;
-        for (const plan of discovered) await this.bestEffort("Managed Docker resource cleanup failed", () => this.runner.run(plan, 60_000));
+        for (const plan of discovered) {
+          if (signal?.aborted) return false;
+          await this.bestEffort("Managed Docker resource cleanup failed", () => this.runCleanupPlan(plan, signal));
+        }
       }
       if (attempt < CLEANUP_ATTEMPTS - 1) await this.wait(CLEANUP_BACKOFF_MS[Math.min(attempt, CLEANUP_BACKOFF_MS.length - 1)]!);
     }
@@ -321,12 +342,12 @@ export class AgentDeploymentExecutor {
     return false;
   }
 
-  private async discoverManagedResources(input: DeploymentExecutionInput, includeRuntime: boolean): Promise<CommandPlan[] | null> {
+  private async discoverManagedResources(input: DeploymentExecutionInput, includeRuntime: boolean, signal?: AbortSignal): Promise<CommandPlan[] | null> {
     const queries = createRuntimeCleanupPlans(input, includeRuntime);
     const removals: CommandPlan[] = [];
     for (const query of queries) {
       let result: ProcessResult;
-      try { result = await this.runner.run(query, 60_000); }
+      try { result = await this.runCleanupPlan(query, signal); }
       catch { return null; }
       if (result.code !== 0) return null;
       const values = result.stdout.split(/\s+/).filter(Boolean);
@@ -339,6 +360,32 @@ export class AgentDeploymentExecutor {
       }
     }
     return removals;
+  }
+
+  /** Discovery only reconstructs records; it never removes a resource. */
+  private async discoverRecoveryRecords(signal?: AbortSignal): Promise<CleanupRepairRecord[] | null> {
+    const queries: CommandPlan[] = [
+      { command: "docker", args: ["ps", "--all", "--format", "{{.Names}}\t{{.Label \"com.deploylite.managed\"}}\t{{.Label \"com.deploylite.command-id\"}}\t{{.Label \"com.deploylite.project-slug\"}}"] },
+      { command: "docker", args: ["image", "ls", "--format", "{{.Repository}}\t{{.Tag}}\t{{.Label \"com.deploylite.managed\"}}\t{{.Label \"com.deploylite.command-id\"}}\t{{.Label \"com.deploylite.project-slug\"}}"] },
+      { command: "docker", args: ["network", "ls", "--format", "{{.Name}}\t{{.Label \"com.deploylite.managed\"}}\t{{.Label \"com.deploylite.command-id\"}}\t{{.Label \"com.deploylite.project-slug\"}}"] },
+      { command: "docker", args: ["buildx", "ls", "--format", "{{.Name}}"] }
+    ];
+    const records = new Map<string, CleanupRepairRecord>();
+    for (const query of queries) {
+      let result: ProcessResult;
+      try { result = await this.runCleanupPlan(query, signal); }
+      catch { return null; }
+      if (result.code !== 0 || signal?.aborted) return null;
+      for (const line of result.stdout.split("\n").filter(Boolean)) {
+        const record = recoveryRecordFromLine(query.args[0]!, line);
+        if (record) records.set(record.commandId, record);
+      }
+    }
+    return [...records.values()].slice(0, REPAIR_RECORDS_PER_PASS);
+  }
+
+  private async runCleanupPlan(plan: CommandPlan, signal?: AbortSignal): Promise<ProcessResult> {
+    return signal ? this.runner.run(plan, 60_000, signal) : this.runner.run(plan, 60_000);
   }
 
   private async bestEffort(message: string, operation: () => Promise<unknown>): Promise<void> {
@@ -370,8 +417,9 @@ export function createDeploymentPlan(input: DeploymentExecutionInput, config: Ex
     args: [
       "run", "--detach", "--name", container,
       "--network", DEPLOYLITE_RUNTIME_NETWORK,
-       "--label", MANAGED_LABEL,
+      "--label", MANAGED_LABEL,
       "--label", `com.deploylite.command-id=${input.command.id}`,
+      "--label", `${MANAGED_PROJECT_LABEL}=${input.projectSlug}`,
       "--read-only", "--cap-drop", "ALL", "--security-opt", "no-new-privileges",
       "--pids-limit", "256", "--memory", "1g", "--cpus", "1",
       "--tmpfs", "/tmp:rw,noexec,nosuid,size=64m",
@@ -386,7 +434,7 @@ export function createDeploymentPlan(input: DeploymentExecutionInput, config: Ex
     { command: "git", args: ["clone", "--no-checkout", "--depth", "1", input.repoUrl, workspace] },
     { command: "git", args: ["-C", workspace, "fetch", "--depth", "1", "origin", input.ref] },
     { command: "git", args: ["-C", workspace, "checkout", "--detach", "FETCH_HEAD"] },
-    { command: "docker", args: ["network", "create", "--driver", "bridge", "--label", MANAGED_LABEL, "--label", `com.deploylite.command-id=${input.command.id}`, buildNetwork] },
+    { command: "docker", args: ["network", "create", "--driver", "bridge", "--label", MANAGED_LABEL, "--label", `com.deploylite.command-id=${input.command.id}`, "--label", `${MANAGED_PROJECT_LABEL}=${input.projectSlug}`, buildNetwork] },
     {
       command: "docker",
       args: [
@@ -404,6 +452,7 @@ export function createDeploymentPlan(input: DeploymentExecutionInput, config: Ex
         "buildx", "build", "--builder", builder, "--network", "none", "--progress", "plain",
         "--label", MANAGED_LABEL,
         "--label", `com.deploylite.command-id=${input.command.id}`,
+        "--label", `${MANAGED_PROJECT_LABEL}=${input.projectSlug}`,
         "--output", `type=docker,name=${tag}`,
         workspace
       ]
@@ -516,6 +565,23 @@ function removalArgs(query: CommandPlan, id: string): string[] {
   if (query.args[0] === "image") return ["image", "rm", "--force", id];
   if (query.args[0] === "network") return ["network", "rm", id];
   throw new Error("Unsupported managed cleanup query");
+}
+
+function recoveryRecordFromLine(kind: string, line: string): CleanupRepairRecord | null {
+  if (kind === "buildx") return null; // A builder name alone is never a managed marker.
+  const fields = line.split("\t");
+  const [name, managed, commandId, projectSlug, ...rest] = kind === "image"
+    ? [`${fields[0] ?? ""}:${fields[1] ?? ""}`, fields[2], fields[3], fields[4], ...fields.slice(5)]
+    : fields;
+  if (rest.length > 0 || managed !== "true" || !commandId || !projectSlug || !SAFE_ID.test(commandId) || !SAFE_ID.test(projectSlug)) return null;
+  try {
+    const matches = kind === "ps"
+      ? name === containerName(projectSlug, commandId)
+      : kind === "image"
+        ? name === imageTag(projectSlug, commandId)
+        : kind === "network" && name === buildNetworkName(commandId);
+    return matches ? { version: 1, commandId, projectSlug } : null;
+  } catch { return null; }
 }
 
 function validateInput(input: DeploymentExecutionInput): void {

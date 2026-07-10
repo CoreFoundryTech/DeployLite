@@ -4,7 +4,7 @@ import { createRequire } from "node:module";
 import { resolve } from "node:path";
 import { describe, expect, it, vi } from "vitest";
 import type { DeploymentCommand } from "@deploylite/contracts";
-import { AgentDeploymentExecutor, assertSafeRuntimePlan, createDeploymentPlan, createSpawnProcessRunner, type CommandBusClient, type HealthProbe, type ProcessRunner, type SpawnedProcess, type WorkspaceFilesystem } from "./index.js";
+import { AgentDeploymentExecutor, assertSafeRuntimePlan, createDeploymentPlan, createSpawnProcessRunner, type CleanupRepairStore, type CommandBusClient, type HealthProbe, type ProcessRunner, type SpawnedProcess, type WorkspaceFilesystem } from "./index.js";
 import { InMemoryCleanupRepairStore } from "../cleanup-repairs.js";
 
 const command: DeploymentCommand = {
@@ -212,13 +212,13 @@ describe("AgentDeploymentExecutor", () => {
 
   it("uses only the exact DeployLite-controlled bounded BuildKit builder policy", () => {
     const plans = createDeploymentPlan({ ...input, command: { ...command, payload: { builder: "attacker", network: "host", output: "/tmp/escape" } } }, executorConfig);
-    expect(plans[3]).toEqual({ command: "docker", args: ["network", "create", "--driver", "bridge", "--label", "com.deploylite.managed=true", "--label", "com.deploylite.command-id=command-1", "deploylite-build-command-1"] });
+    expect(plans[3]).toEqual({ command: "docker", args: ["network", "create", "--driver", "bridge", "--label", "com.deploylite.managed=true", "--label", "com.deploylite.command-id=command-1", "--label", "com.deploylite.project-slug=service", "deploylite-build-command-1"] });
     expect(plans[4]).toEqual({
       command: "docker",
       args: ["buildx", "create", "--name", "deploylite-command-1", "--driver", "docker-container", "--driver-opt", "network=deploylite-build-command-1,memory=1g,memory-swap=1g,cpu-period=100000,cpu-quota=100000,restart-policy=no", "--buildkitd-config", "/etc/deploylite/buildkitd.toml"]
     });
     expect(plans[6]?.args).toEqual(["update", "--pids-limit", "256", "buildx_buildkit_deploylite-command-10"]);
-    expect(plans[8]?.args).toEqual(["buildx", "build", "--builder", "deploylite-command-1", "--network", "none", "--progress", "plain", "--label", "com.deploylite.managed=true", "--label", "com.deploylite.command-id=command-1", "--output", "type=docker,name=deploylite/service:command-1", "/var/lib/deploylite/workspaces/command-1"]);
+    expect(plans[8]?.args).toEqual(["buildx", "build", "--builder", "deploylite-command-1", "--network", "none", "--progress", "plain", "--label", "com.deploylite.managed=true", "--label", "com.deploylite.command-id=command-1", "--label", "com.deploylite.project-slug=service", "--output", "type=docker,name=deploylite/service:command-1", "/var/lib/deploylite/workspaces/command-1"]);
     expect(plans.some((plan) => plan.args[0] === "build")).toBe(false);
     expect(JSON.stringify(plans)).not.toMatch(/attacker|network=host|\/tmp\/escape|--privileged|--mount|--device|--cap-add/);
   });
@@ -391,6 +391,43 @@ describe("agent-only Docker socket compose boundary", () => {
       expect(document).toContain("host-root-equivalent");
       expect(document).toMatch(/BuildKit.*risk|Residual risk/s);
     }
+  });
+
+  it("reconstructs only exact labelled DeployLite resources after a quarantined store reset", async () => {
+    let recoveryPending = true;
+    const recovered: unknown[][] = [];
+    const cleanupRepairs: CleanupRepairStore = {
+      load: vi.fn(async () => []), put: vi.fn(async () => undefined), remove: vi.fn(async () => undefined),
+      recoveryRequired: vi.fn(async () => recoveryPending),
+      completeRecovery: vi.fn(async (records) => { recovered.push(records); recoveryPending = false; })
+    };
+    const test = setup();
+    const runner: ProcessRunner = { run: vi.fn(async (plan) => {
+      if (plan.args[0] === "ps") return { code: 0, stdout: "deploylite-command-1\ttrue\tcommand-1\tservice\nforeign\ttrue\tcommand-1\tservice\n", stderr: "", timedOut: false };
+      if (plan.args[0] === "image") return { code: 0, stdout: "deploylite/service\tcommand-1\ttrue\tcommand-1\tservice\ndeploylite/service\twrong\ttrue\tcommand-1\tservice\n", stderr: "", timedOut: false };
+      if (plan.args[0] === "network") return { code: 0, stdout: "deploylite-build-command-1\ttrue\tcommand-1\tservice\n", stderr: "", timedOut: false };
+      return { code: 0, stdout: "deploylite-command-1\nattacker-builder\n", stderr: "", timedOut: false };
+    }) };
+    const executor = new AgentDeploymentExecutor(runner, test.bus, test.health, test.logger, async () => undefined, test.filesystem, executorConfig, cleanupRepairs);
+
+    await expect(executor.reconcilePending()).resolves.toBe(true);
+
+    expect(recovered).toEqual([[{ version: 1, commandId: "command-1", projectSlug: "service" }]]);
+    expect(vi.mocked(runner.run).mock.calls.every(([plan]) => !["rm", "image", "network"].includes(plan.args[1] ?? ""))).toBe(true);
+  });
+
+  it("retains the recovery marker when trusted discovery fails", async () => {
+    const completeRecovery = vi.fn(async () => undefined);
+    const cleanupRepairs: CleanupRepairStore = {
+      load: vi.fn(async () => []), put: vi.fn(async () => undefined), remove: vi.fn(async () => undefined),
+      recoveryRequired: vi.fn(async () => true), completeRecovery
+    };
+    const test = setup();
+    const runner: ProcessRunner = { run: vi.fn(async () => { throw new Error("discovery unavailable"); }) };
+    const executor = new AgentDeploymentExecutor(runner, test.bus, test.health, test.logger, async () => undefined, test.filesystem, executorConfig, cleanupRepairs);
+
+    await expect(executor.reconcilePending()).resolves.toBe(false);
+    expect(completeRecovery).not.toHaveBeenCalled();
   });
 });
 

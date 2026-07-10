@@ -49,7 +49,7 @@ export type TerminalAcknowledgementReplayer = { replayPending(): Promise<boolean
 export type DeploymentExecutorPort = {
   execute(input: DeploymentExecutionInput, signal?: AbortSignal): Promise<DeploymentExecutionResult>;
   reconcile(input: DeploymentExecutionInput): Promise<DeploymentExecutionResult>;
-  reconcilePending?(): Promise<boolean>;
+  reconcilePending?(signal?: AbortSignal): Promise<boolean>;
 };
 
 export type AgentWorkerOptions = {
@@ -101,13 +101,11 @@ export class AgentWorker {
       resourceSnapshot: initialSnapshot
     }, signal);
     if (registered.id !== this.options.agentId) throw new Error("Agent registration identity mismatch");
-    await Promise.all([this.pollLoop(signal), this.heartbeatLoop(signal)]);
+    await Promise.all([this.pollLoop(signal), this.heartbeatLoop(signal), this.cleanupRepairLoop(signal)]);
   }
 
   private async pollLoop(signal: AbortSignal): Promise<void> {
     let terminalRetryMs = this.#retryDelayMs;
-    let cleanupRetryMs = this.#retryDelayMs;
-    let nextCleanupRepairAt = 0;
     let startupReconciled = false;
     while (!signal.aborted) {
       try {
@@ -118,22 +116,6 @@ export class AgentWorker {
           continue;
         }
         terminalRetryMs = this.#retryDelayMs;
-        if (this.options.executor.reconcilePending && this.#now().getTime() >= nextCleanupRepairAt) {
-          try {
-            if (await this.options.executor.reconcilePending()) {
-              cleanupRetryMs = this.#cleanupRepairIntervalMs;
-              nextCleanupRepairAt = this.#now().getTime() + this.#cleanupRepairIntervalMs;
-            } else {
-              await this.safeLog("error", "Managed resource cleanup remains incomplete; repair will retry");
-              nextCleanupRepairAt = this.#now().getTime() + cleanupRetryMs;
-              cleanupRetryMs = Math.min(this.#maxHeartbeatBackoffMs, Math.max(this.#retryDelayMs, cleanupRetryMs * 2));
-            }
-          } catch {
-            await this.safeLog("error", "Managed resource cleanup repair reconciliation failed; repair will retry");
-            nextCleanupRepairAt = this.#now().getTime() + cleanupRetryMs;
-            cleanupRetryMs = Math.min(this.#maxHeartbeatBackoffMs, Math.max(this.#retryDelayMs, cleanupRetryMs * 2));
-          }
-        }
         if (!startupReconciled) {
           const claimed = await this.options.transport.recoverClaimed(this.options.agentId, signal);
           if (claimed) await this.options.executor.reconcile(claimed);
@@ -155,6 +137,32 @@ export class AgentWorker {
         if (signal.aborted) break;
         await this.safeLog("error", `Agent poll failed: ${safeError(error)}`);
         await this.#wait(this.#retryDelayMs, signal);
+      }
+    }
+  }
+
+  /** Kept separate from polling: Docker repair I/O must never delay command delivery. */
+  private async cleanupRepairLoop(signal: AbortSignal): Promise<void> {
+    if (!this.options.executor.reconcilePending) return;
+    let retryMs = this.#retryDelayMs;
+    while (!signal.aborted) {
+      try {
+        const result = await stopOnAbort(this.options.executor.reconcilePending(signal), signal);
+        if (result.aborted) break;
+        const complete = result.value!;
+        if (complete) {
+          retryMs = this.#retryDelayMs;
+          await this.#wait(this.#cleanupRepairIntervalMs, signal);
+        } else {
+          await this.safeLog("error", "Managed resource cleanup remains incomplete; repair will retry");
+          await this.#wait(retryMs, signal);
+          retryMs = Math.min(this.#maxHeartbeatBackoffMs, Math.max(this.#retryDelayMs, retryMs * 2));
+        }
+      } catch {
+        if (signal.aborted) break;
+        await this.safeLog("error", "Managed resource cleanup repair reconciliation failed; repair will retry");
+        await this.#wait(retryMs, signal);
+        retryMs = Math.min(this.#maxHeartbeatBackoffMs, Math.max(this.#retryDelayMs, retryMs * 2));
       }
     }
   }
@@ -307,7 +315,21 @@ function safeError(error: unknown): string {
 function abortableWait(milliseconds: number, signal: AbortSignal): Promise<void> {
   return new Promise((resolveWait) => {
     if (signal.aborted) return resolveWait();
-    const timer = setTimeout(resolveWait, milliseconds);
-    signal.addEventListener("abort", () => { clearTimeout(timer); resolveWait(); }, { once: true });
+    const finish = () => { clearTimeout(timer); signal.removeEventListener("abort", abort); resolveWait(); };
+    const abort = () => finish();
+    const timer = setTimeout(finish, milliseconds);
+    signal.addEventListener("abort", abort, { once: true });
+  });
+}
+
+function stopOnAbort<T>(operation: Promise<T>, signal: AbortSignal): Promise<{ aborted: true } | { aborted: false; value: T }> {
+  if (signal.aborted) return Promise.resolve({ aborted: true });
+  return new Promise((resolve, reject) => {
+    const abort = () => { signal.removeEventListener("abort", abort); resolve({ aborted: true }); };
+    signal.addEventListener("abort", abort, { once: true });
+    operation.then(
+      (value) => { signal.removeEventListener("abort", abort); resolve({ aborted: false, value }); },
+      (error) => { signal.removeEventListener("abort", abort); reject(error); }
+    ).finally(() => signal.removeEventListener("abort", abort));
   });
 }

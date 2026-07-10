@@ -42,6 +42,19 @@ describe("FileCleanupRepairStore", () => {
     expect(await readFile(join((await import("node:path")).dirname(path), quarantine!), "utf8")).toContain(secret);
   });
 
+  it("persists an empty recovery marker after quarantine without reusing corrupt records", async () => {
+    const path = await pathFor("repairs.json");
+    await writeFile(path, JSON.stringify({ version: 1, records: [repair], recoveryPending: "forged", token: "never-reuse" }), { mode: 0o644 });
+    const store = new FileCleanupRepairStore(path);
+
+    await expect(store.load()).resolves.toEqual([]);
+    await expect(store.recoveryRequired()).resolves.toBe(true);
+    const reset = await readFile(path, "utf8");
+    expect(reset).toBe(JSON.stringify({ version: 1, records: [], recoveryPending: true }));
+    expect(reset).not.toContain("never-reuse");
+    expect((await stat(path)).mode & 0o777).toBe(0o600);
+  });
+
   it("fails closed when quarantine cannot complete", async () => {
     const path = await pathFor("repairs.json");
     await writeFile(path, "{not-json");

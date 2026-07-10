@@ -11,7 +11,7 @@ const repairSchema = z.object({
   commandId: z.string().regex(/^[a-z0-9][a-z0-9-]{0,62}$/),
   projectSlug: z.string().regex(/^[a-z0-9][a-z0-9-]{0,62}$/)
 }).strict();
-const fileSchema = z.object({ version: z.literal(1), records: z.array(repairSchema).max(MAX_RECORDS) }).strict();
+const fileSchema = z.object({ version: z.literal(1), records: z.array(repairSchema).max(MAX_RECORDS), recoveryPending: z.boolean().optional() }).strict();
 
 export class CorruptCleanupRepairStoreError extends Error {
   constructor() {
@@ -23,6 +23,7 @@ export class CorruptCleanupRepairStoreError extends Error {
 export class FileCleanupRepairStore implements CleanupRepairStore {
   readonly #path: string;
   #records: CleanupRepairRecord[] | null = null;
+  #recoveryPending = false;
 
   constructor(path: string) {
     if (!path.startsWith("/")) throw new Error("Cleanup repair path must be absolute");
@@ -35,7 +36,9 @@ export class FileCleanupRepairStore implements CleanupRepairStore {
     try {
       const contents = await readFile(this.#path, "utf8");
       if (Buffer.byteLength(contents, "utf8") > MAX_FILE_BYTES) throw new Error("cleanup repair state exceeds size limit");
-      this.#records = fileSchema.parse(JSON.parse(contents)).records;
+      const parsed = fileSchema.parse(JSON.parse(contents));
+      this.#records = parsed.records;
+      this.#recoveryPending = parsed.recoveryPending === true;
     } catch (error) {
       if ((error as NodeJS.ErrnoException).code === "ENOENT") {
         this.#records = [];
@@ -49,6 +52,9 @@ export class FileCleanupRepairStore implements CleanupRepairStore {
         throw new CorruptCleanupRepairStoreError();
       }
       this.#records = [];
+      this.#recoveryPending = true;
+      try { await this.#persist([]); }
+      catch { throw new CorruptCleanupRepairStoreError(); }
     }
     return structuredClone(this.#records);
   }
@@ -67,9 +73,27 @@ export class FileCleanupRepairStore implements CleanupRepairStore {
     if (next.length !== records.length) await this.#persist(next);
   }
 
+  async recoveryRequired(): Promise<boolean> {
+    await this.load();
+    return this.#recoveryPending;
+  }
+
+  async completeRecovery(records: CleanupRepairRecord[]): Promise<void> {
+    await this.load();
+    const deduped = [...new Map(records.map((record) => {
+      const parsed = repairSchema.parse(record);
+      return [parsed.commandId, parsed] as const;
+    })).values()];
+    if (deduped.length > MAX_RECORDS) throw new Error("Cleanup repair state is full");
+    const pending = this.#recoveryPending;
+    this.#recoveryPending = false;
+    try { await this.#persist(deduped); }
+    catch (error) { this.#recoveryPending = pending; throw error; }
+  }
+
   async #persist(records: CleanupRepairRecord[]): Promise<void> {
     const temporary = `${this.#path}.tmp-${process.pid}-${randomBytes(4).toString("hex")}`;
-    await writeFile(temporary, JSON.stringify(fileSchema.parse({ version: 1, records })), { encoding: "utf8", mode: 0o600, flag: "wx" });
+    await writeFile(temporary, JSON.stringify(fileSchema.parse({ version: 1, records, recoveryPending: this.#recoveryPending || undefined })), { encoding: "utf8", mode: 0o600, flag: "wx" });
     await rename(temporary, this.#path);
     await chmod(this.#path, 0o600);
     this.#records = structuredClone(records);
@@ -82,4 +106,6 @@ export class InMemoryCleanupRepairStore implements CleanupRepairStore {
   async load(): Promise<CleanupRepairRecord[]> { return structuredClone([...this.#records.values()]); }
   async put(record: CleanupRepairRecord): Promise<void> { const parsed = repairSchema.parse(record); this.#records.set(parsed.commandId, parsed); }
   async remove(commandId: string): Promise<void> { this.#records.delete(commandId); }
+  async recoveryRequired(): Promise<boolean> { return false; }
+  async completeRecovery(records: CleanupRepairRecord[]): Promise<void> { for (const record of records) await this.put(record); }
 }
