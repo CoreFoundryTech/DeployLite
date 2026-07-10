@@ -228,11 +228,20 @@ describe("agent-only Docker socket compose boundary", () => {
     }
   });
 
-  it("pins the agent and generated runtimes to the trusted named network", async () => {
+  it("isolates control-plane services from runtimes and makes the agent the only bridge", async () => {
     const compose = await readFile(resolve(import.meta.dirname, "../../../../infra/vps/compose.yml"), "utf8");
-    const agentBlock = compose.match(/  agent:([\s\S]*?)(?=\n  web:)/)?.[1] ?? "";
-    expect(agentBlock).toMatch(/networks:\s*\n\s*- deploylite/);
-    expect(compose).toMatch(/networks:\s*\n  deploylite:\s*\n    name: deploylite-runtime\s*\n    driver: bridge/);
+    const memberships = Object.fromEntries(
+      ["postgres", "migrate", "api", "agent", "web"].map((service) => [service, composeServiceNetworks(compose, service)])
+    );
+
+    expect(memberships).toEqual({
+      postgres: ["control-plane"],
+      migrate: ["control-plane"],
+      api: ["control-plane"],
+      agent: ["control-plane", "runtime"],
+      web: ["control-plane"]
+    });
+    expect(compose).toMatch(/networks:\s*\n  control-plane:\s*\n    name: deploylite-control-plane\s*\n    driver: bridge\s*\n  runtime:\s*\n    name: deploylite-runtime\s*\n    driver: bridge/);
   });
 
   it("installs the executor runtime tools in the minimal pinned Alpine image", async () => {
@@ -257,6 +266,14 @@ describe("agent-only Docker socket compose boundary", () => {
     expect(executor).toContain("Deployment workspace escaped its trusted root");
   });
 });
+
+function composeServiceNetworks(compose: string, service: string): string[] {
+  const serviceBlock = compose.match(new RegExp(`^  ${service}:\\n([\\s\\S]*?)(?=^  [a-z][a-z-]*:|^volumes:|^networks:)`, "m"))?.[1];
+  if (!serviceBlock) throw new Error(`Compose service not found: ${service}`);
+  const networkBlock = serviceBlock.match(/^    networks:\n((?:^      - [a-z][a-z-]*\n?)+)/m)?.[1];
+  if (!networkBlock) throw new Error(`Compose networks not found: ${service}`);
+  return [...networkBlock.matchAll(/^      - ([a-z][a-z-]*)$/gm)].map((match) => match[1]!);
+}
 
 function resultsForPrimaryFailure(plan: { command: string; args: string[] }) {
   if (plan.command === "docker" && plan.args[0] === "run") {

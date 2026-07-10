@@ -136,7 +136,7 @@ The GitHub bootstrap command downloads the requested repository ref, runs the re
 Included:
 
 - Production-oriented Dockerfiles for the API and Web apps.
-- `infra/vps/compose.yml` with Postgres, one-shot migrations, API, Web, named volumes, an internal network, health checks, and restart policies.
+- `infra/vps/compose.yml` with Postgres, one-shot migrations, API, Web, named volumes, separate stable control-plane/runtime networks bridged only by the agent, health checks, and restart policies.
 - Temporary HTTP exposure: Web on host `:80` and API on host `:3001`.
 - Browser-first initial owner creation through the existing setup UI. There are no default admin credentials.
 - `scripts/bootstrap.sh`, a GitHub raw bootstrapper with mocked tests in `scripts/bootstrap.test.sh`.

@@ -18,6 +18,8 @@ This directory contains local-development infrastructure and the first reviewabl
 - `migrate` runs the existing hand-authored SQL migrations once before the API starts.
 - `api` builds `apps/api/Dockerfile`, binds internally to `0.0.0.0:3001`, and is temporarily exposed on host `:3001`.
 - `web` builds `apps/web/Dockerfile`, serves Next.js on container `:3000`, and is temporarily exposed on host `:80`.
+- `deploylite-control-plane` connects PostgreSQL, migrations, API, Web, and the agent. `deploylite-runtime` connects only the agent and dynamically launched project runtimes, so untrusted runtime containers cannot resolve control-plane services through Compose network membership.
+- The agent is the only service on both networks and the only service with the Docker socket mount.
 - Health checks gate API/Web startup where Compose supports dependency conditions.
 
 For local review, render the configuration without starting services:

@@ -11,7 +11,7 @@ services:
     volumes:
       - postgres-data:/var/lib/postgresql/data
     networks:
-      - deploylite
+      - control-plane
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U $${POSTGRES_USER:-deploylite} -d $${POSTGRES_DB:-deploylite}"]
       interval: 5s
@@ -31,7 +31,7 @@ services:
       DATABASE_URL: postgres://${POSTGRES_USER:-deploylite}:${POSTGRES_PASSWORD:?POSTGRES_PASSWORD is required}@postgres:5432/${POSTGRES_DB:-deploylite}
     command: ["node", "packages/db/scripts/migrate.mjs"]
     networks:
-      - deploylite
+      - control-plane
 
   api:
     build:
@@ -61,16 +61,17 @@ services:
     ports:
       - "3001:3001"
     networks:
-      - deploylite
+      - control-plane
     healthcheck:
       test: ["CMD-SHELL", "wget -qO- http://127.0.0.1:3001/api/v1/health >/dev/null"]
       interval: 10s
       timeout: 5s
       retries: 12
 
-  # The agent is the sole Docker-capable service. The Docker socket is
-  # privileged host control; API, web, migration, and MCP services MUST remain
-  # socket-free. Do not add this mount outside the agent without new approval.
+  # The agent is the sole bridge between the trusted control plane and
+  # untrusted project runtimes. The Docker socket is privileged host control;
+  # API, web, migration, and MCP services MUST remain socket-free and MUST NOT
+  # join the runtime network.
   agent:
     build:
       context: ../..
@@ -92,7 +93,8 @@ services:
     tmpfs:
       - /run/deploylite/secrets:mode=0700,size=16m
     networks:
-      - deploylite
+      - control-plane
+      - runtime
 
   web:
     build:
@@ -110,7 +112,7 @@ services:
     ports:
       - "80:3000"
     networks:
-      - deploylite
+      - control-plane
     healthcheck:
       test: ["CMD-SHELL", "wget -qO- http://127.0.0.1:3000/ >/dev/null"]
       interval: 10s
@@ -122,6 +124,9 @@ volumes:
   agent-workspaces:
 
 networks:
-  deploylite:
+  control-plane:
+    name: deploylite-control-plane
+    driver: bridge
+  runtime:
     name: deploylite-runtime
     driver: bridge
