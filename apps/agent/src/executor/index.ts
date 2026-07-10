@@ -10,8 +10,10 @@ const MAX_TIMEOUT_MS = 10 * 60 * 1000;
 const TERMINATION_GRACE_MS = 5_000;
 const AGENT_WORK_BASE = "/var/lib/deploylite";
 const AGENT_SECRET_BASE = "/run/deploylite/secrets";
+export const DEPLOYLITE_RUNTIME_NETWORK = "deploylite-runtime";
 const SAFE_REF = /^[A-Za-z0-9][A-Za-z0-9._/-]{0,127}$/;
 const SAFE_ID = /^[a-z0-9][a-z0-9-]{0,62}$/;
+const SAFE_NETWORK = /^deploylite-[a-z0-9][a-z0-9_.-]{0,52}$/;
 const SAFE_REPOSITORY = /^(https:\/\/[^\s]+|git@[A-Za-z0-9._-]+:[A-Za-z0-9._/-]+\.git)$/;
 
 export type CommandPlan = { command: string; args: string[]; cwd?: string };
@@ -270,6 +272,7 @@ export function createDeploymentPlan(input: DeploymentExecutionInput, config: Ex
     command: "docker",
     args: [
       "run", "--detach", "--name", container,
+      "--network", DEPLOYLITE_RUNTIME_NETWORK,
       "--label", "com.deploylite.managed=true",
       "--label", `com.deploylite.command-id=${input.command.id}`,
       "--read-only", "--cap-drop", "ALL", "--security-opt", "no-new-privileges",
@@ -281,7 +284,7 @@ export function createDeploymentPlan(input: DeploymentExecutionInput, config: Ex
       tag
     ]
   };
-  assertSafeRuntimePlan(runtime);
+  assertSafeRuntimePlan(runtime, DEPLOYLITE_RUNTIME_NETWORK);
   return [
     { command: "git", args: ["clone", "--no-checkout", "--depth", "1", input.repoUrl, workspace] },
     { command: "git", args: ["-C", workspace, "fetch", "--depth", "1", "origin", input.ref] },
@@ -306,13 +309,16 @@ export function createRuntimeCleanupPlans(input: DeploymentExecutionInput): Comm
   ];
 }
 
-export function assertSafeRuntimePlan(plan: CommandPlan): true {
-  const forbidden = ["--privileged", "--network", "--pid", "--ipc", "--device", "--cap-add", "--volume", "--mount", "-v"];
+export function assertSafeRuntimePlan(plan: CommandPlan, trustedNetwork = DEPLOYLITE_RUNTIME_NETWORK): true {
+  const forbidden = ["--privileged", "--pid", "--ipc", "--device", "--cap-add", "--volume", "--mount", "-v"];
   if (plan.command !== "docker" || plan.args[0] !== "run") throw new Error("Runtime plan must be a controlled docker run");
   if (plan.args.some((arg) => forbidden.some((option) => arg === option || arg.startsWith(`${option}=`)) || arg.includes("docker.sock"))) {
     throw new Error("Unsafe Docker runtime option rejected");
   }
-  for (const required of ["--read-only", "--cap-drop", "--security-opt", "--pids-limit", "--memory", "--cpus", "--env-file"]) {
+  if (!SAFE_NETWORK.test(trustedNetwork) || plan.args.filter((arg) => arg === "--network").length !== 1 || valueAfter(plan.args, "--network") !== trustedNetwork || plan.args.some((arg) => arg.startsWith("--network="))) {
+    throw new Error("Runtime plan must use the trusted DeployLite network");
+  }
+  for (const required of ["--network", "--read-only", "--cap-drop", "--security-opt", "--pids-limit", "--memory", "--cpus", "--env-file"]) {
     if (!plan.args.includes(required)) throw new Error(`Runtime plan is missing ${required}`);
   }
   if (valueAfter(plan.args, "--cap-drop") !== "ALL" || valueAfter(plan.args, "--security-opt") !== "no-new-privileges") {
@@ -328,14 +334,22 @@ export function imageTag(projectSlug: string, commandId: string): string {
 
 export function containerName(projectSlug: string, commandId: string): string {
   if (!SAFE_ID.test(projectSlug) || !SAFE_ID.test(commandId)) throw new Error("Invalid project slug or command id");
-  return `deploylite-${projectSlug}-${commandId}`;
+  const name = `deploylite-${commandId}`;
+  if (name.length > 63) throw new Error("Runtime container name exceeds the trusted DNS label limit");
+  return name;
 }
 
 function validateInput(input: DeploymentExecutionInput): void {
   if (!SAFE_REPOSITORY.test(input.repoUrl) || hasCredentialedUrl(input.repoUrl)) throw new Error("Invalid repository URL");
   if (!SAFE_REF.test(input.ref) || input.ref.includes("..") || input.ref.startsWith("-")) throw new Error("Invalid git ref");
   imageTag(input.projectSlug, input.command.id);
-  if (!/^https?:\/\/[A-Za-z0-9._:-]+(?:\/[^\s]*)?$/.test(input.healthUrl)) throw new Error("Invalid health URL");
+  let healthUrl: URL;
+  try { healthUrl = new URL(input.healthUrl); }
+  catch { throw new Error("Invalid health URL"); }
+  const port = Number(healthUrl.port);
+  if (healthUrl.protocol !== "http:" || healthUrl.username || healthUrl.password || healthUrl.hostname !== containerName(input.projectSlug, input.command.id) || !Number.isInteger(port) || port < 1 || port > 65_535) {
+    throw new Error("Health URL must target the managed runtime container and internal port");
+  }
   if (!input.envFile || typeof input.envFile.contents !== "string") throw new Error("A secret env-file is required for deployment");
 }
 

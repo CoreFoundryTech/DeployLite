@@ -123,4 +123,5 @@ volumes:
 
 networks:
   deploylite:
+    name: deploylite-runtime
     driver: bridge

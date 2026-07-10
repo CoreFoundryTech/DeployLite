@@ -11,7 +11,7 @@ const command: DeploymentCommand = {
   requestId: "request-1", correlationId: "correlation-1", issuedAt: "2026-01-01T00:00:00.000Z", claimedAt: null, completedAt: null, failureReason: null
 };
 const executorConfig = { workspaceRoot: "/var/lib/deploylite/workspaces", secretRoot: "/run/deploylite/secrets" };
-const input = { command, repoUrl: "https://github.com/acme/service.git", ref: "main", projectSlug: "service", healthUrl: "http://service:3000/health", envFile: { contents: "TOKEN=super-secret" } };
+const input = { command, repoUrl: "https://github.com/acme/service.git", ref: "main", projectSlug: "service", healthUrl: "http://deploylite-command-1:3000/health", envFile: { contents: "TOKEN=super-secret" } };
 
 function setup(results = [{ code: 0, stdout: "", stderr: "", timedOut: false }]) {
   const runner: ProcessRunner = { run: vi.fn(async () => results.shift() ?? { code: 0, stdout: "", stderr: "", timedOut: false }) };
@@ -51,7 +51,7 @@ describe("AgentDeploymentExecutor", () => {
     const result = await test.executor.execute(input);
     expect(result.ok).toBe(false);
     expect(result.reason).not.toContain("super-secret");
-    expect(test.runner.run).toHaveBeenCalledWith(expect.objectContaining({ args: ["rm", "--force", "deploylite-service-command-1"] }), expect.any(Number));
+    expect(test.runner.run).toHaveBeenCalledWith(expect.objectContaining({ args: ["rm", "--force", "deploylite-command-1"] }), expect.any(Number));
     expect(test.runner.run).toHaveBeenCalledWith(expect.objectContaining({ args: ["image", "rm", "--force", "deploylite/service:command-1"] }), expect.any(Number));
     expect(test.filesystem.remove).toHaveBeenCalled();
     expect(test.filesystem.removeSecretFile).toHaveBeenCalledWith(expect.stringMatching(/\.env$/));
@@ -102,7 +102,7 @@ describe("AgentDeploymentExecutor", () => {
     ]);
     const result = await test.executor.execute(input);
     expect(result.reason).toBe("Timed out: docker");
-    expect(test.runner.run).toHaveBeenCalledWith(expect.objectContaining({ args: ["rm", "--force", "deploylite-service-command-1"] }), 60_000);
+    expect(test.runner.run).toHaveBeenCalledWith(expect.objectContaining({ args: ["rm", "--force", "deploylite-command-1"] }), 60_000);
     expect(test.runner.run).toHaveBeenCalledWith(expect.objectContaining({ args: ["image", "rm", "--force", "deploylite/service:command-1"] }), 60_000);
   });
 
@@ -154,6 +154,8 @@ describe("AgentDeploymentExecutor", () => {
     expect(() => createDeploymentPlan(input, { ...executorConfig, workspaceRoot: "/tmp/workspaces" })).toThrow("outside the allowed agent work base");
     expect(() => createDeploymentPlan(input, { ...executorConfig, workspaceRoot: "/var/lib/deploylite/workspaces/../../escape" })).toThrow("outside the allowed agent work base");
     expect(() => createDeploymentPlan({ ...input, envFile: undefined as never }, executorConfig)).toThrow("secret env-file is required");
+    expect(() => createDeploymentPlan({ ...input, healthUrl: "http://127.0.0.1:3000/" }, executorConfig)).toThrow("managed runtime container");
+    expect(() => createDeploymentPlan({ ...input, healthUrl: "http://deploylite-command-1:70000/" }, executorConfig)).toThrow("Invalid health URL");
   });
 
   it("generates a resource-bounded runtime plan outside the repository context and rejects unsafe flags", () => {
@@ -161,10 +163,13 @@ describe("AgentDeploymentExecutor", () => {
     expect(assertSafeRuntimePlan(plan)).toBe(true);
     expect(plan.cwd).toBeUndefined();
     expect(plan.args).toContain("/run/deploylite/secrets/command-1/runtime.env");
-    expect(plan.args.join(" ")).not.toMatch(/compose|--privileged|docker\.sock|--volume|-v |--network |--pid |--ipc |--device |--cap-add/);
+    expect(plan.args).toEqual(expect.arrayContaining(["--network", "deploylite-runtime", "--name", "deploylite-command-1"]));
+    expect(input.healthUrl).toBe("http://deploylite-command-1:3000/health");
+    expect(plan.args.join(" ")).not.toMatch(/compose|--privileged|docker\.sock|--volume|-v |--publish|-p |--network=host|--pid |--ipc |--device |--cap-add/);
     for (const unsafeOption of ["--privileged", "--network=host", "--pid=host", "--ipc=host", "--device=/dev/sda", "--cap-add=SYS_ADMIN", "--volume=/host:/data", "--mount=type=bind,src=/,dst=/host"]) {
-      expect(() => assertSafeRuntimePlan({ ...plan, args: [...plan.args.slice(0, -1), unsafeOption, plan.args.at(-1)!] })).toThrow("Unsafe Docker runtime option rejected");
+      expect(() => assertSafeRuntimePlan({ ...plan, args: [...plan.args.slice(0, -1), unsafeOption, plan.args.at(-1)!] })).toThrow(unsafeOption.startsWith("--network") ? "trusted DeployLite network" : "Unsafe Docker runtime option rejected");
     }
+    expect(() => assertSafeRuntimePlan({ ...plan, args: [...plan.args.slice(0, -1), "--network", "attacker-network", plan.args.at(-1)!] })).toThrow("trusted DeployLite network");
     expect(() => assertSafeRuntimePlan({ ...plan, args: plan.args.map((arg) => arg === "no-new-privileges" ? "seccomp=unconfined" : arg) })).toThrow("weakens container isolation");
   });
 
@@ -221,6 +226,13 @@ describe("agent-only Docker socket compose boundary", () => {
       const block = compose.match(new RegExp(`  ${service}:([\\s\\S]*?)(?=\\n  [a-z][a-z-]*:|\\nvolumes:)`))?.[1] ?? "";
       expect(block).not.toContain(socket);
     }
+  });
+
+  it("pins the agent and generated runtimes to the trusted named network", async () => {
+    const compose = await readFile(resolve(import.meta.dirname, "../../../../infra/vps/compose.yml"), "utf8");
+    const agentBlock = compose.match(/  agent:([\s\S]*?)(?=\n  web:)/)?.[1] ?? "";
+    expect(agentBlock).toMatch(/networks:\s*\n\s*- deploylite/);
+    expect(compose).toMatch(/networks:\s*\n  deploylite:\s*\n    name: deploylite-runtime\s*\n    driver: bridge/);
   });
 
   it("installs the executor runtime tools in the minimal pinned Alpine image", async () => {
