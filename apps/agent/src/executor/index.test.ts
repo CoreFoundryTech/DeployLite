@@ -45,6 +45,21 @@ describe("AgentDeploymentExecutor", () => {
     expect(test.bus.fail).toHaveBeenCalledWith("command-1", expect.not.stringContaining("super-secret"));
   });
 
+  it("removes an env file when writing succeeds but chmod fails", async () => {
+    const test = setup();
+    let writtenEnvFile: string | undefined;
+    test.filesystem.writeSecretFile = vi.fn(async (path) => {
+      writtenEnvFile = path;
+      throw new Error("chmod failed");
+    });
+
+    const result = await test.executor.execute(input);
+
+    expect(result.reason).toBe("chmod failed");
+    expect(writtenEnvFile).toMatch(/\.env$/);
+    expect(test.filesystem.removeSecretFile).toHaveBeenCalledWith(writtenEnvFile);
+  });
+
   it("fails a bounded health probe and cleans up without running shell interpolation", async () => {
     const test = setup();
     test.health.probe = vi.fn(async () => false);

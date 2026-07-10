@@ -168,8 +168,8 @@ export class AgentDeploymentExecutor {
     try {
       await this.filesystem.create(workspace!);
       for (const plan of plans.slice(0, 3)) await this.run(plan);
-      await this.filesystem.writeSecretFile(envFilePath, input.envFile.contents);
       envFileWritten = true;
+      await this.filesystem.writeSecretFile(envFilePath, input.envFile.contents);
       await this.run(plans[3]!);
       composeStarted = true;
       await this.run(plans.at(-1)!);
