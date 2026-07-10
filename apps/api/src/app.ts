@@ -1,6 +1,8 @@
 import { createAuditLogRecord, createCorrelationContext, createRequestId, parseDeployLiteEnv, type DeployLiteEnv, createEnvSecretCipher, EnvSecretCipherError, EnvSecretKeyInvalidError, EnvSecretKeyMissingError, ENCRYPTION_KEY_VERSION, loadEnvSecretKey, redactLogMessage, redactSecrets, type EnvSecretCipher } from "@deploylite/config";
 import {
   agentRegistrationSchema,
+  agentSelfHeartbeatSchema,
+  agentSelfRegistrationSchema,
   authLoginRequestSchema,
   bootstrapInitialAdminRequestSchema,
   deployRequestSchema,
@@ -850,6 +852,38 @@ function registerRoutes(app: FastifyInstance, state: PlatformRepositories, adapt
   const requireAuditReadRole = createRolePreHandler(adapters, ["admin", "operator"]);
 
   app.get(`${API_PREFIX}/health`, async (request) => ok(request, { status: "ok", service: "deploylite-api", auth: "cookie-session" }));
+  app.post(`${API_PREFIX}/agent/register`, async (request, reply) => {
+    if (!authenticateAgentRequest(request, reply, state.externalAgentIdentity)) return reply;
+    const parsed = agentSelfRegistrationSchema.safeParse(request.body);
+    if (!parsed.success) return reply.code(400).send(errorEnvelope(request, "VALIDATION_ERROR", "Invalid agent registration request."));
+    if (parsed.data.agentId !== state.externalAgentIdentity.agentId) {
+      return reply.code(403).send(errorEnvelope(request, "AGENT_IDENTITY_MISMATCH", "Agent identity mismatch."));
+    }
+    const existing = await state.agents.findById(parsed.data.agentId);
+    const agent: Agent = {
+      id: parsed.data.agentId,
+      name: parsed.data.name,
+      endpoint: parsed.data.endpoint,
+      status: "online",
+      lastHeartbeatAt: parsed.data.observedAt,
+      resourceSnapshot: parsed.data.resourceSnapshot
+    };
+    await state.agents.save(agent);
+    return reply.code(existing ? 200 : 201).send(agent);
+  });
+  app.post(`${API_PREFIX}/agent/:agentId/heartbeat`, async (request, reply) => {
+    if (!authenticateAgentRequest(request, reply, state.externalAgentIdentity)) return reply;
+    const params = z.object({ agentId: agentIdSchema }).safeParse(request.params);
+    const body = agentSelfHeartbeatSchema.safeParse(request.body);
+    if (!params.success || !body.success) return reply.code(400).send(errorEnvelope(request, "VALIDATION_ERROR", "Invalid agent heartbeat request."));
+    if (params.data.agentId !== state.externalAgentIdentity.agentId || body.data.agentId !== state.externalAgentIdentity.agentId) {
+      return reply.code(403).send(errorEnvelope(request, "AGENT_IDENTITY_MISMATCH", "Agent identity mismatch."));
+    }
+    const existing = await state.agents.findById(params.data.agentId);
+    if (!existing) return reply.code(404).send(errorEnvelope(request, "AGENT_NOT_REGISTERED", "Agent is not registered."));
+    const agent = await state.agentStatus.recordHeartbeat({ ...body.data, ...request.correlationContext });
+    return reply.send(agent);
+  });
   app.get(`${API_PREFIX}/agent/commands/next`, async (request, reply) => {
     if (!authenticateAgentRequest(request, reply, state.externalAgentIdentity)) return reply;
     const parsed = z.object({ agentId: agentIdSchema }).safeParse(request.query);

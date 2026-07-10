@@ -48,7 +48,7 @@ function command(overrides: Partial<DeploymentCommand> = {}): DeploymentCommand 
   };
 }
 
-async function fixture(commandOverrides: Partial<DeploymentCommand> = {}) {
+async function fixture(commandOverrides: Partial<DeploymentCommand> = {}, registerAgent = true) {
   const agents = new InMemoryAgentRepository();
   const deployments = new InMemoryDeploymentRepository();
   const projects = new MemoryProjectRepository();
@@ -59,7 +59,7 @@ async function fixture(commandOverrides: Partial<DeploymentCommand> = {}) {
   const agent: Agent = { id: agentId, name: "Agent", endpoint: "http://agent.test", status: "online", lastHeartbeatAt: null, resourceSnapshot: null };
   const project: Project = { id: projectId, name: "Service", repoUrl: "https://github.com/acme/service.git", defaultBranch: "main", buildCommand: null, runCommand: null, port: 3000, description: null, imageTag: null };
   const deployment: Deployment = { id: deploymentId, projectId, agentId, status: "queued", commitSha: "abcdef1", startedAt: "2026-07-10T00:00:00.000Z", finishedAt: null };
-  await agents.save(agent);
+  if (registerAgent) await agents.save(agent);
   await projects.save(project);
   await deployments.save(deployment);
   await commands.save(command(commandOverrides));
@@ -81,12 +81,37 @@ async function fixture(commandOverrides: Partial<DeploymentCommand> = {}) {
     return new Response(response.statusCode === 204 ? null : response.body, { status: response.statusCode, headers: response.headers as Record<string, string> });
   });
   const transport = new HttpAgentCommandTransport({ apiUrl: "http://api.test", token, fetch });
-  return { app, commands, deployments, secrets, transport };
+  return { app, agents, commands, deployments, secrets, transport };
 }
 
 afterEach(() => vi.restoreAllMocks());
 
 describe("agent command HTTP transport integration", () => {
+  it("registers a fresh agent idempotently and records authenticated heartbeats", async () => {
+    const { agents, transport } = await fixture({}, false);
+    const resourceSnapshot = { cpuLoad: 0.2, memoryUsedBytes: 10, memoryTotalBytes: 100, diskUsedBytes: 20, diskTotalBytes: 200 };
+    const registration = { agentId, name: "Production agent", endpoint: "http://agent:3002", observedAt: "2026-07-10T00:00:00.000Z", resourceSnapshot };
+    await expect(transport.poll(agentId, new AbortController().signal)).resolves.toBeNull();
+    await expect(transport.register(registration, new AbortController().signal)).resolves.toMatchObject({ id: agentId, status: "online", lastHeartbeatAt: registration.observedAt });
+    await expect(transport.register({ ...registration, name: "Production agent restarted" }, new AbortController().signal)).resolves.toMatchObject({ id: agentId, name: "Production agent restarted" });
+    await expect(transport.heartbeat(agentId, "2026-07-10T00:00:30.000Z", { ...resourceSnapshot, cpuLoad: 0.3 }, new AbortController().signal)).resolves.toMatchObject({ id: agentId, status: "online", lastHeartbeatAt: "2026-07-10T00:00:30.000Z", resourceSnapshot: { cpuLoad: 0.3 } });
+    expect(await agents.findById(agentId)).toMatchObject({ status: "online", lastHeartbeatAt: "2026-07-10T00:00:30.000Z" });
+    expect(await agents.list()).toHaveLength(1);
+  });
+
+  it("denies registration token failures and isolates the bound agent id", async () => {
+    const { app, agents } = await fixture({}, false);
+    const payload = { agentId, name: "Agent", endpoint: "http://agent:3002", observedAt: "2026-07-10T00:00:00.000Z", resourceSnapshot: { cpuLoad: 0.2, memoryUsedBytes: 10, memoryTotalBytes: 100, diskUsedBytes: 20, diskTotalBytes: 200 } };
+    const denied = await app.inject({ method: "POST", url: "/api/v1/agent/register", headers: { authorization: "Bearer wrong-token", "content-type": "application/json" }, payload });
+    const isolated = await app.inject({ method: "POST", url: "/api/v1/agent/register", headers: { authorization: `Bearer ${token}`, "content-type": "application/json" }, payload: { ...payload, agentId: otherAgentId } });
+    const heartbeatIsolated = await app.inject({ method: "POST", url: `/api/v1/agent/${agentId}/heartbeat`, headers: { authorization: `Bearer ${token}`, "content-type": "application/json" }, payload: { agentId: otherAgentId, observedAt: payload.observedAt, resourceSnapshot: payload.resourceSnapshot } });
+    expect(denied.statusCode).toBe(403);
+    expect(isolated.statusCode).toBe(403);
+    expect(heartbeatIsolated.statusCode).toBe(403);
+    expect(await agents.list()).toEqual([]);
+    expect(`${denied.body}${isolated.body}${heartbeatIsolated.body}`).not.toContain(token);
+  });
+
   it("denies missing and invalid bearer credentials without exposing the configured token", async () => {
     const { app, commands, deployments } = await fixture();
     const missing = await app.inject({ method: "GET", url: `/api/v1/agent/commands/next?agentId=${agentId}` });

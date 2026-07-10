@@ -244,6 +244,20 @@ describe("agent-only Docker socket compose boundary", () => {
     expect(compose).toMatch(/networks:\s*\n  control-plane:\s*\n    name: deploylite-control-plane\s*\n    driver: bridge\s*\n  runtime:\s*\n    name: deploylite-runtime\s*\n    driver: bridge/);
   });
 
+  it("wires stable agent identity and a durable agent-only acknowledgement volume without embedding a token", async () => {
+    const compose = await readFile(resolve(import.meta.dirname, "../../../../infra/vps/compose.yml"), "utf8");
+    const agentBlock = compose.match(/  agent:([\s\S]*?)(?=\n  web:)/)?.[1] ?? "";
+    expect(agentBlock).toContain("DEPLOYLITE_AGENT_NAME:");
+    expect(agentBlock).toContain("DEPLOYLITE_AGENT_ENDPOINT:");
+    expect(agentBlock).toContain("DEPLOYLITE_AGENT_TOKEN: ${DEPLOYLITE_AGENT_TOKEN:?");
+    expect(agentBlock).toContain("agent-state:/var/lib/deploylite/state");
+    for (const service of ["postgres", "migrate", "api", "web"]) {
+      const block = compose.match(new RegExp(`  ${service}:([\\s\\S]*?)(?=\\n  [a-z][a-z-]*:|\\nvolumes:)`))?.[1] ?? "";
+      expect(block).not.toContain("agent-state:/var/lib/deploylite/state");
+    }
+    expect(compose).not.toMatch(/DEPLOYLITE_AGENT_TOKEN:\s+[A-Za-z0-9]{32,}/);
+  });
+
   it("installs the executor runtime tools in the minimal pinned Alpine image", async () => {
     const dockerfile = await readFile(resolve(import.meta.dirname, "../../Dockerfile"), "utf8");
     expect(dockerfile).toContain("node:22.14.0-alpine3.21");

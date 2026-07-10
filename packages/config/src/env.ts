@@ -15,6 +15,8 @@ export const deployLiteEnvSchema = z.object({
   DEPLOYLITE_API_PORT: z.coerce.number().int().min(1).max(65_535).default(3001),
   DEPLOYLITE_AGENT_ID: z.string().uuid().optional(),
   DEPLOYLITE_AGENT_TOKEN: z.string().min(32).optional(),
+  DEPLOYLITE_AGENT_NAME: z.string().min(1).max(128).optional(),
+  DEPLOYLITE_AGENT_ENDPOINT: z.string().url().optional(),
   DATABASE_URL: z.string().url().optional(),
   DEPLOYLITE_SECRET_KEY: z.string().min(1).optional(),
   DEPLOYLITE_SESSION_TTL_SECONDS: z.coerce.number().int().positive().default(60 * 60 * 8),

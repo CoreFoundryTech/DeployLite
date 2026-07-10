@@ -2,15 +2,25 @@ import { AgentDeploymentExecutor, nodeWorkspaceFilesystem, spawnProcessRunner, t
 import { parseDeployLiteEnv } from "@deploylite/config";
 import { redactEnvFileForLog } from "./redaction.js";
 import { AgentWorker, HttpAgentCommandTransport } from "./worker.js";
+import { DurableTerminalCommandBus, FileTerminalOutbox } from "./terminal-outbox.js";
+import { cpus, freemem, loadavg, totalmem } from "node:os";
+import { statfs } from "node:fs/promises";
 
 export async function runAgentEntrypoint(env: NodeJS.ProcessEnv = process.env): Promise<void> {
   const config = parseDeployLiteEnv(env);
   const agentId = required(config, "DEPLOYLITE_AGENT_ID");
+  const agentName = required(config, "DEPLOYLITE_AGENT_NAME");
+  const agentEndpoint = required(config, "DEPLOYLITE_AGENT_ENDPOINT");
   const transport = new HttpAgentCommandTransport({
     apiUrl: config.DEPLOYLITE_API_URL,
     token: required(config, "DEPLOYLITE_AGENT_TOKEN")
   });
   const logger: ExecutorLogger = { log: (level, message) => console[level](redactEnvFileForLog(message)) };
+  const terminalBus = new DurableTerminalCommandBus(
+    agentId,
+    transport,
+    new FileTerminalOutbox(env.DEPLOYLITE_AGENT_OUTBOX_PATH ?? "/var/lib/deploylite/state/terminal-acks.json")
+  );
   const health: HealthProbe = {
     async probe(url, timeoutMs) {
       try {
@@ -21,7 +31,7 @@ export async function runAgentEntrypoint(env: NodeJS.ProcessEnv = process.env): 
   };
   const executor = new AgentDeploymentExecutor(
     spawnProcessRunner,
-    transport,
+    terminalBus,
     health,
     logger,
     undefined,
@@ -31,7 +41,30 @@ export async function runAgentEntrypoint(env: NodeJS.ProcessEnv = process.env): 
       secretRoot: "/run/deploylite/secrets"
     }
   );
-  const worker = new AgentWorker({ agentId, transport, executor, logger });
+  const worker = new AgentWorker({
+    agentId,
+    agentName,
+    agentEndpoint,
+    transport,
+    executor,
+    terminalAcks: terminalBus,
+    resourceCollector: {
+      async collect() {
+        const memoryTotalBytes = totalmem();
+        const disk = await statfs("/");
+        const diskTotalBytes = disk.blocks * disk.bsize;
+        const diskAvailableBytes = disk.bavail * disk.bsize;
+        return {
+          cpuLoad: Math.min(1, Math.max(0, loadavg()[0]! / Math.max(1, cpus().length))),
+          memoryUsedBytes: Math.max(0, memoryTotalBytes - freemem()),
+          memoryTotalBytes,
+          diskUsedBytes: Math.max(0, diskTotalBytes - diskAvailableBytes),
+          diskTotalBytes
+        };
+      }
+    },
+    logger
+  });
   const shutdown = new AbortController();
   const stop = () => shutdown.abort();
   process.once("SIGTERM", stop);

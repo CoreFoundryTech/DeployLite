@@ -1,6 +1,8 @@
 import { describe, expect, it } from "vitest";
 import {
   agentHeartbeatSchema,
+  agentSelfHeartbeatSchema,
+  agentSelfRegistrationSchema,
   bootstrapInitialAdminRequestSchema,
   bootstrapStatusSchema,
   deploymentCommandEventTypeSchema,
@@ -36,6 +38,12 @@ describe("contracts", () => {
     });
 
     expect(result.success).toBe(false);
+  });
+
+  it("keeps agent self-registration and heartbeat identity explicit and strict", () => {
+    const resourceSnapshot = { cpuLoad: 0.2, memoryUsedBytes: 10, memoryTotalBytes: 20, diskUsedBytes: 30, diskTotalBytes: 40 };
+    expect(agentSelfRegistrationSchema.parse({ agentId: "agent_1", name: "Agent", endpoint: "http://agent.test", observedAt: now, resourceSnapshot })).toMatchObject({ agentId: "agent_1" });
+    expect(agentSelfHeartbeatSchema.safeParse({ agentId: "agent_1", observedAt: now, resourceSnapshot, token: "forbidden" }).success).toBe(false);
   });
 
   it("requires log events to carry request context and redaction state", () => {

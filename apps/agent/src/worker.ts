@@ -1,4 +1,4 @@
-import { deploymentCommandSchema, type DeploymentCommand } from "@deploylite/contracts";
+import { agentSchema, deploymentCommandSchema, resourceSnapshotSchema, type Agent, type DeploymentCommand } from "@deploylite/contracts";
 import { z } from "zod";
 import type { CommandBusClient, DeploymentExecutionInput, DeploymentExecutionResult, ExecutorLogger } from "./executor/index.js";
 import { redactEnvFileForLog } from "./redaction.js";
@@ -14,8 +14,15 @@ const executionInputSchema = z.object({
 });
 
 export type AgentCommandTransport = CommandBusClient & {
+  register(input: AgentRegistrationInput, signal: AbortSignal): Promise<Agent>;
+  heartbeat(agentId: string, observedAt: string, resourceSnapshot: ResourceSnapshot, signal: AbortSignal): Promise<Agent>;
   poll(agentId: string, signal: AbortSignal): Promise<DeploymentExecutionInput | null>;
 };
+
+export type ResourceSnapshot = z.infer<typeof resourceSnapshotSchema>;
+export type ResourceSnapshotCollector = { collect(): Promise<ResourceSnapshot> };
+export type AgentRegistrationInput = { agentId: string; name: string; endpoint: string; observedAt: string; resourceSnapshot: ResourceSnapshot };
+export type TerminalAcknowledgementReplayer = { replayPending(): Promise<boolean> };
 
 export type DeploymentExecutorPort = {
   execute(input: DeploymentExecutionInput): Promise<DeploymentExecutionResult>;
@@ -23,10 +30,17 @@ export type DeploymentExecutorPort = {
 
 export type AgentWorkerOptions = {
   agentId: string;
+  agentName: string;
+  agentEndpoint: string;
   transport: AgentCommandTransport;
   executor: DeploymentExecutorPort;
+  resourceCollector: ResourceSnapshotCollector;
+  terminalAcks?: TerminalAcknowledgementReplayer;
   logger?: ExecutorLogger;
   retryDelayMs?: number;
+  heartbeatIntervalMs?: number;
+  maxHeartbeatBackoffMs?: number;
+  now?: () => Date;
   wait?: (milliseconds: number, signal: AbortSignal) => Promise<void>;
 };
 
@@ -34,16 +48,43 @@ export class AgentWorker {
   readonly #logger: ExecutorLogger;
   readonly #retryDelayMs: number;
   readonly #wait: (milliseconds: number, signal: AbortSignal) => Promise<void>;
+  readonly #heartbeatIntervalMs: number;
+  readonly #maxHeartbeatBackoffMs: number;
+  readonly #now: () => Date;
 
   constructor(private readonly options: AgentWorkerOptions) {
     this.#logger = options.logger ?? { log: () => undefined };
     this.#retryDelayMs = options.retryDelayMs ?? 1_000;
     this.#wait = options.wait ?? abortableWait;
+    this.#heartbeatIntervalMs = Math.min(60_000, Math.max(5_000, options.heartbeatIntervalMs ?? 15_000));
+    this.#maxHeartbeatBackoffMs = Math.min(60_000, Math.max(this.#retryDelayMs, options.maxHeartbeatBackoffMs ?? 30_000));
+    this.#now = options.now ?? (() => new Date());
   }
 
   async run(signal: AbortSignal): Promise<void> {
+    const initialSnapshot = resourceSnapshotSchema.parse(await this.options.resourceCollector.collect());
+    const registered = await this.options.transport.register({
+      agentId: this.options.agentId,
+      name: this.options.agentName,
+      endpoint: this.options.agentEndpoint,
+      observedAt: this.#now().toISOString(),
+      resourceSnapshot: initialSnapshot
+    }, signal);
+    if (registered.id !== this.options.agentId) throw new Error("Agent registration identity mismatch");
+    await Promise.all([this.pollLoop(signal), this.heartbeatLoop(signal)]);
+  }
+
+  private async pollLoop(signal: AbortSignal): Promise<void> {
+    let terminalRetryMs = this.#retryDelayMs;
     while (!signal.aborted) {
       try {
+        if (this.options.terminalAcks && !(await this.options.terminalAcks.replayPending())) {
+          await this.safeLog("error", "Terminal acknowledgement retry failed");
+          await this.#wait(terminalRetryMs, signal);
+          terminalRetryMs = Math.min(this.#maxHeartbeatBackoffMs, Math.max(this.#retryDelayMs, terminalRetryMs * 2));
+          continue;
+        }
+        terminalRetryMs = this.#retryDelayMs;
         const input = await this.options.transport.poll(this.options.agentId, signal);
         if (signal.aborted) break;
         if (!input) {
@@ -60,6 +101,25 @@ export class AgentWorker {
         if (signal.aborted) break;
         await this.safeLog("error", `Agent poll failed: ${safeError(error)}`);
         await this.#wait(this.#retryDelayMs, signal);
+      }
+    }
+  }
+
+  private async heartbeatLoop(signal: AbortSignal): Promise<void> {
+    let retryMs = this.#retryDelayMs;
+    while (!signal.aborted) {
+      await this.#wait(this.#heartbeatIntervalMs, signal);
+      if (signal.aborted) break;
+      try {
+        const snapshot = resourceSnapshotSchema.parse(await this.options.resourceCollector.collect());
+        const agent = await this.options.transport.heartbeat(this.options.agentId, this.#now().toISOString(), snapshot, signal);
+        if (agent.id !== this.options.agentId) throw new Error("Agent heartbeat identity mismatch");
+        retryMs = this.#retryDelayMs;
+      } catch (error) {
+        if (signal.aborted) break;
+        await this.safeLog("error", `Agent heartbeat failed: ${safeError(error)}`);
+        await this.#wait(retryMs, signal);
+        retryMs = Math.min(this.#maxHeartbeatBackoffMs, Math.max(this.#retryDelayMs, retryMs * 2));
       }
     }
   }
@@ -85,6 +145,21 @@ export class HttpAgentCommandTransport implements AgentCommandTransport {
     if (!/^https?:$/.test(this.#baseUrl.protocol)) throw new Error("Agent API URL must use HTTP or HTTPS");
     if (!options.token) throw new Error("Agent API token is required");
     this.#fetch = options.fetch ?? fetch;
+  }
+
+  async register(input: AgentRegistrationInput, signal: AbortSignal): Promise<Agent> {
+    const result = await this.request("/api/v1/agent/register", {
+      method: "POST", signal, headers: { "content-type": "application/json" }, body: JSON.stringify(input)
+    });
+    return agentSchema.parse(result);
+  }
+
+  async heartbeat(agentId: string, observedAt: string, resourceSnapshot: ResourceSnapshot, signal: AbortSignal): Promise<Agent> {
+    const result = await this.request(`/api/v1/agent/${encodeURIComponent(agentId)}/heartbeat`, {
+      method: "POST", signal, headers: { "content-type": "application/json" },
+      body: JSON.stringify({ agentId, observedAt, resourceSnapshot: resourceSnapshotSchema.parse(resourceSnapshot) })
+    });
+    return agentSchema.parse(result);
   }
 
   async poll(agentId: string, signal: AbortSignal): Promise<DeploymentExecutionInput | null> {

@@ -14,6 +14,7 @@ import { z } from "zod";
 export * from "./executor/index.js";
 export * from "./worker.js";
 export * from "./redaction.js";
+export * from "./terminal-outbox.js";
 
 export const safeCommandEnvelopeSchema = z.object({
   commandId: z.string().min(1),
