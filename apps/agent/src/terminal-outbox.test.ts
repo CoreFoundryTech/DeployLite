@@ -73,6 +73,39 @@ describe("DurableTerminalCommandBus", () => {
     expect(await outbox.load()).toEqual([]);
   });
 
+  it.each(["complete", "fail"] as const)("drains only a late %s intent after authoritative cancellation", async (action) => {
+    const otherCommandId = "66666666-6666-4666-8666-666666666666";
+    const outbox = new InMemoryTerminalOutbox([
+      { version: 1, commandId, agentId, action, ...(action === "fail" ? { reason: "safe" } : {}), createdAt: "2026-01-01T00:00:02.000Z" },
+      { version: 1, commandId: otherCommandId, agentId, action: "complete", createdAt: "2026-01-01T00:00:03.000Z" }
+    ]);
+    const cancelled = { ...base, state: "cancelled" as const, leaseExpiresAt: null, completedAt: "2026-01-01T00:00:02.000Z" };
+    const recordConflict = vi.fn();
+    const complete = vi.fn(async (id: string) => {
+      if (id === commandId) throw new AuthoritativeTerminalConflictError(cancelled, "completed");
+      throw new Error("unrelated ACK remains unavailable");
+    });
+    const fail = vi.fn(async (id: string) => {
+      if (id === commandId) throw new AuthoritativeTerminalConflictError(cancelled, "failed");
+      throw new Error("unexpected fail");
+    });
+    const bus = new DurableTerminalCommandBus(agentId, transport({ complete, fail }), outbox, undefined, recordConflict);
+
+    await expect(bus.replayPending()).resolves.toBe(false);
+
+    expect(recordConflict).toHaveBeenCalledWith(expect.objectContaining({ commandId, agentId, attemptedState: action === "complete" ? "completed" : "failed", authoritativeState: "cancelled" }));
+    expect(await outbox.load()).toEqual([expect.objectContaining({ commandId: otherCommandId, action: "complete" })]);
+  });
+
+  it("rejects a cancelled conflict with a mismatched assignment and preserves the intent", async () => {
+    const outbox = new InMemoryTerminalOutbox([{ version: 1, commandId, agentId, action: "complete", createdAt: "2026-01-01T00:00:02.000Z" }]);
+    const foreign = { ...base, agentId: "foreign-agent", state: "cancelled" as const, leaseExpiresAt: null, completedAt: "2026-01-01T00:00:02.000Z" };
+    const bus = new DurableTerminalCommandBus(agentId, transport({ complete: vi.fn(async () => { throw new AuthoritativeTerminalConflictError(foreign, "completed"); }) }), outbox);
+
+    await expect(bus.replayPending()).resolves.toBe(false);
+    expect(await outbox.load()).toEqual([expect.objectContaining({ commandId, agentId, action: "complete" })]);
+  });
+
   it("keeps the monotonic completion intent unless the conflict proves command and assignment identity", async () => {
     const outbox = new InMemoryTerminalOutbox([{ version: 1, commandId, agentId, action: "complete", createdAt: "2026-01-01T00:00:02.000Z" }]);
     const foreign = { ...base, id: "foreign-command", state: "failed" as const, leaseExpiresAt: null, completedAt: "2026-01-01T00:00:32.000Z", failureReason: "expired" };
@@ -112,7 +145,7 @@ describe("FileTerminalOutbox", () => {
     const otherCommandId = "66666666-6666-4666-8666-666666666666";
     await first.put({ version: 1, commandId, agentId, action: "complete", createdAt: "2026-01-01T00:00:00.000Z" });
     await first.put({ version: 1, commandId: otherCommandId, agentId, action: "complete", createdAt: "2026-01-01T00:00:01.000Z" });
-    const reconciled = { ...base, state: "failed" as const, leaseExpiresAt: null, completedAt: "2026-01-01T00:00:32.000Z", failureReason: "lease expired" };
+    const reconciled = { ...base, state: "cancelled" as const, leaseExpiresAt: null, completedAt: "2026-01-01T00:00:32.000Z" };
     const complete = vi.fn(async (id: string) => {
       if (id === commandId) throw new AuthoritativeTerminalConflictError(reconciled, "completed");
       return { ...base, id, state: "completed" as const, leaseExpiresAt: null, completedAt: "2026-01-01T00:00:02.000Z" };

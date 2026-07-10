@@ -70,7 +70,8 @@ describe("deployment command bus persistence mapping", () => {
     expect(method).toContain("eq(deploymentCommands.id, commandId)");
     expect(method).toContain("eq(deploymentCommands.agentId, agentId)");
     expect(method).toContain("eq(deploymentCommands.state, expectedState)");
-    expect(method).toContain("lte(deploymentCommands.leaseExpiresAt, new Date(condition.leaseExpiresAtNotAfter))");
+    expect(method).toContain("lte(deploymentCommands.leaseExpiresAt, sql`clock_timestamp()`)");
+    expect(method).toContain("gt(deploymentCommands.leaseExpiresAt, sql`clock_timestamp()`)");
     expect(method).toContain("const authoritative = await this.findById(commandId)");
   });
 });

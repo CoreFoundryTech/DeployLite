@@ -1,4 +1,4 @@
-import { and, asc, desc, eq, gt, inArray, lte } from "drizzle-orm";
+import { and, asc, desc, eq, gt, inArray, lte, sql } from "drizzle-orm";
 import type { DeploymentCommandKind, DeploymentCommandState } from "@deploylite/contracts";
 import type {
   DeploymentCommandBusSubmitInput,
@@ -107,7 +107,7 @@ export class DbDeploymentCommandRepository implements DeploymentCommandRepositor
     agentId: string,
     expectedState: "pending" | "claimed",
     next: Pick<DeploymentCommandRecord, "state" | "completedAt" | "leaseExpiresAt" | "failureReason" | "payload">,
-    condition?: { leaseExpiresAtNotAfter: string }
+    condition?: { leaseExpiresAtNotAfterNow: () => string } | { leaseExpiresAtAfterNow: () => string }
   ): Promise<{ command: DeploymentCommandRecord; applied: boolean } | null> {
     const [row] = await this.db.update(deploymentCommands).set({
       state: next.state,
@@ -120,7 +120,9 @@ export class DbDeploymentCommandRepository implements DeploymentCommandRepositor
       eq(deploymentCommands.id, commandId),
       eq(deploymentCommands.agentId, agentId),
       eq(deploymentCommands.state, expectedState),
-      ...(condition ? [lte(deploymentCommands.leaseExpiresAt, new Date(condition.leaseExpiresAtNotAfter))] : [])
+      ...(condition && "leaseExpiresAtNotAfterNow" in condition
+        ? [lte(deploymentCommands.leaseExpiresAt, sql`clock_timestamp()`)]
+        : condition ? [gt(deploymentCommands.leaseExpiresAt, sql`clock_timestamp()`)] : [])
     )).returning();
     if (row) return { command: toDeploymentCommand(row), applied: true };
     const authoritative = await this.findById(commandId);

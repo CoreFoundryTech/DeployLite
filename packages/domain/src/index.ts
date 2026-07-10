@@ -201,7 +201,7 @@ export type DeploymentCommandRepository = {
     agentId: string,
     expectedState: "pending" | "claimed",
     next: Pick<DeploymentCommandRecord, "state" | "completedAt" | "leaseExpiresAt" | "failureReason" | "payload">,
-    condition?: { leaseExpiresAtNotAfter: string }
+    condition?: { leaseExpiresAtNotAfterNow: () => string } | { leaseExpiresAtAfterNow: () => string }
   ): Promise<{ command: DeploymentCommandRecord; applied: boolean } | null>;
   findById(id: string): Promise<DeploymentCommandRecord | null>;
   findActiveForDeployment(deploymentId: string): Promise<DeploymentCommandRecord | null>;
@@ -526,13 +526,18 @@ export class InMemoryDeploymentCommandRepository implements DeploymentCommandRep
     agentId: string,
     expectedState: "pending" | "claimed",
     next: Pick<DeploymentCommandRecord, "state" | "completedAt" | "leaseExpiresAt" | "failureReason" | "payload">,
-    condition?: { leaseExpiresAtNotAfter: string }
+    condition?: { leaseExpiresAtNotAfterNow: () => string } | { leaseExpiresAtAfterNow: () => string }
   ): Promise<{ command: DeploymentCommandRecord; applied: boolean } | null> {
     const existing = this.#commands.get(commandId);
     if (!existing || existing.agentId !== agentId) return null;
     if (existing.state !== expectedState) return { command: structuredClone(existing), applied: false };
-    if (condition && (!existing.leaseExpiresAt || existing.leaseExpiresAt > condition.leaseExpiresAtNotAfter)) {
-      return { command: structuredClone(existing), applied: false };
+    if (condition) {
+      if ("leaseExpiresAtNotAfterNow" in condition && (!existing.leaseExpiresAt || existing.leaseExpiresAt > condition.leaseExpiresAtNotAfterNow())) {
+        return { command: structuredClone(existing), applied: false };
+      }
+      if ("leaseExpiresAtAfterNow" in condition && (!existing.leaseExpiresAt || existing.leaseExpiresAt <= condition.leaseExpiresAtAfterNow())) {
+        return { command: structuredClone(existing), applied: false };
+      }
     }
     const command = structuredClone({ ...existing, ...next });
     this.#commands.set(command.id, command);

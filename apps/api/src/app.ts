@@ -511,7 +511,7 @@ function createApiState(env: EnvSecretKeySource, overrides: Partial<PlatformRepo
   });
   deploymentCommandBus.registerExecutor(deploymentExecutor);
 
-  return {
+  const state: PlatformRepositories = {
     agents,
     deployments,
     projects,
@@ -527,6 +527,10 @@ function createApiState(env: EnvSecretKeySource, overrides: Partial<PlatformRepo
     externalAgentIdentity: agentId && agentToken ? { agentId, token: agentToken } : null,
     now
   };
+  deploymentCommandBus.onEvent(async (event) => {
+    if (event.type === "deployment.command.cancelled") await projectAuthoritativeTerminalCommand(state, event.command);
+  });
+  return state;
 }
 
 function asEnvSecretMaterializationRepository(repository: EnvSecretValueRepository): EnvSecretMaterializationRepository {
@@ -783,6 +787,13 @@ async function projectAuthoritativeTerminalCommand(
       marker: failedLifecycle?.marker ?? "Agent command failed",
       message: failedLifecycle?.message ?? fallback
     });
+  } else if (command.state === "cancelled") {
+    await ensureAgentDeploymentLifecycle(state, command, {
+      status: "canceled",
+      level: "error",
+      marker: "Deployment command cancelled",
+      message: "Deployment command cancelled; deployment was canceled."
+    });
   }
 }
 
@@ -818,11 +829,12 @@ async function reconcileExpiredClaims(state: PlatformRepositories, agentId: stri
         message: `Agent command lease expired: ${redactLogMessage(command.failureReason).slice(0, INVALID_COMMAND_REASON_MAX)}`
       });
     }
+    if (command.state === "cancelled") await projectAuthoritativeTerminalCommand(state, command);
   }
 }
 
 type AgentDeploymentLifecycle = {
-  status: "running" | "succeeded" | "failed";
+  status: "running" | "succeeded" | "failed" | "canceled";
   level: "info" | "error";
   marker: string;
   message: string;
@@ -835,14 +847,14 @@ async function ensureAgentDeploymentLifecycle(
 ): Promise<void> {
   const deployment = await state.deployments.findById(command.deploymentId);
   if (!deployment || deployment.agentId !== command.agentId) throw new Error("Linked deployment is unavailable for agent lifecycle update");
-  const terminal = lifecycle.status === "succeeded" || lifecycle.status === "failed";
+  const terminal = lifecycle.status === "succeeded" || lifecycle.status === "failed" || lifecycle.status === "canceled";
   const startedAt = lifecycle.status === "running" ? deployment.startedAt ?? state.now().toISOString() : deployment.startedAt;
   if (deployment.status !== lifecycle.status || deployment.startedAt !== startedAt || (terminal && !deployment.finishedAt)) {
     await state.deployments.save({
       ...deployment,
       status: lifecycle.status,
       startedAt,
-      finishedAt: terminal ? deployment.finishedAt ?? new Date().toISOString() : null
+      finishedAt: terminal ? deployment.finishedAt ?? command.completedAt ?? state.now().toISOString() : null
     });
   }
 
@@ -856,7 +868,7 @@ async function ensureAgentDeploymentLifecycle(
     sequence: Math.max(0, ...logs.map((log) => log.sequence)) + 1,
     level: lifecycle.level,
     message: lifecycle.message,
-    timestamp: new Date().toISOString(),
+    timestamp: command.completedAt ?? state.now().toISOString(),
     redactionApplied: true,
     requestId: command.requestId,
     correlationId: command.correlationId
@@ -1088,6 +1100,10 @@ function registerRoutes(app: FastifyInstance, state: PlatformRepositories, adapt
       await projectAuthoritativeTerminalCommand(state, existing);
       return reply.code(409).send(terminalConflictResponse(request, existing, "completed"));
     }
+    if (existing.state === "cancelled") {
+      await projectAuthoritativeTerminalCommand(state, existing);
+      return reply.code(409).send(terminalConflictResponse(request, existing, "completed"));
+    }
     if (existing.state !== "claimed") return reply.code(409).send(errorEnvelope(request, "COMMAND_STATE_CONFLICT", "Command cannot be completed in its current state."));
     if (!existing.leaseExpiresAt || new Date(existing.leaseExpiresAt).getTime() <= state.now().getTime()) {
       const authoritative = await terminallyExpireAgentCommand(state, existing, "Agent command lease expired; completion was rejected.", "Agent command lease expired");
@@ -1114,6 +1130,10 @@ function registerRoutes(app: FastifyInstance, state: PlatformRepositories, adapt
       return reply.send(existing);
     }
     if (existing.state === "completed") {
+      await projectAuthoritativeTerminalCommand(state, existing);
+      return reply.code(409).send(terminalConflictResponse(request, existing, "failed"));
+    }
+    if (existing.state === "cancelled") {
       await projectAuthoritativeTerminalCommand(state, existing);
       return reply.code(409).send(terminalConflictResponse(request, existing, "failed"));
     }

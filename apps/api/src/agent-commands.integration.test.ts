@@ -7,6 +7,7 @@ import {
   InMemoryDeploymentRepository,
   InMemoryEnvSecretValueRepository,
   InMemoryEnvVariableMetadataRepository,
+  type DeploymentCommandRepository,
   type ProjectRepository
 } from "@deploylite/domain";
 import { afterEach, describe, expect, it, vi } from "vitest";
@@ -66,11 +67,11 @@ function command(overrides: Partial<DeploymentCommand> = {}): DeploymentCommand 
   };
 }
 
-async function fixture(commandOverrides: Partial<DeploymentCommand> = {}, registerAgent = true, now: () => Date = () => new Date("2026-07-10T00:00:05.000Z"), commandReconciliationIntervalMs?: number) {
+async function fixture(commandOverrides: Partial<DeploymentCommand> = {}, registerAgent = true, now: () => Date = () => new Date("2026-07-10T00:00:05.000Z"), commandReconciliationIntervalMs?: number, commandRepository?: DeploymentCommandRepository) {
   const agents = new InMemoryAgentRepository();
   const deployments = new InMemoryDeploymentRepository();
   const projects = new MemoryProjectRepository();
-  const commands = new InMemoryDeploymentCommandRepository();
+  const commands = commandRepository ?? new InMemoryDeploymentCommandRepository();
   const metadata = new InMemoryEnvVariableMetadataRepository();
   const secrets = new InMemoryEnvSecretValueRepository();
   const cipher = createEnvSecretCipher(loadEnvSecretKey(secretKey));
@@ -269,6 +270,82 @@ describe("agent command HTTP transport integration", () => {
     expect(await test.commands.findById(commandId)).toMatchObject({ state: "completed" });
     expect(await test.deployments.findById(deploymentId)).toMatchObject({ status: "succeeded" });
     expect((await test.deployments.listLogs(deploymentId)).filter((log) => log.message.startsWith("Agent completed deployment command"))).toHaveLength(1);
+  });
+
+  it("lets lease expiry win when completion reaches terminal persistence at boundary equality", async () => {
+    const inner = new InMemoryDeploymentCommandRepository();
+    let release!: () => void;
+    let entered!: () => void;
+    const gate = new Promise<void>((resolve) => { release = resolve; });
+    const arrival = new Promise<void>((resolve) => { entered = resolve; });
+    const repository: DeploymentCommandRepository = {
+      save: (record) => inner.save(record),
+      claim: (...args) => inner.claim(...args),
+      renewLease: (...args) => inner.renewLease(...args),
+      findById: (id) => inner.findById(id),
+      findActiveForDeployment: (id) => inner.findActiveForDeployment(id),
+      list: () => inner.list(),
+      async transitionTerminal(...args) {
+        if (args[3].state === "completed") {
+          entered();
+          await gate;
+        }
+        return inner.transitionTerminal(...args);
+      }
+    };
+    let now = new Date("2026-07-10T00:00:29.000Z");
+    const test = await fixture({ state: "claimed", claimedAt: "2026-07-10T00:00:00.000Z", leaseExpiresAt: "2026-07-10T00:00:30.000Z" }, true, () => now, undefined, repository);
+    const headers = { authorization: `Bearer ${token}`, "content-type": "application/json" };
+
+    const completion = test.app.inject({ method: "POST", url: `/api/v1/agent/commands/${commandId}/complete`, headers, payload: {} });
+    await arrival;
+    now = new Date("2026-07-10T00:00:30.000Z");
+    release();
+    const response = await completion;
+
+    expect(response.statusCode).toBe(409);
+    expect(response.json()).toMatchObject({ data: { authoritativeCommand: { state: "failed", failureReason: expect.stringContaining("lease expired") }, attemptedState: "completed" } });
+    expect(await test.commands.findById(commandId)).toMatchObject({ state: "failed" });
+    expect(await test.deployments.findById(deploymentId)).toMatchObject({ status: "failed", finishedAt: "2026-07-10T00:00:30.000Z" });
+    expect((await test.deployments.listLogs(deploymentId)).filter((log) => log.message.startsWith("Agent command failed"))).toHaveLength(1);
+  });
+
+  it("returns cancelled as the authoritative conflict for late complete and fail without changing its projection", async () => {
+    const completedAt = "2026-07-10T00:00:04.000Z";
+    const test = await fixture({ state: "cancelled", completedAt, payload: { cancelledBy: "operator" } });
+    const headers = { authorization: `Bearer ${token}`, "content-type": "application/json" };
+
+    const lateComplete = await test.app.inject({ method: "POST", url: `/api/v1/agent/commands/${commandId}/complete`, headers, payload: {} });
+    const lateFail = await test.app.inject({ method: "POST", url: `/api/v1/agent/commands/${commandId}/fail`, headers, payload: { reason: "late failure" } });
+
+    expect(lateComplete.statusCode).toBe(409);
+    expect(lateComplete.json()).toMatchObject({ data: { authoritativeCommand: { id: commandId, agentId, state: "cancelled", completedAt }, attemptedState: "completed" }, error: { code: "AUTHORITATIVE_TERMINAL_CONFLICT" } });
+    expect(lateFail.statusCode).toBe(409);
+    expect(lateFail.json()).toMatchObject({ data: { authoritativeCommand: { id: commandId, agentId, state: "cancelled", completedAt }, attemptedState: "failed" }, error: { code: "AUTHORITATIVE_TERMINAL_CONFLICT" } });
+    expect(await test.commands.findById(commandId)).toMatchObject({ state: "cancelled", completedAt });
+    expect(await test.deployments.findById(deploymentId)).toMatchObject({ status: "canceled", finishedAt: completedAt });
+    const logs = await test.deployments.listLogs(deploymentId);
+    expect(logs.filter((log) => log.message.startsWith("Deployment command cancelled"))).toEqual([
+      expect.objectContaining({ level: "error", timestamp: completedAt, redactionApplied: true, requestId: command().requestId, correlationId: command().correlationId })
+    ]);
+  });
+
+  it("repairs a cancelled deployment projection on a later terminal retry after a transient write failure", async () => {
+    const test = await fixture({ state: "claimed", claimedAt: "2026-07-10T00:00:01.000Z", leaseExpiresAt: "2026-07-10T00:00:31.000Z" });
+    const completedAt = "2026-07-10T00:00:04.000Z";
+    await test.commands.save(command({ state: "cancelled", completedAt, leaseExpiresAt: null, payload: { cancelledBy: "operator" } }));
+    vi.spyOn(test.deployments, "save").mockRejectedValueOnce(new Error("transient cancellation projection failure"));
+    const headers = { authorization: `Bearer ${token}`, "content-type": "application/json" };
+
+    const failedRepair = await test.app.inject({ method: "POST", url: `/api/v1/agent/commands/${commandId}/complete`, headers, payload: {} });
+    expect(failedRepair.statusCode).toBe(500);
+    expect(await test.commands.findById(commandId)).toMatchObject({ state: "cancelled", completedAt });
+    expect(await test.deployments.findById(deploymentId)).toMatchObject({ status: "queued", finishedAt: null });
+
+    const repaired = await test.app.inject({ method: "POST", url: `/api/v1/agent/commands/${commandId}/complete`, headers, payload: {} });
+    expect(repaired.statusCode).toBe(409);
+    expect(await test.deployments.findById(deploymentId)).toMatchObject({ status: "canceled", finishedAt: completedAt });
+    expect((await test.deployments.listLogs(deploymentId)).filter((log) => log.message.startsWith("Deployment command cancelled"))).toHaveLength(1);
   });
 
   it("autonomously reconciles a crashed agent claim after lease expiry without another poll", async () => {

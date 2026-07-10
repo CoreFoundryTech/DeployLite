@@ -118,11 +118,16 @@ export class DeploymentCommandBusService implements DeploymentCommandBus {
     const next: DeploymentCommandRecord = {
       ...existing,
       state: "completed",
-      completedAt: new Date().toISOString(),
+      completedAt: this.now().toISOString(),
       leaseExpiresAt: null,
       payload: output ? { ...existing.payload, output } : existing.payload
     };
-    const result = await this.#repository.transitionTerminal(existing.id, existing.agentId, "claimed", next);
+    const result = await this.#repository.transitionTerminal(existing.id, existing.agentId, "claimed", next, {
+      leaseExpiresAtAfterNow: () => this.now().toISOString()
+    });
+    if (result && !result.applied && result.command.state === "claimed") {
+      return this.failExpiredClaim(commandId, "Agent command lease expired; completion was rejected.");
+    }
     if (result?.applied) await this.#emit("deployment.command.completed", result.command);
     return result?.command ?? null;
   }
@@ -160,7 +165,7 @@ export class DeploymentCommandBusService implements DeploymentCommandBus {
       failureReason: reason
     };
     const result = await this.#repository.transitionTerminal(existing.id, existing.agentId, "claimed", next, {
-      leaseExpiresAtNotAfter: now
+      leaseExpiresAtNotAfterNow: () => this.now().toISOString()
     });
     if (result?.applied) await this.#emit("deployment.command.failed", result.command);
     return result?.command ?? null;

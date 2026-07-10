@@ -291,6 +291,56 @@ describe("DeploymentCommandBusService", () => {
     expect(await inner.findById(command.id)).toMatchObject({ state: "failed", failureReason: "lease expired" });
   });
 
+  it("rejects completion when its terminal CAS reaches persistence at the lease boundary", async () => {
+    const inner = new InMemoryDeploymentCommandRepository();
+    const entered = deferred();
+    const release = deferred();
+    let now = new Date(NOW);
+    const repository: DeploymentCommandRepository = {
+      save: (command) => inner.save(command),
+      claim: (...args) => inner.claim(...args),
+      renewLease: (...args) => inner.renewLease(...args),
+      findById: (id) => inner.findById(id),
+      findActiveForDeployment: (id) => inner.findActiveForDeployment(id),
+      list: () => inner.list(),
+      async transitionTerminal(...args) {
+        if (args[3].state === "completed") {
+          entered.resolve();
+          await release.promise;
+        }
+        return inner.transitionTerminal(...args);
+      }
+    };
+    const bus = new DeploymentCommandBusService(repository, () => now);
+    const command = await bus.submit(baseInput);
+    await bus.claim(command.id, command.agentId);
+
+    now = new Date("2026-01-01T00:00:29.000Z");
+    const completion = bus.complete(command.id);
+    await entered.promise;
+    now = new Date("2026-01-01T00:00:30.000Z");
+    release.resolve();
+
+    await expect(completion).resolves.toMatchObject({ state: "failed", failureReason: "Agent command lease expired; completion was rejected." });
+    await expect(bus.failExpiredClaim(command.id, "lease expired at boundary")).resolves.toMatchObject({ state: "failed" });
+    await expect(bus.complete(command.id)).resolves.toMatchObject({ state: "failed", failureReason: "Agent command lease expired; completion was rejected." });
+  });
+
+  it("keeps completion authoritative when its CAS commits before lease expiry", async () => {
+    let now = new Date(NOW);
+    const repository = new InMemoryDeploymentCommandRepository();
+    const bus = new DeploymentCommandBusService(repository, () => now);
+    const command = await bus.submit(baseInput);
+    await bus.claim(command.id, command.agentId);
+
+    now = new Date("2026-01-01T00:00:29.999Z");
+    await expect(bus.complete(command.id)).resolves.toMatchObject({ state: "completed", completedAt: now.toISOString() });
+    now = new Date("2026-01-01T00:00:30.000Z");
+
+    await expect(bus.failExpiredClaim(command.id, "lease expired")).resolves.toMatchObject({ state: "completed" });
+    await expect(bus.complete(command.id)).resolves.toMatchObject({ state: "completed", completedAt: "2026-01-01T00:00:29.999Z" });
+  });
+
   it("looks up the active command for a deployment and ignores terminal states", async () => {
     const bus = await newBus();
     const command = await bus.submit(baseInput);
