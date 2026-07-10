@@ -795,10 +795,19 @@ async function terminallyFailAgentCommand(state: PlatformRepositories, command: 
 
 async function reconcileExpiredClaims(state: PlatformRepositories, agentId: string): Promise<void> {
   const now = state.now().getTime();
-  const claimed = (await state.deploymentCommandBus.list()).filter((command) => command.agentId === agentId && command.state === "claimed");
+  const assigned = (await state.deploymentCommandBus.list()).filter((command) => command.agentId === agentId);
+  const claimed = assigned.filter((command) => command.state === "claimed");
   for (const command of claimed) {
     if (!command.leaseExpiresAt || new Date(command.leaseExpiresAt).getTime() <= now) {
       await terminallyFailAgentCommand(state, command, "Agent command lease expired; execution was not retried.", "Agent command lease expired");
+    }
+  }
+  for (const command of assigned) {
+    if (command.state === "failed" && command.failureReason?.includes("lease expired")) {
+      await projectAuthoritativeTerminalCommand(state, command, {
+        marker: "Agent command lease expired",
+        message: `Agent command lease expired: ${redactLogMessage(command.failureReason).slice(0, INVALID_COMMAND_REASON_MAX)}`
+      });
     }
   }
 }

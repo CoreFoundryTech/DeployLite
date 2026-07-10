@@ -284,6 +284,24 @@ describe("agent command HTTP transport integration", () => {
     vi.useRealTimers();
   });
 
+  it("repairs a lease-expiry deployment projection after a transient repository failure", async () => {
+    vi.useFakeTimers();
+    const consoleError = vi.spyOn(console, "error").mockImplementation(() => undefined);
+    let now = new Date("2026-07-10T00:00:05.000Z");
+    const test = await fixture({}, true, () => now, 100);
+    await test.transport.poll(agentId, new AbortController().signal);
+    now = new Date("2026-07-10T00:00:40.000Z");
+    vi.spyOn(test.deployments, "save").mockRejectedValueOnce(new Error("transient deployment write failure"));
+    await vi.advanceTimersByTimeAsync(100);
+    expect(await test.commands.findById(commandId)).toMatchObject({ state: "failed" });
+    await vi.advanceTimersByTimeAsync(100);
+    expect(await test.deployments.findById(deploymentId)).toMatchObject({ status: "failed", finishedAt: expect.any(String) });
+    expect((await test.deployments.listLogs(deploymentId)).filter((log) => log.message.startsWith("Agent command lease expired"))).toHaveLength(1);
+    expect(consoleError).toHaveBeenCalledWith("[deployment-command-reconciliation] reconciliation failed");
+    await test.app.close();
+    vi.useRealTimers();
+  });
+
   it("renews a claimed command lease only for the bound agent", async () => {
     let now = new Date("2026-07-10T00:00:05.000Z");
     const test = await fixture({}, true, () => now);
