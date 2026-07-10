@@ -1,7 +1,7 @@
 import { randomUUID } from "node:crypto";
 import { readdir, readFile } from "node:fs/promises";
 
-import { closeDbPool, createDbClient, createDbPool, DbAgentRepository, DbDeploymentRepository, DbProjectRepository, type DeployLiteDb } from "@deploylite/db";
+import { closeDbPool, createDbClient, createDbPool, DbAgentRepository, DbDeploymentCommandRepository, DbDeploymentRepository, DbProjectRepository, type DeployLiteDb } from "@deploylite/db";
 import type { FastifyInstance } from "fastify";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 
@@ -12,6 +12,7 @@ const integrationEnabled = process.env.DEPLOYLITE_API_POSTGRES_INTEGRATION === "
 const describeIntegration = integrationEnabled ? describe : describe.skip;
 const contentHeaders = { "content-type": "application/json" };
 const adminPassword = "correct horse battery staple";
+const UUID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
 
 let maintenancePool: ReturnType<typeof createDbPool> | null = null;
 let pool: ReturnType<typeof createDbPool> | null = null;
@@ -81,6 +82,38 @@ describeIntegration("DeployLite API PostgreSQL integration", () => {
     const cookie = login.headers["set-cookie"] as string;
     expect(cookie).toContain("dl_pg_session=");
 
+    const registeredAgent = await firstApp.inject({
+      method: "POST",
+      url: "/api/v1/agents/register",
+      headers: { ...contentHeaders, cookie },
+      payload: { name: "API-created PostgreSQL agent", endpoint: "https://api-agent.postgres.test" }
+    });
+    const apiAgentId = registeredAgent.json().data.agent.id as string;
+    const createdProject = await firstApp.inject({
+      method: "POST",
+      url: "/api/v1/projects",
+      headers: { ...contentHeaders, cookie },
+      payload: { name: "API-created PostgreSQL project", repoUrl: "https://github.com/example/api-created-postgres", defaultBranch: "main", runCommand: "node server.js" }
+    });
+    const apiProjectId = createdProject.json().data.project.id as string;
+    const triggeredDeployment = await firstApp.inject({
+      method: "POST",
+      url: `/api/v1/projects/${apiProjectId}/deployments`,
+      headers: { ...contentHeaders, cookie },
+      payload: { agentId: apiAgentId, commitSha: "abcdef1" }
+    });
+    const apiDeploymentId = triggeredDeployment.json().data.deployment.id as string;
+    const [apiCommand] = await new DbDeploymentCommandRepository(requireDb()).list();
+
+    expect(registeredAgent.statusCode).toBe(200);
+    expect(createdProject.statusCode).toBe(200);
+    expect(triggeredDeployment.statusCode).toBe(200);
+    expect(apiAgentId).toMatch(UUID_PATTERN);
+    expect(apiProjectId).toMatch(UUID_PATTERN);
+    expect(apiDeploymentId).toMatch(UUID_PATTERN);
+    expect(apiCommand).toMatchObject({ deploymentId: apiDeploymentId, agentId: apiAgentId });
+    expect(apiCommand?.id).toMatch(UUID_PATTERN);
+
     const projectId = randomUUID();
     const agentId = randomUUID();
     const deploymentId = randomUUID();
@@ -137,9 +170,9 @@ describeIntegration("DeployLite API PostgreSQL integration", () => {
     const deployments = await restartedApp.inject({ method: "GET", url: "/api/v1/deployments", headers: { cookie } });
     const logs = await restartedApp.inject({ method: "GET", url: `/api/v1/deployments/${deploymentId}/logs`, headers: { cookie } });
 
-    expect(projects.json().data.projects).toEqual([expect.objectContaining({ id: projectId, name: "PostgreSQL project" })]);
-    expect(agents.json().data.agents).toEqual([expect.objectContaining({ id: agentId, name: "PostgreSQL agent" })]);
-    expect(deployments.json().data.deployments).toEqual([expect.objectContaining({ id: deploymentId, projectId, agentId })]);
+    expect(projects.json().data.projects).toEqual(expect.arrayContaining([expect.objectContaining({ id: projectId, name: "PostgreSQL project" })]));
+    expect(agents.json().data.agents).toEqual(expect.arrayContaining([expect.objectContaining({ id: agentId, name: "PostgreSQL agent" })]));
+    expect(deployments.json().data.deployments).toEqual(expect.arrayContaining([expect.objectContaining({ id: deploymentId, projectId, agentId })]));
     expect(logs.json().data.events).toEqual([
       expect.objectContaining({ deploymentId, sequence: 1, message: expect.stringContaining("[REDACTED]"), redactionApplied: true })
     ]);

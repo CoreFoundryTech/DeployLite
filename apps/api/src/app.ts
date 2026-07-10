@@ -1,5 +1,4 @@
 import { createAuditLogRecord, createCorrelationContext, createRequestId, parseDeployLiteEnv, type DeployLiteEnv, createEnvSecretCipher, EnvSecretKeyInvalidError, EnvSecretKeyMissingError, ENCRYPTION_KEY_VERSION, loadEnvSecretKey, type EnvSecretCipher } from "@deploylite/config";
-import { materializeMockDeploy, redactEnvFileForLog, type EncryptedEnvRecord } from "@deploylite/agent";
 import {
   agentRegistrationSchema,
   authLoginRequestSchema,
@@ -21,12 +20,13 @@ import {
   type EnvVariableMetadata,
   type Project
 } from "@deploylite/contracts";
-import { BcryptPasswordHasher, bootstrapInitialAdmin, closeDbPool, createDbClient, createDbPool, createOpaqueSessionToken, DbAgentRepository, DbAuditRepository, DbAuthUserRepository, DbDeploymentRepository, DbEnvSecretValueRepository, DbEnvVariableMetadataRepository, DbProjectRepository, DbSessionRepository, hashSessionToken, type DeployLiteDb } from "@deploylite/db";
+import { BcryptPasswordHasher, bootstrapInitialAdmin, closeDbPool, createDbClient, createDbPool, createOpaqueSessionToken, DbAgentRepository, DbAuditRepository, DbAuthUserRepository, DbDeploymentCommandRepository, DbDeploymentRepository, DbEnvSecretValueRepository, DbEnvVariableMetadataRepository, DbProjectRepository, DbSessionRepository, hashSessionToken, type DeployLiteDb } from "@deploylite/db";
 import {
   AgentStatusService,
   authenticateLocalUser,
   getBootstrapStatus,
   InMemoryAgentRepository,
+  InMemoryDeploymentCommandRepository,
   InMemoryDeploymentRepository,
   InMemoryEnvSecretValueRepository,
   InMemoryEnvVariableMetadataRepository,
@@ -42,10 +42,13 @@ import {
   type CanonicalRoleName,
   type CreateInitialAdminInput,
   type CreateSessionInput,
+  type DeploymentCommandBus,
+  type DeploymentCommandRepository,
   type EnvSecretValueRepository,
   type EnvVariableMetadataRepository,
   type PasswordHasher,
   type AgentRepository,
+  type DeploymentExecutor,
   type DeploymentRepository,
   type ProjectRepository,
   type SafeAuthUser,
@@ -53,6 +56,7 @@ import {
 } from "@deploylite/domain";
 import Fastify, { type FastifyInstance, type FastifyReply, type FastifyRequest } from "fastify";
 import { z } from "zod";
+import { DeploymentCommandBusService, MockDeploymentExecutor } from "./commands/index.js";
 
 declare module "fastify" {
   interface FastifyRequest {
@@ -429,6 +433,7 @@ type PlatformRepositoryOptions = {
   agents: AgentRepository;
   deployments: DeploymentRepository;
   projects: ProjectRepository;
+  deploymentCommands?: DeploymentCommandRepository;
   envMetadata?: EnvVariableMetadataRepository;
   envSecretValues?: EnvSecretValueRepository;
   envSecretCipher?: EnvSecretCipher;
@@ -439,7 +444,9 @@ type PlatformRepositories = PlatformRepositoryOptions & {
   envMetadata: EnvVariableMetadataRepository;
   envSecretValues: EnvSecretValueRepository;
   envSecretCipher: EnvSecretCipher;
-  deployRunner: DeployRunner;
+  deploymentCommandBus: DeploymentCommandBus;
+  deploymentExecutor: DeploymentExecutor;
+  cancelDeploymentExecutorTimers: () => void;
 };
 
 type EnvSecretKeySource = NodeJS.ProcessEnv | Record<string, string | number | boolean | undefined>;
@@ -462,172 +469,43 @@ function createApiState(env: EnvSecretKeySource, overrides: Partial<PlatformRepo
   const agents = overrides.agents ?? new InMemoryAgentRepository();
   const deployments = overrides.deployments ?? new InMemoryDeploymentRepository();
   const projects = overrides.projects ?? new InMemoryProjectRepository();
+  const deploymentCommands = overrides.deploymentCommands ?? new InMemoryDeploymentCommandRepository();
   const envMetadata = overrides.envMetadata ?? new InMemoryEnvVariableMetadataRepository();
   const envSecretValues = overrides.envSecretValues ?? new InMemoryEnvSecretValueRepository();
   const envSecretCipher = overrides.envSecretCipher ?? createLazyEnvSecretCipher(env);
   const agentStatus = new AgentStatusService(agents);
-  const deployRunner = new DeployRunner(deployments, envMetadata, agentStatus, envSecretCipher);
-  return { agents, deployments, projects, envMetadata, envSecretValues, envSecretCipher, agentStatus, deployRunner };
-}
 
-/**
- * Deterministic set of mock env secret values used by the API's
- * dry-run materialization step. The values are intentionally
- * harmless (no real credentials) but they exercise the full
- * encrypt → decrypt → redact pipeline so the agent's
- * `materializeMockDeploy` is actually wired into the deploy path.
- * The plaintext is held only for the duration of the encrypt call
- * and never written to a log or a response — only the redacted
- * projection reaches the deployment log.
- */
-const DRY_RUN_MOCK_VALUES: ReadonlyArray<{ key: string; scope: "project" | "deployment"; value: string }> = [
-  { key: "DATABASE_URL", scope: "project", value: "postgres://dry-run:placeholder@db.invalid:5432/dryrun" },
-  { key: "API_KEY", scope: "project", value: "sk_dry_run_placeholder" }
-];
+  // The deployment command bus is the in-process control-plane channel
+  // between the API route handlers and the deployment executor. The
+  // executor is the only component allowed to mutate the deployment
+  // status, append deployment logs, or touch the host. Slice 1 keeps
+  // the executor in the API process so the route surface stays
+  // socket-free; a later slice will replace the in-process executor
+  // with a real agent that runs in a Docker-socket-mounted container.
+  const deploymentCommandBus = new DeploymentCommandBusService(deploymentCommands);
+  const deploymentExecutor = new MockDeploymentExecutor({
+    bus: deploymentCommandBus,
+    deployments,
+    envMetadata,
+    agentStatus,
+    envSecretCipher,
+    projectResolver: (projectId) => projects.findById(projectId)
+  });
+  deploymentCommandBus.registerExecutor(deploymentExecutor);
 
-class DeployRunner {
-  #sequenceByDeployment = new Map<string, number>();
-  #timers = new Map<string, NodeJS.Timeout>();
-
-  constructor(
-    private readonly deployments: DeploymentRepository,
-    private readonly envMetadata: EnvVariableMetadataRepository,
-    private readonly agentStatus: AgentStatusService,
-    private readonly envSecretCipher?: EnvSecretCipher
-  ) {}
-
-  /**
-   * Control-plane deployment runner. In this local MVP, the API does not talk
-   * to a real agent or to a Docker socket. It records the deployment as
-   * `queued`, then schedules status transitions to `running` and `succeeded`
-   * (or `failed` when required env metadata is missing) and appends audit-safe
-   * log events so the UI can show a real lifecycle end-to-end.
-   */
-  async start(deployment: Deployment, project: Project, requestId: string, correlationId: string): Promise<{ deployment: Deployment; logs: EnvVariableMetadata[] }> {
-    const logs = await this.envMetadata.listByProject(project.id);
-    const missingRequired = logs.filter((record) => record.required && !record.valuePresent);
-    await this.appendLog(deployment, "info", `Queued deploy for project ${project.name} (${project.repoUrl}@${project.defaultBranch}).`, requestId, correlationId);
-    await this.appendLog(deployment, "info", `Resolved ${logs.length} env metadata record(s); ${missingRequired.length} required-without-value.`, requestId, correlationId);
-
-    if (missingRequired.length > 0) {
-      await this.appendLog(deployment, "error", `Refusing to advance: required env metadata missing for ${missingRequired.map((m) => m.key).join(", ")}.`, requestId, correlationId);
-      const failed: Deployment = { ...deployment, status: "failed", finishedAt: new Date().toISOString() };
-      await this.deployments.save(failed);
-      return { deployment: failed, logs };
-    }
-
-    // Dry-run materialization. The agent module's
-    // `materializeMockDeploy` is invoked with a deterministic mock
-    // set of `EncryptedEnvRecord` values, encrypted in-process with
-    // the API's own cipher. The agent then decrypts them, renders a
-    // `.env` string, and `redactEnvFileForLog` collapses every value
-    // to `[REDACTED]` so the plaintext never reaches the log. The
-    // step is wired into the deploy path so the agent module is not
-    // inert (round-1 finding: the helper was defined but never
-    // called). Failures are swallowed — a missing cipher must not
-    // break the deploy — and the deploy still proceeds.
-    const projection = await this.materializeDryRun(project);
-    if (projection) {
-      await this.appendLog(deployment, "info", `Materialized env (mock, redacted):\n${projection}`, requestId, correlationId);
-    }
-
-    if (!project.buildCommand) {
-      await this.appendLog(deployment, "warn", "No build command configured; skipping build step.", requestId, correlationId);
-    } else {
-      await this.appendLog(deployment, "info", `Build command: ${project.buildCommand}`, requestId, correlationId);
-    }
-    if (!project.runCommand) {
-      await this.appendLog(deployment, "warn", "No run command configured; deploy will stay in queued state.", requestId, correlationId);
-    } else {
-      await this.appendLog(deployment, "info", `Run command: ${project.runCommand} (port ${project.port ?? "default"})`, requestId, correlationId);
-    }
-
-    this.scheduleAdvance(deployment.id, "running", 50);
-    this.scheduleAdvance(deployment.id, "succeeded", 250);
-    return { deployment, logs };
-  }
-
-  /**
-   * Build a deterministic mock `EncryptedEnvRecord[]` and round-trip
-   * it through the agent module's `materializeMockDeploy` +
-   * `redactEnvFileForLog` pipeline. The output is the redacted
-   * `.env` projection suitable for the deploy log; plaintext is
-   * never returned. Returns null when no cipher is configured (so
-   * the deploy can still proceed) or when the agent module refuses
-   * to materialize (e.g. key version mismatch).
-   */
-  async materializeDryRun(project: Project): Promise<string | null> {
-    if (!this.envSecretCipher) return null;
-    try {
-      const records: EncryptedEnvRecord[] = DRY_RUN_MOCK_VALUES.map((mock) => {
-        const encryptedValue = Buffer.from(this.envSecretCipher!.encrypt(mock.value), "base64");
-        return {
-          key: mock.key,
-          scope: mock.scope,
-          encryptedValue,
-          valueFingerprint: this.envSecretCipher!.fingerprint(mock.value),
-          keyVersion: ENCRYPTION_KEY_VERSION
-        };
-      });
-      const entry = materializeMockDeploy({
-        projectId: project.id,
-        agentId: "agent_dry_run",
-        records,
-        cipher: this.envSecretCipher
-      });
-      return redactEnvFileForLog(entry.contents);
-    } catch {
-      return null;
-    }
-  }
-
-  async appendLog(deployment: Deployment, level: "debug" | "info" | "warn" | "error", message: string, requestId: string, correlationId: string) {
-    const next = (this.#sequenceByDeployment.get(deployment.id) ?? 0) + 1;
-    this.#sequenceByDeployment.set(deployment.id, next);
-    await this.deployments.appendLog({
-      id: `log_${createRequestId()}`,
-      deploymentId: deployment.id,
-      sequence: next,
-      level,
-      message,
-      timestamp: new Date().toISOString(),
-      redactionApplied: true,
-      requestId,
-      correlationId
-    });
-  }
-
-  scheduleAdvance(deploymentId: string, status: "running" | "succeeded" | "failed", delayMs: number) {
-    const previous = this.#timers.get(deploymentId);
-    if (previous) {
-      clearTimeout(previous);
-    }
-    const timer = setTimeout(async () => {
-      this.#timers.delete(deploymentId);
-      const existing = await this.deployments.findById(deploymentId);
-      if (!existing) return;
-      if (existing.status === "failed" || existing.status === "succeeded" || existing.status === "canceled") return;
-      const finishedAt = status === "running" ? null : new Date().toISOString();
-      const next: Deployment = { ...existing, status, finishedAt };
-      await this.deployments.save(next);
-      const message =
-        status === "running"
-          ? "Simulated agent picked up the deployment. Real Docker execution is intentionally deferred."
-          : status === "succeeded"
-            ? "Simulated agent marked the deployment succeeded. Real container execution is intentionally deferred."
-            : "Simulated agent marked the deployment failed.";
-      await this.appendLog(next, status === "succeeded" ? "info" : status === "failed" ? "error" : "info", message, next.startedAt, next.startedAt);
-      void this.agentStatus;
-    }, delayMs);
-    this.#timers.set(deploymentId, timer);
-  }
-
-  cancelTimers() {
-    for (const timer of this.#timers.values()) {
-      clearTimeout(timer);
-    }
-    this.#timers.clear();
-  }
+  return {
+    agents,
+    deployments,
+    projects,
+    deploymentCommands,
+    envMetadata,
+    envSecretValues,
+    envSecretCipher,
+    agentStatus,
+    deploymentCommandBus,
+    deploymentExecutor,
+    cancelDeploymentExecutorTimers: () => deploymentExecutor.cancelTimers()
+  };
 }
 
 async function createSeededInMemoryAuthAdapters(env: DeployLiteEnv): Promise<AuthAdapters> {
@@ -670,6 +548,7 @@ function createDbAuthAdapters(env: DeployLiteEnv, options: BuildApiAppOptions): 
       agents: options.state?.agents ?? new DbAgentRepository(db),
       deployments: options.state?.deployments ?? new DbDeploymentRepository(db),
       projects: options.state?.projects ?? new DbProjectRepository(db),
+      deploymentCommands: options.state?.deploymentCommands ?? new DbDeploymentCommandRepository(db),
       envMetadata: options.state?.envMetadata ?? new DbEnvVariableMetadataRepository(db),
       envSecretValues: options.state?.envSecretValues ?? new DbEnvSecretValueRepository(db),
       envSecretCipher: options.state?.envSecretCipher
@@ -861,7 +740,7 @@ function registerRoutes(app: FastifyInstance, state: PlatformRepositories, adapt
   });
   app.post(`${API_PREFIX}/agents/register`, { preHandler: [requireAuth, requireMutationRole] }, async (request) => {
     const body = parseBody(agentRegistrationSchema, request.body);
-    const agent: Agent = { id: `agent_${createRequestId()}`, name: body.name, endpoint: body.endpoint, status: "offline", lastHeartbeatAt: null, resourceSnapshot: null };
+    const agent: Agent = { id: createRequestId(), name: body.name, endpoint: body.endpoint, status: "offline", lastHeartbeatAt: null, resourceSnapshot: null };
     await state.agents.save(agent);
     return ok(request, { agent, audit: auditMutation(request, "agent.register", "agent", agent.id) });
   });
@@ -879,7 +758,7 @@ function registerRoutes(app: FastifyInstance, state: PlatformRepositories, adapt
   app.post(`${API_PREFIX}/projects`, { preHandler: [requireAuth, requireMutationRole] }, async (request) => {
     const body = parseBody(projectCreateRequestSchema, request.body);
     const project: Project = {
-      id: `project_${createRequestId()}`,
+      id: createRequestId(),
       name: body.name,
       repoUrl: body.repoUrl,
       defaultBranch: body.defaultBranch,
@@ -1144,7 +1023,7 @@ function registerRoutes(app: FastifyInstance, state: PlatformRepositories, adapt
     }
     const commitSha = body.commitSha ?? "0000000";
     const deployment: Deployment = {
-      id: `dep_${createRequestId()}`,
+      id: createRequestId(),
       projectId: project.id,
       agentId,
       status: "queued",
@@ -1153,10 +1032,58 @@ function registerRoutes(app: FastifyInstance, state: PlatformRepositories, adapt
       finishedAt: null
     };
     await state.deployments.save(deployment);
-    const runnerResult = await state.deployRunner.start(deployment, project, request.correlationContext.requestId, request.correlationContext.correlationId);
+    // Publish a `start` command to the deployment command bus and
+    // await the executor's synchronous part of the lifecycle. The
+    // bus dispatches the command to the in-process executor (or, in
+    // a later slice, to the real agent over the typed envelope).
+    // The executor mirrors the legacy `DeployRunner` lifecycle so
+    // the response and log surface stay byte-for-byte identical for
+    // the slice-1 acceptance criteria. The `running` / `succeeded`
+    // transitions arrive later through the existing SSE log stream
+    // and `findById` polling.
+    let dispatched: Awaited<ReturnType<DeploymentCommandBus["dispatch"]>>;
+    try {
+      const command = await state.deploymentCommandBus.submit({
+        deploymentId: deployment.id,
+        agentId: deployment.agentId,
+        kind: "start",
+        payload: { projectId: project.id, commitSha },
+        requestedBy: request.auth?.user.id ?? null,
+        requestId: request.correlationContext.requestId,
+        correlationId: request.correlationContext.correlationId
+      });
+      // Dispatch inline so the response reflects the deployment status
+      // (e.g. `failed` for missing required env metadata) that the UI
+      // will see. Later slices can replace this with an out-of-process
+      // agent poll/claim loop without changing the route contract.
+      dispatched = await state.deploymentCommandBus.dispatch(command);
+      if (!dispatched) {
+        throw new Error("Deployment command was not dispatched");
+      }
+    } catch (error) {
+      const failed: Deployment = { ...deployment, status: "failed", finishedAt: new Date().toISOString() };
+      await state.deployments.save(failed);
+      const existingLogs = await state.deployments.listLogs(deployment.id);
+      const sequence = Math.max(0, ...existingLogs.map((event) => event.sequence)) + 1;
+      await state.deployments.appendLog({
+        id: createRequestId(),
+        deploymentId: deployment.id,
+        sequence,
+        level: "error",
+        message: "Deployment command submission or dispatch failed.",
+        timestamp: new Date().toISOString(),
+        redactionApplied: true,
+        requestId: request.correlationContext.requestId,
+        correlationId: request.correlationContext.correlationId
+      });
+      throw error;
+    }
+    const refreshed = dispatched ? await state.deployments.findById(deployment.id) : null;
+    const observed = refreshed ?? deployment;
+    const envVariables = await state.envMetadata.listByProject(project.id);
     return ok(request, {
-      deployment: runnerResult.deployment,
-      envVariables: runnerResult.logs.map((record) => envVariableMetadataSchema.parse(record)),
+      deployment: observed,
+      envVariables: envVariables.map((record) => envVariableMetadataSchema.parse(record)),
       audit: auditMutation(request, "deployment.trigger", "deployment", deployment.id)
     });
   });
@@ -1220,7 +1147,7 @@ function registerRoutes(app: FastifyInstance, state: PlatformRepositories, adapt
   });
   app.post(`${API_PREFIX}/deployments`, { preHandler: [requireAuth, requireMutationRole] }, async (request) => {
     const body = parseBody(deploymentSchema.omit({ id: true, startedAt: true, finishedAt: true }), request.body);
-    const deployment: Deployment = { id: `dep_${createRequestId()}`, startedAt: new Date().toISOString(), finishedAt: null, ...body };
+    const deployment: Deployment = { id: createRequestId(), startedAt: new Date().toISOString(), finishedAt: null, ...body };
     await state.deployments.save(deployment);
     return ok(request, { deployment, audit: auditMutation(request, "deployment.create", "deployment", deployment.id) });
   });
@@ -1246,7 +1173,7 @@ export async function buildApiApp(options: BuildApiAppOptions = {}): Promise<Fas
   registerCoreHooks(app, corsOrigin);
   registerRoutes(app, repositories.state, repositories.auth, authConfig);
   app.addHook("onClose", () => {
-    repositories.state.deployRunner.cancelTimers();
+    repositories.state.cancelDeploymentExecutorTimers();
   });
   return app;
 }

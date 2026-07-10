@@ -1,6 +1,8 @@
 import { BcryptPasswordHasher, createOpaqueSessionToken, hashSessionToken } from "@deploylite/db";
 import {
   InitialAdminAlreadyExistsError,
+  InMemoryDeploymentCommandRepository,
+  InMemoryDeploymentRepository,
   InMemoryEnvSecretValueRepository,
   InMemoryEnvVariableMetadataRepository,
   type AgentRepository,
@@ -8,11 +10,13 @@ import {
   type AuthUserRepository,
   type CreateInitialAdminInput,
   type DeploymentRepository,
+  type DeploymentCommandRepository,
   type EnvVariableMetadataRecord,
   type EnvVariableMetadataRepository,
   type ProjectRepository
 } from "@deploylite/domain";
 import { createEnvSecretCipher, loadEnvSecretKey } from "@deploylite/config";
+import { readFile } from "node:fs/promises";
 import { describe, expect, it } from "vitest";
 import { buildApiApp, createRuntimeRepositories, InMemoryAuditRepository, InMemoryAuthUserRepository, InMemorySessionRepository } from "./app.js";
 
@@ -21,6 +25,7 @@ const password = "correct horse battery staple";
 const testEnvSecretKey = "deploylite-test-env-secret-key-1234567890";
 const testEnvSecretCipher = createEnvSecretCipher(loadEnvSecretKey(testEnvSecretKey));
 const testEnv: NodeJS.ProcessEnv = { ...process.env, DEPLOYLITE_SECRET_KEY: testEnvSecretKey };
+const UUID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
 
 function projectFixture(id = "project-1") {
   return {
@@ -1598,5 +1603,246 @@ describe("DeployLite API scaffold", () => {
       const list = await app.inject({ method: "GET", url: "/api/v1/audit-events", headers: { cookie } });
       expect(list.statusCode).toBe(403);
     });
+  });
+});
+
+describe("Phase 5 slice 1 — DeploymentCommandBus control plane", () => {
+  it("creates UUID-backed agent, project, and deployment records with command-compatible foreign keys", async () => {
+    const deploymentCommands = new InMemoryDeploymentCommandRepository();
+    const { app } = await authFixture({ state: { deploymentCommands } });
+    const cookie = await loginCookie(app);
+
+    const register = await app.inject({
+      method: "POST",
+      url: "/api/v1/agents/register",
+      headers: { ...contentHeaders, cookie },
+      payload: { name: "UUID agent", endpoint: "https://agent.uuid.test" }
+    });
+    const agentId = register.json().data.agent.id as string;
+
+    const createProject = await app.inject({
+      method: "POST",
+      url: "/api/v1/projects",
+      headers: { ...contentHeaders, cookie },
+      payload: { name: "UUID project", repoUrl: "https://github.com/example/uuid-project", defaultBranch: "main", runCommand: "node server.js" }
+    });
+    const projectId = createProject.json().data.project.id as string;
+
+    const trigger = await app.inject({
+      method: "POST",
+      url: `/api/v1/projects/${projectId}/deployments`,
+      headers: { ...contentHeaders, cookie },
+      payload: { agentId, commitSha: "abcdef1" }
+    });
+    const deploymentId = trigger.json().data.deployment.id as string;
+    const commands = await deploymentCommands.list();
+
+    const directCreate = await app.inject({
+      method: "POST",
+      url: "/api/v1/deployments",
+      headers: { ...contentHeaders, cookie },
+      payload: { projectId, agentId, status: "queued", commitSha: "abcdef2" }
+    });
+
+    expect(register.statusCode).toBe(200);
+    expect(createProject.statusCode).toBe(200);
+    expect(trigger.statusCode).toBe(200);
+    expect(directCreate.statusCode).toBe(200);
+    expect(agentId).toMatch(UUID_PATTERN);
+    expect(projectId).toMatch(UUID_PATTERN);
+    expect(deploymentId).toMatch(UUID_PATTERN);
+    expect(directCreate.json().data.deployment.id).toMatch(UUID_PATTERN);
+    expect(commands).toHaveLength(1);
+    expect(commands[0]).toMatchObject({ deploymentId, agentId });
+    expect(commands[0]?.id).toMatch(UUID_PATTERN);
+
+    const logs = await app.inject({ method: "GET", url: `/api/v1/deployments/${deploymentId}/logs`, headers: { cookie } });
+    expect((logs.json().data.events as Array<{ id: string }>).every((event) => UUID_PATTERN.test(event.id))).toBe(true);
+
+    await app.close();
+  });
+
+  it("persists a `start` command for every triggered deployment and resolves to `completed` when the lifecycle finishes", async () => {
+    const deploymentCommands = new InMemoryDeploymentCommandRepository();
+    const { app } = await authFixture({ state: { deploymentCommands } });
+    const cookie = await loginCookie(app);
+
+    const project = (await app.inject({
+      method: "POST",
+      url: "/api/v1/projects",
+      headers: { ...contentHeaders, cookie },
+      payload: { name: "CommandBus", repoUrl: "https://github.com/example/command-bus", defaultBranch: "main", buildCommand: "pnpm build", runCommand: "node server.js", port: 3000 }
+    })).json().data.project;
+
+    const trigger = await app.inject({
+      method: "POST",
+      url: `/api/v1/projects/${project.id}/deployments`,
+      headers: { ...contentHeaders, cookie, "x-request-id": "req_bus_1" },
+      payload: {}
+    });
+    expect(trigger.statusCode).toBe(200);
+    const deploymentId = trigger.json().data.deployment.id;
+
+    // The bus dispatch is awaited inline for the synchronous part of
+    // the lifecycle; the asynchronous continuation is observed via
+    // the existing `/deployments/:id` polling and SSE log stream.
+    await new Promise((resolve) => setTimeout(resolve, 350));
+
+    const detail = await app.inject({ method: "GET", url: `/api/v1/deployments/${deploymentId}`, headers: { cookie } });
+    expect(detail.json().data.deployment.status).toBe("succeeded");
+    const commands = await deploymentCommands.list();
+    expect(commands).toHaveLength(1);
+    expect(commands[0]).toMatchObject({ deploymentId, kind: "start", state: "completed", failureReason: null });
+    expect(commands[0]?.completedAt).not.toBeNull();
+
+    await app.close();
+  });
+
+  it("never touches the Docker socket or any host shell path: no fs writes, no child process spawn", async () => {
+    // The slice-1 executor is the only component allowed to mutate
+    // the deployment. It is socket-free by design: the source file
+    // cannot import any privileged Node API (child_process, fs
+    // write, net.connect, etc.). This test re-reads the file to
+    // detect a regression. The `docker` keyword IS allowed in
+    // human-readable log messages (e.g. "Real Docker execution is
+    // intentionally deferred.") — the safety property is the
+    // absence of dangerous API imports.
+    const source = await readFile(new URL("./commands/executor.ts", import.meta.url), "utf8");
+
+    expect(source).not.toMatch(/from\s+["']child_process["']|require\(["']child_process["']\)/);
+    expect(source).not.toMatch(/exec\(|execSync\(|spawn\(|spawnSync\(/);
+    expect(source).not.toMatch(/net\.connect|net\.createConnection|connect\(/);
+    expect(source).not.toMatch(/writeFile|writeFileSync|appendFile|appendFileSync/);
+  });
+
+  it("rejects a deploy when the required env metadata is missing and records the `start` command as `failed` in the bus", async () => {
+    const deploymentCommands = new InMemoryDeploymentCommandRepository();
+    const { app } = await authFixture({ state: { deploymentCommands } });
+    const cookie = await loginCookie(app);
+
+    const project = (await app.inject({
+      method: "POST",
+      url: "/api/v1/projects",
+      headers: { ...contentHeaders, cookie },
+      payload: { name: "MissingSecret", repoUrl: "https://github.com/example/missing-secret", defaultBranch: "main", runCommand: "node server.js" }
+    })).json().data.project;
+
+    await app.inject({
+      method: "POST",
+      url: `/api/v1/projects/${project.id}/env-variables`,
+      headers: { ...contentHeaders, cookie },
+      payload: { key: "DATABASE_URL", required: true }
+    });
+
+    const trigger = await app.inject({
+      method: "POST",
+      url: `/api/v1/projects/${project.id}/deployments`,
+      headers: { ...contentHeaders, cookie },
+      payload: {}
+    });
+    expect(trigger.statusCode).toBe(200);
+    expect(trigger.json().data.deployment.status).toBe("failed");
+    const commands = await deploymentCommands.list();
+    expect(commands).toHaveLength(1);
+    expect(commands[0]).toMatchObject({ kind: "start", state: "failed" });
+    expect(commands[0]?.failureReason).toContain("required env metadata missing");
+
+    await app.close();
+  });
+
+  it("preserves the queued -> running -> succeeded deployment lifecycle and log correlation", async () => {
+    const delegate = new InMemoryDeploymentRepository();
+    const transitions: Array<{ deploymentId: string; status: string }> = [];
+    const deployments: DeploymentRepository = {
+      async save(deployment) {
+        transitions.push({ deploymentId: deployment.id, status: deployment.status });
+        return delegate.save(deployment);
+      },
+      findById: (id) => delegate.findById(id),
+      list: () => delegate.list(),
+      appendLog: (event) => delegate.appendLog(event),
+      listLogs: (deploymentId, afterSequence) => delegate.listLogs(deploymentId, afterSequence)
+    };
+    const { app } = await authFixture({
+      state: {
+        deployments,
+        envMetadata: new InMemoryEnvVariableMetadataRepository(),
+        envSecretValues: new InMemoryEnvSecretValueRepository(),
+        envSecretCipher: testEnvSecretCipher
+      }
+    });
+    const cookie = await loginCookie(app);
+    const project = (await app.inject({
+      method: "POST",
+      url: "/api/v1/projects",
+      headers: { ...contentHeaders, cookie },
+      payload: { name: "BusTrace", repoUrl: "https://github.com/example/bus-trace", defaultBranch: "main", buildCommand: "pnpm build", runCommand: "node server.js", port: 3000 }
+    })).json().data.project;
+
+    const trigger = await app.inject({
+      method: "POST",
+      url: `/api/v1/projects/${project.id}/deployments`,
+      headers: { ...contentHeaders, cookie, "x-request-id": "req_bus_trace_1" },
+      payload: {}
+    });
+    const deploymentId = trigger.json().data.deployment.id;
+    await new Promise((resolve) => setTimeout(resolve, 350));
+    const detail = await app.inject({ method: "GET", url: `/api/v1/deployments/${deploymentId}`, headers: { cookie } });
+    expect(detail.json().data.deployment.status).toBe("succeeded");
+    expect(transitions.filter((transition) => transition.deploymentId === deploymentId).map((transition) => transition.status)).toEqual([
+      "queued",
+      "running",
+      "succeeded"
+    ]);
+    const logs = await deployments.listLogs(deploymentId);
+    expect(logs.length).toBeGreaterThan(0);
+    expect(logs.every((event) => event.requestId === "req_bus_trace_1" && event.correlationId === "req_bus_trace_1")).toBe(true);
+
+    await app.close();
+  });
+
+  it("marks the deployment failed when command submission fails", async () => {
+    const deployments = new InMemoryDeploymentRepository();
+    const deploymentCommands: DeploymentCommandRepository = {
+      async save() {
+        throw new Error("command store unavailable");
+      },
+      async findById() {
+        return null;
+      },
+      async findActiveForDeployment() {
+        return null;
+      },
+      async list() {
+        return [];
+      }
+    };
+    const { app } = await authFixture({ state: { deployments, deploymentCommands } });
+    const cookie = await loginCookie(app);
+    const project = (await app.inject({
+      method: "POST",
+      url: "/api/v1/projects",
+      headers: { ...contentHeaders, cookie },
+      payload: { name: "FailingBus", repoUrl: "https://github.com/example/failing-bus", defaultBranch: "main", runCommand: "node server.js" }
+    })).json().data.project;
+
+    const trigger = await app.inject({
+      method: "POST",
+      url: `/api/v1/projects/${project.id}/deployments`,
+      headers: { ...contentHeaders, cookie, "x-request-id": "req_failing_bus_1" },
+      payload: {}
+    });
+
+    expect(trigger.statusCode).toBe(500);
+    const failed = (await deployments.list()).find((deployment) => deployment.projectId === project.id);
+    expect(failed).toMatchObject({ status: "failed" });
+    expect(failed?.finishedAt).not.toBeNull();
+    expect(await deployments.listLogs(failed!.id)).toContainEqual(expect.objectContaining({
+      level: "error",
+      requestId: "req_failing_bus_1",
+      correlationId: "req_failing_bus_1"
+    }));
+
+    await app.close();
   });
 });

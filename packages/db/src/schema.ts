@@ -239,6 +239,65 @@ export const envSecretValues = pgTable(
   ]
 );
 
+// =====================================================================
+// Deployment command queue.
+//
+// Persistent control-plane queue for deployment intent. The API submits
+// commands (`start`, `cancel`, `restart`, `rollback`) here; the
+// deployment agent (or a mock executor) claims them, drives the
+// lifecycle, and resolves them through the same table. The state
+// machine mirrors the in-process port in `packages/domain`:
+//
+//   pending  -> claimed   -> completed
+//                        -> failed
+//           -> cancelled
+//   claimed  -> cancelled (handled by the executor mid-flight)
+//
+// The table is intentionally narrow: it is a control-plane record, not
+// an audit log. Per-row correlation IDs ride along so the API can
+// stitch the command back to the originating HTTP request and the
+// agent can fan logs out under the same correlation id. No secret
+// values are stored here; the `payload` JSONB is the safe command
+// arguments (commit SHA, requested actor, restart-from-deployment id,
+// etc.) and must remain free of any plaintext material.
+// =====================================================================
+
+export const deploymentCommands = pgTable(
+  "deployment_commands",
+  {
+    id: uuid("id").primaryKey().defaultRandom(),
+    deploymentId: uuid("deployment_id").notNull().references(() => deployments.id, { onDelete: "cascade", onUpdate: "cascade" }),
+    agentId: uuid("agent_id").notNull().references(() => agents.id, { onDelete: "restrict", onUpdate: "cascade" }),
+    kind: text("kind").notNull(),
+    state: text("state").notNull().default("pending"),
+    payload: jsonObject("payload"),
+    requestedBy: uuid("requested_by").references(() => users.id, { onDelete: "set null", onUpdate: "cascade" }),
+    requestId: text("request_id").notNull(),
+    correlationId: text("correlation_id").notNull(),
+    issuedAt: timestamp("issued_at", { withTimezone: true }).notNull().defaultNow(),
+    claimedAt: timestamp("claimed_at", { withTimezone: true }),
+    completedAt: timestamp("completed_at", { withTimezone: true }),
+    failureReason: text("failure_reason"),
+    ...timestamps
+  },
+  (table) => [
+    index("deployment_commands_deployment_id_idx").on(table.deploymentId),
+    index("deployment_commands_agent_id_idx").on(table.agentId),
+    index("deployment_commands_state_idx").on(table.state),
+    index("deployment_commands_issued_at_idx").on(table.issuedAt),
+    check("deployment_commands_kind_valid", sql`${table.kind} in ('start', 'cancel', 'restart', 'rollback')`),
+    check("deployment_commands_state_valid", sql`${table.state} in ('pending', 'claimed', 'completed', 'cancelled', 'failed')`),
+    check(
+      "deployment_commands_terminal_state_has_completed_at",
+      sql`(${table.state} in ('completed', 'cancelled', 'failed')) = (${table.completedAt} is not null)`
+    ),
+    check(
+      "deployment_commands_failure_reason_only_on_failed",
+      sql`(${table.state} = 'failed') = (${table.failureReason} is not null)`
+    )
+  ]
+);
+
 export const domains = pgTable(
   "domains",
   {
@@ -295,3 +354,5 @@ export type NewDeploymentLogRow = typeof deploymentLogs.$inferInsert;
 export type NewEnvVariableMetadata = typeof envVariableMetadata.$inferInsert;
 export type EnvSecretValueRow = typeof envSecretValues.$inferSelect;
 export type NewEnvSecretValue = typeof envSecretValues.$inferInsert;
+export type DeploymentCommandRow = typeof deploymentCommands.$inferSelect;
+export type NewDeploymentCommandRow = typeof deploymentCommands.$inferInsert;
