@@ -14,10 +14,12 @@ const input = { command, repoUrl: "https://github.com/acme/service.git", ref: "m
 
 function setup(results = [{ code: 0, stdout: "", stderr: "", timedOut: false }]) {
   const runner: ProcessRunner = { run: vi.fn(async () => results.shift() ?? { code: 0, stdout: "", stderr: "", timedOut: false }) };
-  const bus: CommandBusClient = { claim: vi.fn(async () => ({ ...command, state: "claimed" as const })), complete: vi.fn(async () => null), fail: vi.fn(async () => null) };
+  const fail = vi.fn(async () => null);
+  const bus: CommandBusClient = { claim: vi.fn(async () => ({ ...command, state: "claimed" as const })), complete: vi.fn(async () => null), fail };
   const health: HealthProbe = { probe: vi.fn(async () => true) };
   const filesystem: WorkspaceFilesystem = { create: vi.fn(async () => undefined), remove: vi.fn(async () => undefined), writeSecretFile: vi.fn(async () => undefined), removeSecretFile: vi.fn(async () => undefined) };
-  return { runner, bus, health, filesystem, executor: new AgentDeploymentExecutor(runner, bus, health, { log: vi.fn() }, async () => undefined, filesystem, executorConfig) };
+  const logger = { log: vi.fn() };
+  return { runner, bus, fail, health, filesystem, logger, executor: new AgentDeploymentExecutor(runner, bus, health, logger, async () => undefined, filesystem, executorConfig) };
 }
 
 describe("AgentDeploymentExecutor", () => {
@@ -45,19 +47,22 @@ describe("AgentDeploymentExecutor", () => {
     expect(test.bus.fail).toHaveBeenCalledWith("command-1", expect.not.stringContaining("super-secret"));
   });
 
-  it("removes an env file when writing succeeds but chmod fails", async () => {
+  it("removes the exact partial env file when chmod fails after its secret write", async () => {
     const test = setup();
-    let writtenEnvFile: string | undefined;
-    test.filesystem.writeSecretFile = vi.fn(async (path) => {
-      writtenEnvFile = path;
+    const partialSecretFiles = new Map<string, string>();
+    test.filesystem.writeSecretFile = vi.fn(async (path, contents) => {
+      partialSecretFiles.set(path, contents);
       throw new Error("chmod failed");
     });
 
     const result = await test.executor.execute(input);
+    const [partialEnvPath] = [...partialSecretFiles.keys()];
 
     expect(result.reason).toBe("chmod failed");
-    expect(writtenEnvFile).toMatch(/\.env$/);
-    expect(test.filesystem.removeSecretFile).toHaveBeenCalledWith(writtenEnvFile);
+    expect(partialEnvPath).toMatch(/\.env$/);
+    expect(partialSecretFiles.get(partialEnvPath!)).toBe(input.envFile.contents);
+    expect(test.filesystem.removeSecretFile).toHaveBeenCalledWith(partialEnvPath);
+    expect(JSON.stringify([result, test.fail.mock.calls, test.logger.log.mock.calls])).not.toContain(input.envFile.contents);
   });
 
   it("fails a bounded health probe and cleans up without running shell interpolation", async () => {
