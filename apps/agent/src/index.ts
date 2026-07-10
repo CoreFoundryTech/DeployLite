@@ -11,6 +11,8 @@ import {
 import { agentHeartbeatSchema, resourceSnapshotSchema, type AgentHeartbeat } from "@deploylite/contracts";
 import { z } from "zod";
 
+export * from "./executor/index.js";
+
 export const safeCommandEnvelopeSchema = z.object({
   commandId: z.string().min(1),
   agentId: z.string().min(1),

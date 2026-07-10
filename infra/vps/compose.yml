@@ -65,6 +65,28 @@ services:
       timeout: 5s
       retries: 12
 
+  # The agent is the sole Docker-capable service. The Docker socket is
+  # privileged host control; API, web, migration, and MCP services MUST remain
+  # socket-free. Do not add this mount outside the agent without new approval.
+  agent:
+    build:
+      context: ../..
+      dockerfile: apps/agent/Dockerfile
+    image: deploylite-agent:local
+    restart: unless-stopped
+    depends_on:
+      api:
+        condition: service_healthy
+    environment:
+      NODE_ENV: production
+      DEPLOYLITE_API_URL: http://api:3001
+      DEPLOYLITE_AGENT_WORKSPACE_ROOT: /var/lib/deploylite/workspaces
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+      - agent-workspaces:/var/lib/deploylite/workspaces
+    networks:
+      - deploylite
+
   web:
     build:
       context: ../..
@@ -90,6 +112,7 @@ services:
 
 volumes:
   postgres-data:
+  agent-workspaces:
 
 networks:
   deploylite:
