@@ -799,7 +799,7 @@ async function projectAuthoritativeTerminalCommand(
 
 async function terminallyFailAgentCommand(state: PlatformRepositories, command: DeploymentCommand, reason: string, marker = "Agent command rejected"): Promise<DeploymentCommand | null> {
   const safeReason = redactLogMessage(reason).slice(0, INVALID_COMMAND_REASON_MAX);
-  const authoritative = await state.deploymentCommandBus.fail(command.id, safeReason);
+  const authoritative = await state.deploymentCommandBus.failSystem(command.id, safeReason);
   if (authoritative) await projectAuthoritativeTerminalCommand(state, authoritative, { marker, message: `${marker}: ${safeReason}` });
   return authoritative;
 }
@@ -903,6 +903,18 @@ function terminalConflictResponse(request: FastifyRequest, command: DeploymentCo
     error: {
       code: "AUTHORITATIVE_TERMINAL_CONFLICT",
       message: "The command already has a different authoritative terminal outcome.",
+      correlationId: request.correlationContext.correlationId
+    },
+    requestId: request.correlationContext.requestId
+  };
+}
+
+function leaseConflictResponse(request: FastifyRequest, command: DeploymentCommand, attemptedState: "completed" | "failed") {
+  return {
+    data: { authoritativeCommand: command, attemptedState, leaseConflict: true },
+    error: {
+      code: "AUTHORITATIVE_LEASE_CONFLICT",
+      message: "The agent command lease was not live when the terminal transition committed.",
       correlationId: request.correlationContext.correlationId
     },
     requestId: request.correlationContext.requestId
@@ -1140,6 +1152,14 @@ function registerRoutes(app: FastifyInstance, state: PlatformRepositories, adapt
     if (existing.state !== "claimed") return reply.code(409).send(errorEnvelope(request, "COMMAND_STATE_CONFLICT", "Command cannot fail in its current state."));
     const failed = await state.deploymentCommandBus.fail(existing.id, safeReason);
     if (!failed) return reply.code(404).send(errorEnvelope(request, "NOT_FOUND", "Command not found."));
+    if (failed.state === "claimed") {
+      let authoritative = await terminallyExpireAgentCommand(state, failed, "Agent command lease expired; failure was rejected.", "Agent command lease expired");
+      if (authoritative?.state === "claimed") {
+        authoritative = await terminallyFailAgentCommand(state, authoritative, "Agent command lease was unavailable; failure was rejected.", "Agent command lease unavailable");
+      }
+      if (!authoritative) return reply.code(404).send(errorEnvelope(request, "NOT_FOUND", "Command not found."));
+      return reply.code(409).send(leaseConflictResponse(request, authoritative, "failed"));
+    }
     await projectAuthoritativeTerminalCommand(state, failed, { marker: "Agent reported deployment failure", message: `Agent reported deployment failure: ${safeReason}` });
     if (failed.state !== "failed") return reply.code(409).send(terminalConflictResponse(request, failed, "failed"));
     return reply.send(failed);

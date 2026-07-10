@@ -73,6 +73,16 @@ describe("DurableTerminalCommandBus", () => {
     expect(await outbox.load()).toEqual([]);
   });
 
+  it("drains a stale failure intent after an authoritative lease conflict without starving later work", async () => {
+    const outbox = new InMemoryTerminalOutbox([{ version: 1, commandId, agentId, action: "fail", reason: "safe", createdAt: "2026-01-01T00:00:32.000Z" }]);
+    const expired = { ...base, state: "failed" as const, leaseExpiresAt: null, completedAt: "2026-01-01T00:00:32.000Z", failureReason: "Agent command lease expired; failure was rejected." };
+    const recordConflict = vi.fn();
+    const bus = new DurableTerminalCommandBus(agentId, transport({ fail: vi.fn(async () => { throw new AuthoritativeTerminalConflictError(expired, "failed", true); }) }), outbox, undefined, recordConflict);
+    await expect(bus.replayPending()).resolves.toBe(true);
+    expect(recordConflict).toHaveBeenCalledWith(expect.objectContaining({ attemptedState: "failed", authoritativeState: "failed" }));
+    expect(await outbox.load()).toEqual([]);
+  });
+
   it.each(["complete", "fail"] as const)("drains only a late %s intent after authoritative cancellation", async (action) => {
     const otherCommandId = "66666666-6666-4666-8666-666666666666";
     const outbox = new InMemoryTerminalOutbox([

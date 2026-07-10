@@ -17,13 +17,18 @@ const executionInputSchema = z.object({
 const terminalConflictResponseSchema = z.object({
   data: z.object({
     authoritativeCommand: deploymentCommandSchema,
-    attemptedState: z.enum(["completed", "failed"])
+    attemptedState: z.enum(["completed", "failed"]),
+    leaseConflict: z.literal(true).optional()
   }),
-  error: z.object({ code: z.literal("AUTHORITATIVE_TERMINAL_CONFLICT") })
+  error: z.object({ code: z.enum(["AUTHORITATIVE_TERMINAL_CONFLICT", "AUTHORITATIVE_LEASE_CONFLICT"]) })
 }).passthrough();
 
 export class AuthoritativeTerminalConflictError extends Error {
-  constructor(public readonly authoritativeCommand: DeploymentCommand, public readonly attemptedState: "completed" | "failed") {
+  constructor(
+    public readonly authoritativeCommand: DeploymentCommand,
+    public readonly attemptedState: "completed" | "failed",
+    public readonly leaseConflict = false
+  ) {
     super("Agent command has a different authoritative terminal outcome");
     this.name = "AuthoritativeTerminalConflictError";
   }
@@ -44,6 +49,7 @@ export type TerminalAcknowledgementReplayer = { replayPending(): Promise<boolean
 export type DeploymentExecutorPort = {
   execute(input: DeploymentExecutionInput, signal?: AbortSignal): Promise<DeploymentExecutionResult>;
   reconcile(input: DeploymentExecutionInput): Promise<DeploymentExecutionResult>;
+  reconcilePending?(): Promise<boolean>;
 };
 
 export type AgentWorkerOptions = {
@@ -108,6 +114,12 @@ export class AgentWorker {
         }
         terminalRetryMs = this.#retryDelayMs;
         if (!startupReconciled) {
+          if (this.options.executor.reconcilePending && !(await this.options.executor.reconcilePending())) {
+            await this.safeLog("error", "Managed resource cleanup remains incomplete; repair will retry");
+            await this.#wait(terminalRetryMs, signal);
+            terminalRetryMs = Math.min(this.#maxHeartbeatBackoffMs, Math.max(this.#retryDelayMs, terminalRetryMs * 2));
+            continue;
+          }
           const claimed = await this.options.transport.recoverClaimed(this.options.agentId, signal);
           if (claimed) await this.options.executor.reconcile(claimed);
           startupReconciled = true;
@@ -265,7 +277,7 @@ export class HttpAgentCommandTransport implements AgentCommandTransport {
     if (response.status === 204) return null;
     if (response.status === 409) {
       const parsed = terminalConflictResponseSchema.safeParse(await response.json());
-      if (parsed.success) throw new AuthoritativeTerminalConflictError(parsed.data.data.authoritativeCommand, parsed.data.data.attemptedState);
+      if (parsed.success) throw new AuthoritativeTerminalConflictError(parsed.data.data.authoritativeCommand, parsed.data.data.attemptedState, parsed.data.data.leaseConflict === true);
       throw new Error("Agent API returned an invalid terminal conflict response");
     }
     if (!response.ok) throw new Error(`Agent API request failed with status ${response.status}`);

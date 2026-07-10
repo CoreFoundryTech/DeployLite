@@ -341,6 +341,70 @@ describe("DeploymentCommandBusService", () => {
     await expect(bus.complete(command.id)).resolves.toMatchObject({ state: "completed", completedAt: "2026-01-01T00:00:29.999Z" });
   });
 
+  it("allows an agent failure only while the persisted claim lease is live", async () => {
+    let now = new Date(NOW);
+    const repository = new InMemoryDeploymentCommandRepository();
+    const bus = new DeploymentCommandBusService(repository, () => now);
+    const events: DeploymentCommandEvent[] = [];
+    bus.onEvent((event) => { events.push(event); });
+    const command = await bus.submit(baseInput);
+    await bus.claim(command.id, command.agentId);
+    now = new Date("2026-01-01T00:00:29.999Z");
+    await expect(bus.fail(command.id, "agent failed")).resolves.toMatchObject({ state: "failed", failureReason: "agent failed", completedAt: now.toISOString() });
+    expect(events.filter((event) => event.type === "deployment.command.failed")).toHaveLength(1);
+  });
+
+  it("rejects agent failure at lease equality without mutating state or emitting a terminal event", async () => {
+    let now = new Date(NOW);
+    const repository = new InMemoryDeploymentCommandRepository();
+    const bus = new DeploymentCommandBusService(repository, () => now);
+    const events: DeploymentCommandEvent[] = [];
+    bus.onEvent((event) => { events.push(event); });
+    const command = await bus.submit(baseInput);
+    await bus.claim(command.id, command.agentId);
+    now = new Date("2026-01-01T00:00:30.000Z");
+    await expect(bus.fail(command.id, "stale agent failed")).resolves.toMatchObject({ state: "claimed", leaseExpiresAt: now.toISOString(), failureReason: null });
+    expect(events.filter((event) => event.type === "deployment.command.failed")).toEqual([]);
+    await expect(bus.failExpiredClaim(command.id, "system lease expiry")).resolves.toMatchObject({ state: "failed", failureReason: "system lease expiry" });
+  });
+
+  it.each(["renewal-first", "failure-first"] as const)("serializes renewal versus agent failure when %s commits", async (winner) => {
+    const inner = new InMemoryDeploymentCommandRepository();
+    const renewGate = deferred();
+    const failGate = deferred();
+    const renewEntered = deferred();
+    const failEntered = deferred();
+    const repository: DeploymentCommandRepository = {
+      save: (value) => inner.save(value), claim: (...args) => inner.claim(...args), findById: (id) => inner.findById(id),
+      findActiveForDeployment: (id) => inner.findActiveForDeployment(id), list: () => inner.list(),
+      async renewLease(...args) { renewEntered.resolve(); await renewGate.promise; return inner.renewLease(...args); },
+      async transitionTerminal(...args) { failEntered.resolve(); await failGate.promise; return inner.transitionTerminal(...args); }
+    };
+    const claimBus = new DeploymentCommandBusService(repository, () => new Date(NOW));
+    const raceBus = new DeploymentCommandBusService(repository, () => new Date("2026-01-01T00:00:20.000Z"));
+    const command = await claimBus.submit(baseInput);
+    await claimBus.claim(command.id, command.agentId);
+    const renewal = raceBus.renewLease(command.id, command.agentId);
+    const failure = raceBus.fail(command.id, "agent failed");
+    await Promise.all([renewEntered.promise, failEntered.promise]);
+    if (winner === "renewal-first") { renewGate.resolve(); await renewal; failGate.resolve(); }
+    else { failGate.resolve(); await failure; renewGate.resolve(); }
+    const [renewed, failed] = await Promise.all([renewal, failure]);
+    if (winner === "renewal-first") {
+      expect(renewed).toMatchObject({ state: "claimed", leaseExpiresAt: "2026-01-01T00:00:50.000Z" });
+      expect(failed).toMatchObject({ state: "failed", failureReason: "agent failed" });
+    } else {
+      expect(failed).toMatchObject({ state: "failed", failureReason: "agent failed" });
+      expect(renewed).toBeNull();
+    }
+  });
+
+  it("keeps system prerequisite failure authoritative without requiring an agent lease", async () => {
+    const bus = await newBus();
+    const pending = await bus.submit(baseInput);
+    await expect(bus.failSystem(pending.id, "missing prerequisite")).resolves.toMatchObject({ state: "failed", failureReason: "missing prerequisite" });
+  });
+
   it("looks up the active command for a deployment and ignores terminal states", async () => {
     const bus = await newBus();
     const command = await bus.submit(baseInput);

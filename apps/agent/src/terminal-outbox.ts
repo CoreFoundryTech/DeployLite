@@ -224,7 +224,7 @@ export class DurableTerminalCommandBus implements CommandBusClient {
       command.id !== commandId ||
       command.agentId !== this.agentId ||
       error.attemptedState !== attemptedState ||
-      command.state === attemptedState ||
+      (command.state === attemptedState && !error.leaseConflict) ||
       (command.state !== "completed" && command.state !== "failed" && command.state !== "cancelled")
     ) {
       throw new Error("Terminal conflict response did not prove an authoritative assignment-scoped outcome");

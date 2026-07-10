@@ -1,6 +1,6 @@
 import { describe, expect, it, vi } from "vitest";
 import type { Agent, DeploymentCommand } from "@deploylite/contracts";
-import { AgentWorker, HttpAgentCommandTransport, type AgentCommandTransport } from "./worker.js";
+import { AgentWorker, AuthoritativeTerminalConflictError, HttpAgentCommandTransport, type AgentCommandTransport } from "./worker.js";
 
 const command: DeploymentCommand = {
   id: "command-1", deploymentId: "deployment-1", agentId: "agent-1", kind: "start", state: "pending", payload: {}, requestedBy: null,
@@ -95,6 +95,25 @@ describe("AgentWorker", () => {
     }).run(shutdown.signal);
     expect(order).toEqual(["register", "replay", "recover", "reconcile", "poll"]);
     expect(executor.execute).not.toHaveBeenCalled();
+  });
+
+  it("replays durable managed-resource repairs before command recovery after restart", async () => {
+    const shutdown = new AbortController();
+    const order: string[] = [];
+    const commandTransport = transport({
+      recoverClaimed: vi.fn(async () => { order.push("recover"); return null; }),
+      poll: vi.fn(async () => { order.push("poll"); shutdown.abort(); return null; })
+    });
+    const executor = {
+      execute: vi.fn(),
+      reconcile: vi.fn(),
+      reconcilePending: vi.fn(async () => { order.push("repair"); return true; })
+    };
+    await new AgentWorker({
+      agentId: "agent-1", agentName: "Agent", agentEndpoint: "http://agent.test", transport: commandTransport,
+      executor, resourceCollector: { collect: async () => snapshot }, terminalAcks: { replayPending: async () => { order.push("outbox"); return true; } }
+    }).run(shutdown.signal);
+    expect(order).toEqual(["outbox", "repair", "recover", "poll"]);
   });
 
   it("aborts execution when lease renewal cannot be confirmed and does not execute twice", async () => {
@@ -196,5 +215,17 @@ describe("HttpAgentCommandTransport", () => {
     const commandTransport = new HttpAgentCommandTransport({ apiUrl: "https://api.example.test", token: "secret-agent-token", fetch: fetchMock });
     await expect(commandTransport.register({ agentId: "agent-1", name: "Agent", endpoint: "http://agent.test", observedAt: "2026-01-01T00:00:00.000Z", resourceSnapshot: snapshot }, new AbortController().signal)).resolves.toEqual(agent);
     expect(String(fetchMock.mock.calls[0]![0])).toBe("https://api.example.test/api/v1/agent/register");
+  });
+
+  it("parses an authoritative lease conflict so a stale fail outbox can drain", async () => {
+    const authoritative = { ...command, state: "failed" as const, leaseExpiresAt: null, completedAt: "2026-01-01T00:00:30.000Z", failureReason: "lease expired" };
+    const fetchMock = vi.fn<typeof fetch>(async () => new Response(JSON.stringify({
+      data: { authoritativeCommand: authoritative, attemptedState: "failed", leaseConflict: true },
+      error: { code: "AUTHORITATIVE_LEASE_CONFLICT" }
+    }), { status: 409, headers: { "content-type": "application/json" } }));
+    const commandTransport = new HttpAgentCommandTransport({ apiUrl: "https://api.example.test", token: "secret-agent-token", fetch: fetchMock });
+    const failure = commandTransport.fail(command.id, "stale failure");
+    await expect(failure).rejects.toBeInstanceOf(AuthoritativeTerminalConflictError);
+    await expect(failure).rejects.toMatchObject({ leaseConflict: true, authoritativeCommand: { state: "failed" } });
   });
 });

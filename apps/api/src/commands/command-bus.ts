@@ -142,11 +142,39 @@ export class DeploymentCommandBusService implements DeploymentCommandBus {
     const next: DeploymentCommandRecord = {
       ...existing,
       state: "failed",
-      completedAt: new Date().toISOString(),
+      completedAt: this.now().toISOString(),
       leaseExpiresAt: null,
       failureReason: reason
     };
-    const result = await this.#repository.transitionTerminal(existing.id, existing.agentId, existing.state, next);
+    const result = await this.#repository.transitionTerminal(existing.id, existing.agentId, "claimed", next, {
+      leaseExpiresAtAfterNow: () => this.now().toISOString()
+    });
+    if (result?.applied) await this.#emit("deployment.command.failed", result.command);
+    return result?.command ?? null;
+  }
+
+  async failSystem(commandId: string, reason: string): Promise<DeploymentCommandRecord | null> {
+    const existing = await this.#repository.findById(commandId);
+    if (!existing) return null;
+    if (existing.state === "completed" || existing.state === "failed" || existing.state === "cancelled") return existing;
+    const next: DeploymentCommandRecord = {
+      ...existing,
+      state: "failed",
+      completedAt: this.now().toISOString(),
+      leaseExpiresAt: null,
+      failureReason: reason
+    };
+    let result = await this.#repository.transitionTerminal(existing.id, existing.agentId, existing.state, next);
+    if (result && !result.applied && (result.command.state === "pending" || result.command.state === "claimed")) {
+      const authoritativeNext: DeploymentCommandRecord = {
+        ...result.command,
+        state: "failed",
+        completedAt: this.now().toISOString(),
+        leaseExpiresAt: null,
+        failureReason: reason
+      };
+      result = await this.#repository.transitionTerminal(result.command.id, result.command.agentId, result.command.state, authoritativeNext);
+    }
     if (result?.applied) await this.#emit("deployment.command.failed", result.command);
     return result?.command ?? null;
   }

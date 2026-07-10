@@ -170,6 +170,7 @@ export type DeploymentCommandBus = {
   renewLease(commandId: string, agentId: string): Promise<DeploymentCommandRecord | null>;
   complete(commandId: string, output?: Record<string, unknown>): Promise<DeploymentCommandRecord | null>;
   fail(commandId: string, reason: string): Promise<DeploymentCommandRecord | null>;
+  failSystem(commandId: string, reason: string): Promise<DeploymentCommandRecord | null>;
   failExpiredClaim(commandId: string, reason: string): Promise<DeploymentCommandRecord | null>;
   cancel(commandId: string, requestedBy: string | null): Promise<DeploymentCommandRecord | null>;
   list(): Promise<DeploymentCommandRecord[]>;
