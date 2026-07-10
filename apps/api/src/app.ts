@@ -1041,20 +1041,43 @@ function registerRoutes(app: FastifyInstance, state: PlatformRepositories, adapt
     // the slice-1 acceptance criteria. The `running` / `succeeded`
     // transitions arrive later through the existing SSE log stream
     // and `findById` polling.
-    const command = await state.deploymentCommandBus.submit({
-      deploymentId: deployment.id,
-      agentId: deployment.agentId,
-      kind: "start",
-      payload: { projectId: project.id, commitSha },
-      requestedBy: request.auth?.user.id ?? null,
-      requestId: request.correlationContext.requestId,
-      correlationId: request.correlationContext.correlationId
-    });
-    // Dispatch inline so the response reflects the deployment status
-    // (e.g. `failed` for missing required env metadata) that the UI
-    // will see. Later slices can replace this with an out-of-process
-    // agent poll/claim loop without changing the route contract.
-    const dispatched = await state.deploymentCommandBus.dispatch(command);
+    let dispatched: Awaited<ReturnType<DeploymentCommandBus["dispatch"]>>;
+    try {
+      const command = await state.deploymentCommandBus.submit({
+        deploymentId: deployment.id,
+        agentId: deployment.agentId,
+        kind: "start",
+        payload: { projectId: project.id, commitSha },
+        requestedBy: request.auth?.user.id ?? null,
+        requestId: request.correlationContext.requestId,
+        correlationId: request.correlationContext.correlationId
+      });
+      // Dispatch inline so the response reflects the deployment status
+      // (e.g. `failed` for missing required env metadata) that the UI
+      // will see. Later slices can replace this with an out-of-process
+      // agent poll/claim loop without changing the route contract.
+      dispatched = await state.deploymentCommandBus.dispatch(command);
+      if (!dispatched) {
+        throw new Error("Deployment command was not dispatched");
+      }
+    } catch (error) {
+      const failed: Deployment = { ...deployment, status: "failed", finishedAt: new Date().toISOString() };
+      await state.deployments.save(failed);
+      const existingLogs = await state.deployments.listLogs(deployment.id);
+      const sequence = Math.max(0, ...existingLogs.map((event) => event.sequence)) + 1;
+      await state.deployments.appendLog({
+        id: `log_${createRequestId()}`,
+        deploymentId: deployment.id,
+        sequence,
+        level: "error",
+        message: "Deployment command submission or dispatch failed.",
+        timestamp: new Date().toISOString(),
+        redactionApplied: true,
+        requestId: request.correlationContext.requestId,
+        correlationId: request.correlationContext.correlationId
+      });
+      throw error;
+    }
     const refreshed = dispatched ? await state.deployments.findById(deployment.id) : null;
     const observed = refreshed ?? deployment;
     const envVariables = await state.envMetadata.listByProject(project.id);

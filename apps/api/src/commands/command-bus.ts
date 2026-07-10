@@ -61,7 +61,7 @@ export class DeploymentCommandBusService implements DeploymentCommandBus {
     }
     const issuedAt = new Date().toISOString();
     const command: DeploymentCommandRecord = {
-      id: `cmd_${createRequestId()}`,
+      id: createRequestId(),
       deploymentId: input.deploymentId,
       agentId: input.agentId,
       kind: input.kind,
@@ -95,7 +95,7 @@ export class DeploymentCommandBusService implements DeploymentCommandBus {
     const next: DeploymentCommandRecord = {
       ...existing,
       state: "claimed",
-      claimedAt: new Date().toISOString()
+      claimedAt: existing.claimedAt ?? new Date().toISOString()
     };
     const saved = await this.#repository.save(next);
     await this.#emit("deployment.command.claimed", saved);
@@ -189,7 +189,13 @@ export class DeploymentCommandBusService implements DeploymentCommandBus {
     if (!claimed) {
       return null;
     }
-    await this.#executor.execute(claimed);
+    try {
+      await this.#executor.execute(claimed);
+    } catch (error) {
+      const reason = error instanceof Error ? error.message : "Deployment executor failed";
+      await this.fail(claimed.id, reason);
+      throw error;
+    }
     // The executor is responsible for resolving the command (complete /
     // fail / cancel). It may also do so asynchronously; this dispatch
     // helper returns the claimed row so the caller can observe the

@@ -177,6 +177,16 @@ describeIntegration("PostgreSQL auth foundation integration", () => {
       startedAt: now,
       finishedAt: null
     });
+    const finishedAt = new Date().toISOString();
+    await requireDbDeploymentRepository().save({
+      id: deploymentId,
+      projectId,
+      agentId,
+      status: "succeeded",
+      commitSha: "abcdef1234567890",
+      startedAt: now,
+      finishedAt
+    });
     await requireDbDeploymentRepository().appendLog({
       id: deploymentLogId,
       deploymentId,
@@ -238,7 +248,7 @@ describeIntegration("PostgreSQL auth foundation integration", () => {
       id: deploymentId,
       projectId,
       agentId,
-      status: "running",
+      status: "succeeded",
       commitSha: "abcdef1234567890"
     });
     await expect(requireDbDeploymentRepository().listLogs(deploymentId)).resolves.toEqual([

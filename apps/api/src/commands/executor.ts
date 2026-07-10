@@ -134,8 +134,7 @@ export class MockDeploymentExecutor implements DeploymentExecutor {
       await this.#appendLog(deployment, "info", `Run command: ${project.runCommand} (port ${project.port ?? "default"})`, command.requestId, command.correlationId);
     }
 
-    this.#scheduleAdvance(command.id, deployment.id, "running", 50);
-    this.#scheduleAdvance(command.id, deployment.id, "succeeded", 250);
+    this.#scheduleAdvance(command.id, deployment.id, "running", 50, command.requestId, command.correlationId);
     // The lifecycle itself completes asynchronously via the timers.
     // The bus does not need to be resolved synchronously; a follow-up
     // call from the timer chain will resolve the command when the
@@ -200,7 +199,14 @@ export class MockDeploymentExecutor implements DeploymentExecutor {
     });
   }
 
-  #scheduleAdvance(commandId: string, deploymentId: string, status: "running" | "succeeded" | "failed", delayMs: number): void {
+  #scheduleAdvance(
+    commandId: string,
+    deploymentId: string,
+    status: "running" | "succeeded" | "failed",
+    delayMs: number,
+    requestId: string,
+    correlationId: string
+  ): void {
     const previous = this.#timers.get(deploymentId);
     if (previous) {
       clearTimeout(previous);
@@ -219,7 +225,10 @@ export class MockDeploymentExecutor implements DeploymentExecutor {
           : status === "succeeded"
             ? "Simulated agent marked the deployment succeeded. Real container execution is intentionally deferred."
             : "Simulated agent marked the deployment failed.";
-      await this.#appendLog(next, status === "succeeded" ? "info" : status === "failed" ? "error" : "info", message, next.startedAt, next.startedAt);
+      await this.#appendLog(next, status === "succeeded" ? "info" : status === "failed" ? "error" : "info", message, requestId, correlationId);
+      if (status === "running") {
+        this.#scheduleAdvance(commandId, deploymentId, "succeeded", 200, requestId, correlationId);
+      }
       if (status === "succeeded") {
         await this.#bus.complete(commandId, { deploymentId });
       } else if (status === "failed") {

@@ -36,6 +36,7 @@ describe("DeploymentCommandBusService", () => {
 
     const command = await bus.submit({ ...baseInput, payload: { commitSha: "abcdef1" } });
 
+    expect(command.id).toMatch(/^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i);
     expect(command.state).toBe("pending");
     expect(command.payload).toEqual({ commitSha: "abcdef1" });
     expect(command.issuedAt).toBeTypeOf("string");
@@ -128,6 +129,30 @@ describe("DeploymentCommandBusService", () => {
     expect(executor.execute).toHaveBeenCalledWith(expect.objectContaining({ id: command.id, state: "claimed" }));
     expect(dispatched?.state).toBe("claimed");
     expect((await bus.findById(command.id))?.state).toBe("completed");
+  });
+
+  it("fails a claimed command when the executor throws", async () => {
+    const bus = await newBus();
+    bus.registerExecutor({
+      execute: vi.fn(async () => {
+        throw new Error("executor unavailable");
+      }),
+      cancelTimers: () => undefined
+    });
+    const events: DeploymentCommandEvent[] = [];
+    bus.onEvent((event) => {
+      events.push(event);
+    });
+    const command = await bus.submit(baseInput);
+
+    await expect(bus.dispatch(command)).rejects.toThrow("executor unavailable");
+
+    expect(await bus.findById(command.id)).toMatchObject({ state: "failed", failureReason: "executor unavailable" });
+    expect(events.map((event) => event.type)).toEqual([
+      "deployment.command.submitted",
+      "deployment.command.claimed",
+      "deployment.command.failed"
+    ]);
   });
 
   it("isolates listener failures from the command lifecycle", async () => {

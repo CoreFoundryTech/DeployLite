@@ -131,6 +131,18 @@ export class DbDeploymentRepository implements DeploymentRepository {
         startedAt: new Date(deployment.startedAt),
         finishedAt: deployment.finishedAt ? new Date(deployment.finishedAt) : null
       })
+      .onConflictDoUpdate({
+        target: deployments.id,
+        set: {
+          projectId: deployment.projectId,
+          agentId: deployment.agentId,
+          status: deployment.status,
+          commitSha: deployment.commitSha,
+          startedAt: new Date(deployment.startedAt),
+          finishedAt: deployment.finishedAt ? new Date(deployment.finishedAt) : null,
+          updatedAt: new Date()
+        }
+      })
       .returning();
 
     if (!row) throw new Error("Failed to save deployment");
