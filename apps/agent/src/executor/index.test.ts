@@ -5,6 +5,7 @@ import { resolve } from "node:path";
 import { describe, expect, it, vi } from "vitest";
 import type { DeploymentCommand } from "@deploylite/contracts";
 import { AgentDeploymentExecutor, assertSafeRuntimePlan, createDeploymentPlan, createSpawnProcessRunner, type CommandBusClient, type HealthProbe, type ProcessRunner, type SpawnedProcess, type WorkspaceFilesystem } from "./index.js";
+import { InMemoryCleanupRepairStore } from "../cleanup-repairs.js";
 
 const command: DeploymentCommand = {
   id: "command-1", deploymentId: "deployment-1", agentId: "agent-1", kind: "start", state: "pending", payload: {}, requestedBy: null,
@@ -14,7 +15,13 @@ const executorConfig = { workspaceRoot: "/var/lib/deploylite/workspaces", secret
 const input = { command, repoUrl: "https://github.com/acme/service.git", ref: "main", projectSlug: "service", healthUrl: "http://deploylite-command-1:3000/health", envFile: { contents: "TOKEN=super-secret" } };
 
 function setup(results = [{ code: 0, stdout: "", stderr: "", timedOut: false }]) {
-  const runner: ProcessRunner = { run: vi.fn(async () => results.shift() ?? { code: 0, stdout: "", stderr: "", timedOut: false }) };
+  const runner: ProcessRunner = { run: vi.fn(async (plan) => {
+    const result = results.shift() ?? { code: 0, stdout: "", stderr: "", timedOut: false };
+    if (plan.args.includes("{{json .HostConfig}}") && result.code === 0 && !result.stdout) {
+      return { ...result, stdout: JSON.stringify({ Memory: 1073741824, MemorySwap: 1073741824, CpuPeriod: 100000, CpuQuota: 100000, PidsLimit: 256, NetworkMode: "deploylite-build-command-1", Privileged: false }) };
+    }
+    return result;
+  }) };
   const fail = vi.fn(async () => null);
   const bus: CommandBusClient = { claim: vi.fn(async () => ({ ...command, state: "claimed" as const, leaseExpiresAt: "2026-01-01T00:00:30.000Z" })), renewLease: vi.fn(async () => null), complete: vi.fn(async () => null), fail };
   const health: HealthProbe = { probe: vi.fn(async () => true) };
@@ -27,7 +34,8 @@ function setup(results = [{ code: 0, stdout: "", stderr: "", timedOut: false }])
     removeSecretFile: vi.fn(async () => undefined)
   };
   const logger = { log: vi.fn() };
-  return { runner, bus, fail, health, filesystem, logger, executor: new AgentDeploymentExecutor(runner, bus, health, logger, async () => undefined, filesystem, executorConfig) };
+  const cleanupRepairs = new InMemoryCleanupRepairStore();
+  return { runner, bus, fail, health, filesystem, logger, cleanupRepairs, executor: new AgentDeploymentExecutor(runner, bus, health, logger, async () => undefined, filesystem, executorConfig, cleanupRepairs) };
 }
 
 describe("AgentDeploymentExecutor", () => {
@@ -35,10 +43,10 @@ describe("AgentDeploymentExecutor", () => {
     const test = setup();
     const result = await test.executor.execute(input);
     expect(result.ok).toBe(true);
-    expect(test.runner.run).toHaveBeenCalledTimes(5);
+    expect(test.runner.run).toHaveBeenCalledTimes(18);
     expect(test.runner.run).toHaveBeenNthCalledWith(1, expect.objectContaining({ command: "git", args: expect.arrayContaining(["clone", "--no-checkout"]) }), expect.any(Number));
-    expect(test.runner.run).toHaveBeenNthCalledWith(4, expect.objectContaining({ command: "docker", args: expect.arrayContaining(["build", "--tag", "deploylite/service:command-1"]) }), expect.any(Number));
-    expect(test.runner.run).toHaveBeenNthCalledWith(5, expect.objectContaining({ command: "docker", args: expect.arrayContaining(["run", "--read-only", "--env-file"]) }), expect.any(Number));
+    expect(test.runner.run).toHaveBeenNthCalledWith(9, expect.objectContaining({ command: "docker", args: expect.arrayContaining(["buildx", "build", "--builder", "deploylite-command-1", "--network", "none", "--output", "type=docker,name=deploylite/service:command-1"]) }), expect.any(Number));
+    expect(test.runner.run).toHaveBeenNthCalledWith(10, expect.objectContaining({ command: "docker", args: expect.arrayContaining(["run", "--read-only", "--env-file"]) }), expect.any(Number));
     expect(test.bus.complete).toHaveBeenCalledWith("command-1", expect.objectContaining({ imageTag: "deploylite/service:command-1" }));
     expect(test.filesystem.create).toHaveBeenCalled();
     expect(test.filesystem.writeSecretFile).toHaveBeenCalledWith("/run/deploylite/secrets/command-1/runtime.env", "TOKEN=super-secret");
@@ -53,17 +61,21 @@ describe("AgentDeploymentExecutor", () => {
     await expect(test.executor.execute(input)).rejects.toThrow("completion ACK lost");
 
     expect(test.bus.fail).not.toHaveBeenCalled();
-    expect(test.runner.run).not.toHaveBeenCalledWith(expect.objectContaining({ args: ["rm", "--force", "deploylite-command-1"] }), expect.any(Number));
-    expect(test.runner.run).not.toHaveBeenCalledWith(expect.objectContaining({ args: ["image", "rm", "--force", "deploylite/service:command-1"] }), expect.any(Number));
+    expect(test.runner.run).not.toHaveBeenCalledWith(expect.objectContaining({ args: ["rm", "--force", expect.any(String)] }), expect.any(Number));
   });
 
   it("records a redacted command failure and cleans only DeployLite-labelled runtime resources", async () => {
-    const test = setup([{ code: 0, stdout: "", stderr: "", timedOut: false }, { code: 0, stdout: "", stderr: "", timedOut: false }, { code: 0, stdout: "", stderr: "", timedOut: false }, { code: 0, stdout: "", stderr: "", timedOut: false }, { code: 1, stdout: "token=super-secret", stderr: "failed", timedOut: false }]);
+    const test = setup();
+    vi.mocked(test.runner.run).mockImplementation(async (plan) => {
+      if (plan.args.includes("{{json .HostConfig}}")) return boundedBuilderResult();
+      if (plan.args[0] === "run") return { code: 1, stdout: "token=super-secret", stderr: "failed", timedOut: false };
+      return { code: 0, stdout: "", stderr: "", timedOut: false };
+    });
     const result = await test.executor.execute(input);
     expect(result.ok).toBe(false);
     expect(result.reason).not.toContain("super-secret");
-    expect(test.runner.run).toHaveBeenCalledWith(expect.objectContaining({ args: ["rm", "--force", "deploylite-command-1"] }), expect.any(Number));
-    expect(test.runner.run).toHaveBeenCalledWith(expect.objectContaining({ args: ["image", "rm", "--force", "deploylite/service:command-1"] }), expect.any(Number));
+    expect(test.runner.run).toHaveBeenCalledWith(expect.objectContaining({ args: expect.arrayContaining(["ps", "--all", "--filter", "label=com.deploylite.managed=true", "--filter", "label=com.deploylite.command-id=command-1"]) }), expect.any(Number));
+    expect(test.runner.run).toHaveBeenCalledWith(expect.objectContaining({ args: expect.arrayContaining(["image", "ls", "--filter", "reference=deploylite/service:command-1", "--filter", "label=com.deploylite.managed=true"]) }), expect.any(Number));
     expect(test.filesystem.remove).toHaveBeenCalled();
     expect(test.filesystem.removeSecretFile).toHaveBeenCalledWith(expect.stringMatching(/\.env$/));
     expect(test.bus.fail).toHaveBeenCalledWith("command-1", expect.not.stringContaining("super-secret"));
@@ -119,16 +131,16 @@ describe("AgentDeploymentExecutor", () => {
   });
 
   it("performs explicit trusted Docker cleanup after a build timeout", async () => {
-    const test = setup([
-      { code: 0, stdout: "", stderr: "", timedOut: false },
-      { code: 0, stdout: "", stderr: "", timedOut: false },
-      { code: 0, stdout: "", stderr: "", timedOut: false },
-      { code: 1, stdout: "", stderr: "", timedOut: true }
-    ]);
+    const test = setup();
+    vi.mocked(test.runner.run).mockImplementation(async (plan) => {
+      if (plan.args.includes("{{json .HostConfig}}")) return boundedBuilderResult();
+      if (plan.args[0] === "buildx" && plan.args[1] === "build") return { code: 1, stdout: "", stderr: "", timedOut: true };
+      return { code: 0, stdout: "", stderr: "", timedOut: false };
+    });
     const result = await test.executor.execute(input);
     expect(result.reason).toBe("Timed out: docker");
-    expect(test.runner.run).toHaveBeenCalledWith(expect.objectContaining({ args: ["rm", "--force", "deploylite-command-1"] }), 60_000);
-    expect(test.runner.run).toHaveBeenCalledWith(expect.objectContaining({ args: ["image", "rm", "--force", "deploylite/service:command-1"] }), 60_000);
+    expect(test.runner.run).toHaveBeenCalledWith(expect.objectContaining({ args: expect.arrayContaining(["ps", "--all", "--filter", "name=^/deploylite-command-1$"]) }), 60_000);
+    expect(test.runner.run).toHaveBeenCalledWith(expect.objectContaining({ args: expect.arrayContaining(["image", "ls", "--filter", "reference=deploylite/service:command-1"]) }), 60_000);
   });
 
   it("preserves the primary error and reaches commandBus.fail when every cleanup fails", async () => {
@@ -196,6 +208,67 @@ describe("AgentDeploymentExecutor", () => {
     }
     expect(() => assertSafeRuntimePlan({ ...plan, args: [...plan.args.slice(0, -1), "--network", "attacker-network", plan.args.at(-1)!] })).toThrow("trusted DeployLite network");
     expect(() => assertSafeRuntimePlan({ ...plan, args: plan.args.map((arg) => arg === "no-new-privileges" ? "seccomp=unconfined" : arg) })).toThrow("weakens container isolation");
+  });
+
+  it("uses only the exact DeployLite-controlled bounded BuildKit builder policy", () => {
+    const plans = createDeploymentPlan({ ...input, command: { ...command, payload: { builder: "attacker", network: "host", output: "/tmp/escape" } } }, executorConfig);
+    expect(plans[3]).toEqual({ command: "docker", args: ["network", "create", "--driver", "bridge", "--label", "com.deploylite.managed=true", "--label", "com.deploylite.command-id=command-1", "deploylite-build-command-1"] });
+    expect(plans[4]).toEqual({
+      command: "docker",
+      args: ["buildx", "create", "--name", "deploylite-command-1", "--driver", "docker-container", "--driver-opt", "network=deploylite-build-command-1,memory=1g,memory-swap=1g,cpu-period=100000,cpu-quota=100000,restart-policy=no", "--buildkitd-config", "/etc/deploylite/buildkitd.toml"]
+    });
+    expect(plans[6]?.args).toEqual(["update", "--pids-limit", "256", "buildx_buildkit_deploylite-command-10"]);
+    expect(plans[8]?.args).toEqual(["buildx", "build", "--builder", "deploylite-command-1", "--network", "none", "--progress", "plain", "--label", "com.deploylite.managed=true", "--label", "com.deploylite.command-id=command-1", "--output", "type=docker,name=deploylite/service:command-1", "/var/lib/deploylite/workspaces/command-1"]);
+    expect(plans.some((plan) => plan.args[0] === "build")).toBe(false);
+    expect(JSON.stringify(plans)).not.toMatch(/attacker|network=host|\/tmp\/escape|--privileged|--mount|--device|--cap-add/);
+  });
+
+  it("fails closed before build when the bounded builder cannot be proven", async () => {
+    const test = setup();
+    vi.mocked(test.runner.run).mockImplementation(async (plan) => plan.args.includes("{{json .HostConfig}}")
+      ? { ...boundedBuilderResult(), stdout: JSON.stringify({ Memory: 1073741824, MemorySwap: 1073741824, CpuPeriod: 100000, CpuQuota: 100000, PidsLimit: 0, NetworkMode: "deploylite-build-command-1", Privileged: false }) }
+      : { code: 0, stdout: "", stderr: "", timedOut: false });
+    const result = await test.executor.execute(input);
+    expect(result.reason).toBe("Bounded BuildKit builder is unavailable");
+    expect(test.runner.run).not.toHaveBeenCalledWith(expect.objectContaining({ args: expect.arrayContaining(["buildx", "build"]) }), expect.any(Number));
+  });
+
+  it("rechecks absent resources, removes late labelled container and image IDs, and preserves unrelated IDs", async () => {
+    const test = setup();
+    let containerChecks = 0;
+    let imageChecks = 0;
+    vi.mocked(test.runner.run).mockImplementation(async (plan) => {
+      if (plan.args.includes("{{json .HostConfig}}")) return boundedBuilderResult();
+      if (plan.args[0] === "run") return { code: 1, stdout: "", stderr: "runtime failed", timedOut: false };
+      if (plan.args[0] === "ps") return { code: 0, stdout: ++containerChecks === 2 ? "a".repeat(64) : "", stderr: "", timedOut: false };
+      if (plan.args[0] === "image") return { code: 0, stdout: ++imageChecks === 2 ? "b".repeat(64) : "", stderr: "", timedOut: false };
+      return { code: 0, stdout: "", stderr: "", timedOut: false };
+    });
+    await test.executor.execute(input);
+    expect(test.runner.run).toHaveBeenCalledWith({ command: "docker", args: ["rm", "--force", "a".repeat(64)] }, 60_000);
+    expect(test.runner.run).toHaveBeenCalledWith({ command: "docker", args: ["image", "rm", "--force", "b".repeat(64)] }, 60_000);
+    expect(JSON.stringify(vi.mocked(test.runner.run).mock.calls)).not.toContain("c".repeat(64));
+    expect(await test.cleanupRepairs.load()).toEqual([]);
+  });
+
+  it("bounds cleanup exhaustion, retains repair state, and clears it on restart without another terminal effect", async () => {
+    const test = setup();
+    vi.mocked(test.runner.run).mockImplementation(async (plan) => {
+      if (plan.args.includes("{{json .HostConfig}}")) return boundedBuilderResult();
+      if (plan.args[0] === "run") return { code: 1, stdout: "", stderr: "runtime failed", timedOut: false };
+      if (plan.args[0] === "ps" || plan.args[0] === "image" || (plan.args[0] === "buildx" && plan.args[1] === "ls") || (plan.args[0] === "network" && plan.args[1] === "ls")) throw new Error("daemon unavailable");
+      return { code: 0, stdout: "", stderr: "", timedOut: false };
+    });
+    const result = await test.executor.execute(input);
+    expect(result.reason).toContain("cleanup incomplete");
+    expect(vi.mocked(test.runner.run).mock.calls.filter(([plan]) => plan.args[0] === "ps")).toHaveLength(4);
+    expect(await test.cleanupRepairs.load()).toEqual([{ version: 1, commandId: "command-1", projectSlug: "service" }]);
+    const terminalCalls = test.fail.mock.calls.length;
+    const repairRunner: ProcessRunner = { run: vi.fn(async () => ({ code: 0, stdout: "", stderr: "", timedOut: false })) };
+    const restarted = new AgentDeploymentExecutor(repairRunner, test.bus, test.health, test.logger, async () => undefined, test.filesystem, executorConfig, test.cleanupRepairs);
+    await expect(restarted.reconcilePending()).resolves.toBe(true);
+    expect(await test.cleanupRepairs.load()).toEqual([]);
+    expect(test.fail).toHaveBeenCalledTimes(terminalCalls);
   });
 
   it("redacts credential-bearing URLs returned by a runner before failures are logged", async () => {
@@ -286,7 +359,8 @@ describe("agent-only Docker socket compose boundary", () => {
   it("installs the executor runtime tools in the minimal pinned Alpine image", async () => {
     const dockerfile = await readFile(resolve(import.meta.dirname, "../../Dockerfile"), "utf8");
     expect(dockerfile).toContain("node:22.14.0-alpine3.21");
-    expect(dockerfile).toContain("apk add --no-cache git docker-cli docker-cli-compose");
+    expect(dockerfile).toContain("apk add --no-cache git docker-cli docker-cli-buildx docker-cli-compose");
+    expect(dockerfile).toContain("COPY apps/agent/buildkitd.toml /etc/deploylite/buildkitd.toml");
     expect(dockerfile).toContain('CMD ["node", "apps/agent/dist/main.js"]');
     for (const runtimePath of ["apps/agent/node_modules", "packages/config/dist", "packages/config/node_modules", "packages/contracts/dist", "packages/contracts/node_modules", "packages/domain/dist", "packages/domain/node_modules"]) {
       expect(dockerfile).toContain(runtimePath);
@@ -305,6 +379,19 @@ describe("agent-only Docker socket compose boundary", () => {
     expect(executor).toContain("Deployment workspace may not be a symbolic link");
     expect(executor).toContain("Deployment workspace escaped its trusted root");
   });
+
+  it("documents bounded BuildKit policy and residual socket risk without claiming a complete sandbox", async () => {
+    const [readme, infra] = await Promise.all([
+      readFile(resolve(import.meta.dirname, "../../../../README.md"), "utf8"),
+      readFile(resolve(import.meta.dirname, "../../../../infra/README.md"), "utf8")
+    ]);
+    for (const document of [readme, infra]) {
+      expect(document).toContain("Buildx");
+      expect(document).toContain("fails closed");
+      expect(document).toContain("host-root-equivalent");
+      expect(document).toMatch(/BuildKit.*risk|Residual risk/s);
+    }
+  });
 });
 
 function composeServiceNetworks(compose: string, service: string): string[] {
@@ -316,8 +403,18 @@ function composeServiceNetworks(compose: string, service: string): string[] {
 }
 
 function resultsForPrimaryFailure(plan: { command: string; args: string[] }) {
+  if (plan.args.includes("{{json .HostConfig}}")) return Promise.resolve(boundedBuilderResult());
   if (plan.command === "docker" && plan.args[0] === "run") {
     return Promise.resolve({ code: 1, stdout: "", stderr: "primary runtime failure", timedOut: false });
   }
   return Promise.resolve({ code: 0, stdout: "", stderr: "", timedOut: false });
+}
+
+function boundedBuilderResult() {
+  return {
+    code: 0,
+    stdout: JSON.stringify({ Memory: 1073741824, MemorySwap: 1073741824, CpuPeriod: 100000, CpuQuota: 100000, PidsLimit: 256, NetworkMode: "deploylite-build-command-1", Privileged: false }),
+    stderr: "",
+    timedOut: false
+  };
 }

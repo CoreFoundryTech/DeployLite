@@ -12,7 +12,8 @@ WORKDIR /app
 # Alpine 3.21 repository packages provide Git plus the Docker CLI and Compose
 # v2 plugin required by the executor. Keep this image on Alpine 3.21 until a
 # deliberate tool-version refresh; Docker socket access remains privileged.
-RUN apk add --no-cache git docker-cli docker-cli-compose
+RUN apk add --no-cache git docker-cli docker-cli-buildx docker-cli-compose
+COPY apps/agent/buildkitd.toml /etc/deploylite/buildkitd.toml
 COPY --from=build /app/node_modules ./node_modules
 COPY --from=build /app/apps/agent/package.json ./apps/agent/package.json
 COPY --from=build /app/apps/agent/node_modules ./apps/agent/node_modules

@@ -90,6 +90,7 @@ services:
       DEPLOYLITE_AGENT_ENDPOINT: ${DEPLOYLITE_AGENT_ENDPOINT:-http://agent:3002}
       DEPLOYLITE_AGENT_WORKSPACE_ROOT: /var/lib/deploylite/workspaces
       DEPLOYLITE_AGENT_OUTBOX_PATH: /var/lib/deploylite/state/terminal-acks.json
+      DEPLOYLITE_AGENT_CLEANUP_REPAIR_PATH: /var/lib/deploylite/state/cleanup-repairs.json
     volumes:
       - /var/run/docker.sock:/var/run/docker.sock
       - agent-workspaces:/var/lib/deploylite/workspaces

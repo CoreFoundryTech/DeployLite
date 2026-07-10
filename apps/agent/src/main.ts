@@ -3,6 +3,7 @@ import { parseDeployLiteEnv } from "@deploylite/config";
 import { redactEnvFileForLog } from "./redaction.js";
 import { AgentWorker, HttpAgentCommandTransport } from "./worker.js";
 import { DurableTerminalCommandBus, FileTerminalOutbox } from "./terminal-outbox.js";
+import { FileCleanupRepairStore } from "./cleanup-repairs.js";
 import { cpus, freemem, loadavg, totalmem } from "node:os";
 import { statfs } from "node:fs/promises";
 
@@ -41,7 +42,8 @@ export async function runAgentEntrypoint(env: NodeJS.ProcessEnv = process.env): 
     {
       workspaceRoot: env.DEPLOYLITE_AGENT_WORKSPACE_ROOT ?? "/var/lib/deploylite/workspaces",
       secretRoot: "/run/deploylite/secrets"
-    }
+    },
+    new FileCleanupRepairStore(env.DEPLOYLITE_AGENT_CLEANUP_REPAIR_PATH ?? "/var/lib/deploylite/state/cleanup-repairs.json")
   );
   const worker = new AgentWorker({
     agentId,

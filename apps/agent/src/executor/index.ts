@@ -10,6 +10,10 @@ const MAX_TIMEOUT_MS = 10 * 60 * 1000;
 const TERMINATION_GRACE_MS = 5_000;
 const AGENT_WORK_BASE = "/var/lib/deploylite";
 const AGENT_SECRET_BASE = "/run/deploylite/secrets";
+const BUILDKIT_CONFIG_PATH = "/etc/deploylite/buildkitd.toml";
+const CLEANUP_ATTEMPTS = 4;
+const CLEANUP_BACKOFF_MS = [250, 500, 1_000] as const;
+const MANAGED_LABEL = "com.deploylite.managed=true";
 export const DEPLOYLITE_RUNTIME_NETWORK = "deploylite-runtime";
 const SAFE_REF = /^[A-Za-z0-9][A-Za-z0-9._/-]{0,127}$/;
 const SAFE_ID = /^[a-z0-9][a-z0-9-]{0,62}$/;
@@ -36,6 +40,12 @@ export type WorkspaceFilesystem = {
   removeSecretDirectory(path: string): Promise<void>;
   writeSecretFile(path: string, contents: string): Promise<void>;
   removeSecretFile(path: string): Promise<void>;
+};
+export type CleanupRepairRecord = { version: 1; commandId: string; projectSlug: string };
+export type CleanupRepairStore = {
+  load(): Promise<CleanupRepairRecord[]>;
+  put(record: CleanupRepairRecord): Promise<void>;
+  remove(commandId: string): Promise<void>;
 };
 
 export type ExecutorConfig = { workspaceRoot: string; secretRoot: string };
@@ -165,7 +175,8 @@ export class AgentDeploymentExecutor {
     private readonly logger: ExecutorLogger = { log: () => undefined },
     private readonly wait: (milliseconds: number) => Promise<void> = (milliseconds) => new Promise((resolveWait) => setTimeout(resolveWait, milliseconds)),
     private readonly filesystem: WorkspaceFilesystem = nodeWorkspaceFilesystem,
-    private readonly config: ExecutorConfig = { workspaceRoot: `${AGENT_WORK_BASE}/workspaces`, secretRoot: AGENT_SECRET_BASE }
+    private readonly config: ExecutorConfig = { workspaceRoot: `${AGENT_WORK_BASE}/workspaces`, secretRoot: AGENT_SECRET_BASE },
+    private readonly cleanupRepairs: CleanupRepairStore = { load: async () => [], put: async () => undefined, remove: async () => undefined }
   ) {}
 
   async execute(input: DeploymentExecutionInput, signal?: AbortSignal): Promise<DeploymentExecutionResult> {
@@ -193,14 +204,14 @@ export class AgentDeploymentExecutor {
     const workspace = plans[0]?.args.at(-1);
     const secretDirectory = safeSecretDirectory(this.config.secretRoot, claimed.id);
     const envFilePath = resolve(secretDirectory, "runtime.env");
-    let buildAttempted = false;
+    let managedResourcesAttempted = false;
     let envFileWritten = false;
     let failure: unknown;
     try {
       await this.filesystem.create(workspace!);
       for (const plan of plans.slice(0, 3)) await this.run(plan, signal);
-      buildAttempted = true;
-      await this.run(plans[3]!, signal);
+      managedResourcesAttempted = true;
+      for (const plan of plans.slice(3, -1)) await this.run(plan, signal);
       await this.filesystem.createSecretDirectory(secretDirectory);
       envFileWritten = true;
       await this.filesystem.writeSecretFile(envFilePath, input.envFile.contents);
@@ -212,9 +223,20 @@ export class AgentDeploymentExecutor {
     const secretCleanupError = await this.cleanupSecret(envFileWritten, envFilePath, secretDirectory);
     failure ??= secretCleanupError;
     if (failure) {
-      if (buildAttempted) await this.cleanupRuntime(input);
+      if (managedResourcesAttempted) {
+        const cleaned = await this.reconcileRuntime(input, true);
+        if (!cleaned) failure = new Error(`${errorMessage(failure)}; managed resource cleanup incomplete; repair remains scheduled`);
+      }
       if (workspace) await this.bestEffort("Deployment workspace cleanup failed", () => this.filesystem.remove(workspace));
       return this.fail(claimed, errorMessage(failure), plans);
+    }
+    const buildResourcesClean = await this.reconcileRuntime(input, false);
+    if (!buildResourcesClean) {
+      const rollbackClean = await this.reconcileRuntime(input, true);
+      if (workspace) await this.bestEffort("Deployment workspace cleanup failed", () => this.filesystem.remove(workspace));
+      return this.fail(claimed, rollbackClean
+        ? "Managed build resource cleanup exceeded the initial bounded window; deployment was rolled back safely."
+        : "Managed build resource cleanup incomplete; repair remains scheduled.", plans);
     }
     if (workspace) await this.bestEffort("Deployment workspace cleanup failed", () => this.filesystem.remove(workspace));
     await this.commandBus.complete(claimed.id, { imageTag: imageTag(input.projectSlug, claimed.id), workspace: "[REDACTED]" });
@@ -224,12 +246,23 @@ export class AgentDeploymentExecutor {
   async reconcile(input: DeploymentExecutionInput): Promise<DeploymentExecutionResult> {
     let plans: CommandPlan[] = [];
     try { plans = createDeploymentPlan(input, this.config); } catch { /* cleanup still uses validated identifiers below */ }
-    await this.cleanupRuntime(input);
+    const cleaned = await this.reconcileRuntime(input, true);
     const workspace = plans[0]?.args.at(-1);
     if (workspace) await this.bestEffort("Deployment workspace cleanup failed", () => this.filesystem.remove(workspace));
     const secretDirectory = safeSecretDirectory(this.config.secretRoot, input.command.id);
     await this.bestEffort("Deployment secret cleanup failed", () => this.filesystem.removeSecretDirectory(secretDirectory));
-    return this.fail(input.command, "Agent restarted with an owned claimed command; execution was not retried.", plans);
+    return this.fail(input.command, cleaned
+      ? "Agent restarted with an owned claimed command; execution was not retried."
+      : "Agent restarted with an owned claimed command; managed resource cleanup incomplete; repair remains scheduled.", plans);
+  }
+
+  async reconcilePending(): Promise<boolean> {
+    let complete = true;
+    for (const record of await this.cleanupRepairs.load()) {
+      const input = repairInput(record);
+      if (!(await this.reconcileRuntime(input, true))) complete = false;
+    }
+    return complete;
   }
 
   private async run(plan: CommandPlan, signal?: AbortSignal): Promise<void> {
@@ -237,6 +270,7 @@ export class AgentDeploymentExecutor {
     const result = signal ? await this.runner.run(plan, MAX_TIMEOUT_MS, signal) : await this.runner.run(plan, MAX_TIMEOUT_MS);
     if (result.timedOut) throw new Error(`Timed out: ${plan.command}`);
     if (result.code !== 0) throw new Error(`Command failed: ${plan.command}: ${redactOutput(`${result.stderr}\n${result.stdout}`).trim().slice(0, 1024)}`);
+    if (plan.args[0] === "inspect" && plan.args.includes("{{json .HostConfig}}")) assertBoundedBuilderInspection(result.stdout);
   }
 
   private async waitForHealth(url: string, signal?: AbortSignal): Promise<void> {
@@ -259,13 +293,52 @@ export class AgentDeploymentExecutor {
     return cleanupError;
   }
 
-  private async cleanupRuntime(input: DeploymentExecutionInput): Promise<void> {
-    const cleanupPlans = createRuntimeCleanupPlans(input);
-    for (const plan of cleanupPlans) {
-      await this.bestEffort("Managed Docker resource cleanup failed", async () => {
-        await this.runner.run(plan, 60_000);
-      });
+  private async reconcileRuntime(input: DeploymentExecutionInput, includeRuntime: boolean): Promise<boolean> {
+    const record = cleanupRepairRecord(input);
+    try { await this.cleanupRepairs.put(record); }
+    catch {
+      await this.safeLog("error", `Managed resource cleanup repair state could not be persisted for command ${input.command.id}.`);
+      return false;
     }
+    let consecutiveAbsent = 0;
+    for (let attempt = 0; attempt < CLEANUP_ATTEMPTS; attempt += 1) {
+      const discovered = await this.discoverManagedResources(input, includeRuntime);
+      if (discovered === null) {
+        consecutiveAbsent = 0;
+      } else if (discovered.length === 0) {
+        consecutiveAbsent += 1;
+        if (attempt === CLEANUP_ATTEMPTS - 1 && consecutiveAbsent >= 2) {
+          await this.cleanupRepairs.remove(input.command.id);
+          return true;
+        }
+      } else {
+        consecutiveAbsent = 0;
+        for (const plan of discovered) await this.bestEffort("Managed Docker resource cleanup failed", () => this.runner.run(plan, 60_000));
+      }
+      if (attempt < CLEANUP_ATTEMPTS - 1) await this.wait(CLEANUP_BACKOFF_MS[Math.min(attempt, CLEANUP_BACKOFF_MS.length - 1)]!);
+    }
+    await this.safeLog("error", `Managed resource cleanup incomplete for command ${input.command.id}; repair remains scheduled.`);
+    return false;
+  }
+
+  private async discoverManagedResources(input: DeploymentExecutionInput, includeRuntime: boolean): Promise<CommandPlan[] | null> {
+    const queries = createRuntimeCleanupPlans(input, includeRuntime);
+    const removals: CommandPlan[] = [];
+    for (const query of queries) {
+      let result: ProcessResult;
+      try { result = await this.runner.run(query, 60_000); }
+      catch { return null; }
+      if (result.code !== 0) return null;
+      const values = result.stdout.split(/\s+/).filter(Boolean);
+      if (query.args[0] === "buildx") {
+        const builder = builderName(input.command.id);
+        if (values.includes(builder)) removals.push({ command: "docker", args: ["buildx", "rm", "--force", builder] });
+      } else {
+        if (values.some((value) => !/^[a-f0-9]{12,64}$/i.test(value))) return null;
+        for (const value of values) removals.push({ command: "docker", args: removalArgs(query, value) });
+      }
+    }
+    return removals;
   }
 
   private async bestEffort(message: string, operation: () => Promise<unknown>): Promise<void> {
@@ -290,12 +363,14 @@ export function createDeploymentPlan(input: DeploymentExecutionInput, config: Ex
   const tag = imageTag(input.projectSlug, input.command.id);
   const envFilePath = resolve(safeSecretDirectory(config.secretRoot, input.command.id), "runtime.env");
   const container = containerName(input.projectSlug, input.command.id);
+  const builder = builderName(input.command.id);
+  const buildNetwork = buildNetworkName(input.command.id);
   const runtime: CommandPlan = {
     command: "docker",
     args: [
       "run", "--detach", "--name", container,
       "--network", DEPLOYLITE_RUNTIME_NETWORK,
-      "--label", "com.deploylite.managed=true",
+       "--label", MANAGED_LABEL,
       "--label", `com.deploylite.command-id=${input.command.id}`,
       "--read-only", "--cap-drop", "ALL", "--security-opt", "no-new-privileges",
       "--pids-limit", "256", "--memory", "1g", "--cpus", "1",
@@ -311,12 +386,25 @@ export function createDeploymentPlan(input: DeploymentExecutionInput, config: Ex
     { command: "git", args: ["clone", "--no-checkout", "--depth", "1", input.repoUrl, workspace] },
     { command: "git", args: ["-C", workspace, "fetch", "--depth", "1", "origin", input.ref] },
     { command: "git", args: ["-C", workspace, "checkout", "--detach", "FETCH_HEAD"] },
+    { command: "docker", args: ["network", "create", "--driver", "bridge", "--label", MANAGED_LABEL, "--label", `com.deploylite.command-id=${input.command.id}`, buildNetwork] },
     {
       command: "docker",
       args: [
-        "build", "--tag", tag,
-        "--label", "com.deploylite.managed=true",
+        "buildx", "create", "--name", builder, "--driver", "docker-container",
+        "--driver-opt", `network=${buildNetwork},memory=1g,memory-swap=1g,cpu-period=100000,cpu-quota=100000,restart-policy=no`,
+        "--buildkitd-config", BUILDKIT_CONFIG_PATH
+      ]
+    },
+    { command: "docker", args: ["buildx", "inspect", "--builder", builder, "--bootstrap"] },
+    { command: "docker", args: ["update", "--pids-limit", "256", builderContainerName(builder)] },
+    { command: "docker", args: ["inspect", "--format", "{{json .HostConfig}}", builderContainerName(builder)] },
+    {
+      command: "docker",
+      args: [
+        "buildx", "build", "--builder", builder, "--network", "none", "--progress", "plain",
+        "--label", MANAGED_LABEL,
         "--label", `com.deploylite.command-id=${input.command.id}`,
+        "--output", `type=docker,name=${tag}`,
         workspace
       ]
     },
@@ -324,11 +412,19 @@ export function createDeploymentPlan(input: DeploymentExecutionInput, config: Ex
   ];
 }
 
-export function createRuntimeCleanupPlans(input: DeploymentExecutionInput): CommandPlan[] {
-  return [
-    { command: "docker", args: ["rm", "--force", containerName(input.projectSlug, input.command.id)] },
-    { command: "docker", args: ["image", "rm", "--force", imageTag(input.projectSlug, input.command.id)] }
+export function createRuntimeCleanupPlans(input: DeploymentExecutionInput, includeRuntime = true): CommandPlan[] {
+  const labels = ["--filter", `label=${MANAGED_LABEL}`, "--filter", `label=com.deploylite.command-id=${input.command.id}`];
+  const plans: CommandPlan[] = [
+    { command: "docker", args: ["buildx", "ls", "--format", "{{.Name}}"] },
+    { command: "docker", args: ["network", "ls", "--quiet", "--filter", `name=^${buildNetworkName(input.command.id)}$`, ...labels] }
   ];
+  if (includeRuntime) {
+    plans.unshift(
+      { command: "docker", args: ["ps", "--all", "--quiet", "--filter", `name=^/${containerName(input.projectSlug, input.command.id)}$`, ...labels] },
+      { command: "docker", args: ["image", "ls", "--quiet", "--no-trunc", "--filter", `reference=${imageTag(input.projectSlug, input.command.id)}`, ...labels] }
+    );
+  }
+  return plans;
 }
 
 export function assertSafeRuntimePlan(plan: CommandPlan, trustedNetwork = DEPLOYLITE_RUNTIME_NETWORK): true {
@@ -359,6 +455,67 @@ export function containerName(projectSlug: string, commandId: string): string {
   const name = `deploylite-${commandId}`;
   if (name.length > 63) throw new Error("Runtime container name exceeds the trusted DNS label limit");
   return name;
+}
+
+export function builderName(commandId: string): string {
+  if (!SAFE_ID.test(commandId)) throw new Error("Invalid command id for builder");
+  const name = `deploylite-${commandId}`;
+  if (name.length > 63) throw new Error("Buildx builder name exceeds the trusted limit");
+  return name;
+}
+
+export function buildNetworkName(commandId: string): string {
+  if (!SAFE_ID.test(commandId)) throw new Error("Invalid command id for build network");
+  const name = `deploylite-build-${commandId}`;
+  if (name.length > 63) throw new Error("Build network name exceeds the trusted limit");
+  return name;
+}
+
+function builderContainerName(builder: string): string {
+  return `buildx_buildkit_${builder}0`;
+}
+
+function assertBoundedBuilderInspection(stdout: string): void {
+  let hostConfig: Record<string, unknown>;
+  try { hostConfig = JSON.parse(stdout) as Record<string, unknown>; }
+  catch { throw new Error("Bounded BuildKit builder inspection was invalid"); }
+  if (
+    hostConfig.Memory !== 1024 ** 3 || hostConfig.MemorySwap !== 1024 ** 3 ||
+    hostConfig.CpuPeriod !== 100_000 || hostConfig.CpuQuota !== 100_000 || hostConfig.PidsLimit !== 256 ||
+    typeof hostConfig.NetworkMode !== "string" || !hostConfig.NetworkMode.startsWith("deploylite-build-")
+  ) throw new Error("Bounded BuildKit builder is unavailable");
+}
+
+function cleanupRepairRecord(input: DeploymentExecutionInput): CleanupRepairRecord {
+  imageTag(input.projectSlug, input.command.id);
+  return { version: 1, commandId: input.command.id, projectSlug: input.projectSlug };
+}
+
+function repairInput(record: CleanupRepairRecord): DeploymentExecutionInput {
+  const command: DeploymentCommand = {
+    id: record.commandId,
+    deploymentId: record.commandId,
+    agentId: record.commandId,
+    kind: "start",
+    state: "failed",
+    payload: {},
+    requestedBy: null,
+    requestId: record.commandId,
+    correlationId: record.commandId,
+    issuedAt: new Date(0).toISOString(),
+    claimedAt: null,
+    leaseExpiresAt: null,
+    completedAt: null,
+    failureReason: null
+  };
+  return { command, repoUrl: "https://invalid.example/repository.git", ref: "repair", projectSlug: record.projectSlug, envFile: { contents: "" }, healthUrl: `http://${containerName(record.projectSlug, record.commandId)}:1/` };
+}
+
+function removalArgs(query: CommandPlan, id: string): string[] {
+  if (query.args[0] === "ps") return ["rm", "--force", id];
+  if (query.args[0] === "image") return ["image", "rm", "--force", id];
+  if (query.args[0] === "network") return ["network", "rm", id];
+  throw new Error("Unsupported managed cleanup query");
 }
 
 function validateInput(input: DeploymentExecutionInput): void {
