@@ -1,17 +1,29 @@
 import { and, eq } from "drizzle-orm";
 import type { EnvSecretValue } from "@deploylite/contracts";
-import type { EnvSecretValueInput, EnvSecretValueRecord, EnvSecretValueRepository } from "@deploylite/domain";
+import type { EncryptedEnvSecretMaterial, EnvSecretMaterializationRepository, EnvSecretValueInput, EnvSecretValueRecord, EnvSecretValueRepository } from "@deploylite/domain";
 
 import type { DeployLiteDb } from "../client.js";
 import { assertEnvSecretValuesInputHasNoRawValueColumns } from "../env-metadata.js";
 import { envSecretValues, type EnvSecretValueRow } from "../schema.js";
 
-export class DbEnvSecretValueRepository implements EnvSecretValueRepository {
+export class DbEnvSecretValueRepository implements EnvSecretValueRepository, EnvSecretMaterializationRepository {
   constructor(private readonly db: DeployLiteDb) {}
 
   async listByProject(projectId: string): Promise<EnvSecretValueRecord[]> {
     const rows = await this.db.select().from(envSecretValues).where(eq(envSecretValues.projectId, projectId));
     return rows.map(toEnvSecretValue);
+  }
+
+  async listEncryptedByProject(projectId: string): Promise<EncryptedEnvSecretMaterial[]> {
+    const rows = await this.db.select().from(envSecretValues).where(eq(envSecretValues.projectId, projectId));
+    return rows.map((row) => ({
+      projectId: row.projectId,
+      key: row.key,
+      scope: row.scope === "deployment" ? "deployment" : "project",
+      encryptedValue: Buffer.from(row.encryptedValue),
+      valueFingerprint: row.valueFingerprint,
+      keyVersion: row.keyVersion
+    }));
   }
 
   async upsert(record: EnvSecretValueInput): Promise<EnvSecretValueRecord> {

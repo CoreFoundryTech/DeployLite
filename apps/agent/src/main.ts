@@ -1,12 +1,14 @@
 import { AgentDeploymentExecutor, nodeWorkspaceFilesystem, spawnProcessRunner, type ExecutorLogger, type HealthProbe } from "./executor/index.js";
+import { parseDeployLiteEnv } from "@deploylite/config";
 import { redactEnvFileForLog } from "./redaction.js";
 import { AgentWorker, HttpAgentCommandTransport } from "./worker.js";
 
 export async function runAgentEntrypoint(env: NodeJS.ProcessEnv = process.env): Promise<void> {
-  const agentId = required(env, "DEPLOYLITE_AGENT_ID");
+  const config = parseDeployLiteEnv(env);
+  const agentId = required(config, "DEPLOYLITE_AGENT_ID");
   const transport = new HttpAgentCommandTransport({
-    apiUrl: required(env, "DEPLOYLITE_API_URL"),
-    token: required(env, "DEPLOYLITE_AGENT_TOKEN")
+    apiUrl: config.DEPLOYLITE_API_URL,
+    token: required(config, "DEPLOYLITE_AGENT_TOKEN")
   });
   const logger: ExecutorLogger = { log: (level, message) => console[level](redactEnvFileForLog(message)) };
   const health: HealthProbe = {
@@ -42,8 +44,9 @@ export async function runAgentEntrypoint(env: NodeJS.ProcessEnv = process.env): 
   }
 }
 
-function required(env: NodeJS.ProcessEnv, key: string): string {
-  const value = env[key]?.trim();
+function required(env: Record<string, unknown>, key: string): string {
+  const raw = env[key];
+  const value = typeof raw === "string" ? raw.trim() : "";
   if (!value) throw new Error(`${key} is required`);
   return value;
 }

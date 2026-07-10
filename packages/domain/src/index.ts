@@ -244,6 +244,13 @@ export type EnvSecretValueInput = {
   keyVersion: number;
 };
 
+export type EncryptedEnvSecretMaterial = EnvSecretValueInput;
+
+/** Internal-only encrypted materialization port. Public env repositories never expose ciphertext. */
+export type EnvSecretMaterializationRepository = {
+  listEncryptedByProject(projectId: string): Promise<EncryptedEnvSecretMaterial[]>;
+};
+
 export type EnvSecretValueRepository = {
   listByProject(projectId: string): Promise<EnvSecretValueRecord[]>;
   upsert(record: EnvSecretValueInput): Promise<EnvSecretValueRecord>;
@@ -452,6 +459,7 @@ export class InMemoryEnvVariableMetadataRepository implements EnvVariableMetadat
 
 export class InMemoryEnvSecretValueRepository implements EnvSecretValueRepository {
   readonly #records = new Map<string, EnvSecretValueRecord>();
+  readonly #encryptedRecords = new Map<string, EncryptedEnvSecretMaterial>();
   #seq = 0;
 
   #key(projectId: string, key: string, scope: EnvSecretValueRecord["scope"]): string {
@@ -488,10 +496,22 @@ export class InMemoryEnvSecretValueRepository implements EnvSecretValueRepositor
       updatedAt: now
     };
     this.#records.set(this.#key(record.projectId, record.key, record.scope), next);
+    this.#encryptedRecords.set(this.#key(record.projectId, record.key, record.scope), {
+      ...record,
+      encryptedValue: Buffer.from(record.encryptedValue)
+    });
     return { ...next };
   }
 
+  async listEncryptedByProject(projectId: string): Promise<EncryptedEnvSecretMaterial[]> {
+    return [...this.#encryptedRecords.values()]
+      .filter((record) => record.projectId === projectId)
+      .map((record) => ({ ...record, encryptedValue: Buffer.from(record.encryptedValue) }));
+  }
+
   async remove(projectId: string, key: string, scope: EnvSecretValueRecord["scope"]): Promise<boolean> {
-    return this.#records.delete(this.#key(projectId, key, scope));
+    const recordKey = this.#key(projectId, key, scope);
+    this.#encryptedRecords.delete(recordKey);
+    return this.#records.delete(recordKey);
   }
 }

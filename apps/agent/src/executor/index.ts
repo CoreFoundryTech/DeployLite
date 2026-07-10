@@ -275,6 +275,8 @@ export function createDeploymentPlan(input: DeploymentExecutionInput, config: Ex
       "--read-only", "--cap-drop", "ALL", "--security-opt", "no-new-privileges",
       "--pids-limit", "256", "--memory", "1g", "--cpus", "1",
       "--tmpfs", "/tmp:rw,noexec,nosuid,size=64m",
+      // Docker CLI reads --env-file locally before creating the container;
+      // this path belongs in the agent tmpfs, not on the daemon host.
       "--env-file", envFilePath,
       tag
     ]

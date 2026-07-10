@@ -1,4 +1,4 @@
-import { createAuditLogRecord, createCorrelationContext, createRequestId, parseDeployLiteEnv, type DeployLiteEnv, createEnvSecretCipher, EnvSecretKeyInvalidError, EnvSecretKeyMissingError, ENCRYPTION_KEY_VERSION, loadEnvSecretKey, type EnvSecretCipher } from "@deploylite/config";
+import { createAuditLogRecord, createCorrelationContext, createRequestId, parseDeployLiteEnv, type DeployLiteEnv, createEnvSecretCipher, EnvSecretCipherError, EnvSecretKeyInvalidError, EnvSecretKeyMissingError, ENCRYPTION_KEY_VERSION, loadEnvSecretKey, redactLogMessage, redactSecrets, type EnvSecretCipher } from "@deploylite/config";
 import {
   agentRegistrationSchema,
   authLoginRequestSchema,
@@ -16,6 +16,7 @@ import {
   resourceSnapshotSchema,
   type Agent,
   type Deployment,
+  type DeploymentCommand,
   type EnvSecretValue,
   type EnvVariableMetadata,
   type Project
@@ -45,6 +46,7 @@ import {
   type DeploymentCommandBus,
   type DeploymentCommandRepository,
   type EnvSecretValueRepository,
+  type EnvSecretMaterializationRepository,
   type EnvVariableMetadataRepository,
   type PasswordHasher,
   type AgentRepository,
@@ -55,7 +57,9 @@ import {
   type SessionRepository
 } from "@deploylite/domain";
 import Fastify, { type FastifyInstance, type FastifyReply, type FastifyRequest } from "fastify";
+import { createHash, timingSafeEqual } from "node:crypto";
 import { z } from "zod";
+import { buildDeployEnvFile } from "@deploylite/agent";
 import { DeploymentCommandBusService, MockDeploymentExecutor } from "./commands/index.js";
 
 declare module "fastify" {
@@ -436,6 +440,7 @@ type PlatformRepositoryOptions = {
   deploymentCommands?: DeploymentCommandRepository;
   envMetadata?: EnvVariableMetadataRepository;
   envSecretValues?: EnvSecretValueRepository;
+  envSecretMaterialization?: EnvSecretMaterializationRepository;
   envSecretCipher?: EnvSecretCipher;
 };
 
@@ -443,10 +448,12 @@ type PlatformRepositories = PlatformRepositoryOptions & {
   agentStatus: AgentStatusService;
   envMetadata: EnvVariableMetadataRepository;
   envSecretValues: EnvSecretValueRepository;
+  envSecretMaterialization: EnvSecretMaterializationRepository;
   envSecretCipher: EnvSecretCipher;
   deploymentCommandBus: DeploymentCommandBus;
   deploymentExecutor: DeploymentExecutor;
   cancelDeploymentExecutorTimers: () => void;
+  externalAgentIdentity: { agentId: string; token: string } | null;
 };
 
 type EnvSecretKeySource = NodeJS.ProcessEnv | Record<string, string | number | boolean | undefined>;
@@ -472,7 +479,11 @@ function createApiState(env: EnvSecretKeySource, overrides: Partial<PlatformRepo
   const deploymentCommands = overrides.deploymentCommands ?? new InMemoryDeploymentCommandRepository();
   const envMetadata = overrides.envMetadata ?? new InMemoryEnvVariableMetadataRepository();
   const envSecretValues = overrides.envSecretValues ?? new InMemoryEnvSecretValueRepository();
+  const envSecretMaterialization = overrides.envSecretMaterialization ?? asEnvSecretMaterializationRepository(envSecretValues);
   const envSecretCipher = overrides.envSecretCipher ?? createLazyEnvSecretCipher(env);
+  const agentId = typeof env["DEPLOYLITE_AGENT_ID"] === "string" ? env["DEPLOYLITE_AGENT_ID"] : undefined;
+  const agentToken = typeof env["DEPLOYLITE_AGENT_TOKEN"] === "string" ? env["DEPLOYLITE_AGENT_TOKEN"] : undefined;
+  if (agentId || agentToken) loadEnvSecretKey(extractSecretKey(env));
   const agentStatus = new AgentStatusService(agents);
 
   // The deployment command bus is the in-process control-plane channel
@@ -500,11 +511,25 @@ function createApiState(env: EnvSecretKeySource, overrides: Partial<PlatformRepo
     deploymentCommands,
     envMetadata,
     envSecretValues,
+    envSecretMaterialization,
     envSecretCipher,
     agentStatus,
     deploymentCommandBus,
     deploymentExecutor,
-    cancelDeploymentExecutorTimers: () => deploymentExecutor.cancelTimers()
+    cancelDeploymentExecutorTimers: () => deploymentExecutor.cancelTimers(),
+    externalAgentIdentity: agentId && agentToken ? { agentId, token: agentToken } : null
+  };
+}
+
+function asEnvSecretMaterializationRepository(repository: EnvSecretValueRepository): EnvSecretMaterializationRepository {
+  const candidate = repository as EnvSecretValueRepository & Partial<EnvSecretMaterializationRepository>;
+  if (typeof candidate.listEncryptedByProject === "function") {
+    return { listEncryptedByProject: (projectId) => candidate.listEncryptedByProject!(projectId) };
+  }
+  return {
+    async listEncryptedByProject() {
+      throw new EnvSecretKeyMissingError("encrypted env material repository is unavailable");
+    }
   };
 }
 
@@ -551,6 +576,7 @@ function createDbAuthAdapters(env: DeployLiteEnv, options: BuildApiAppOptions): 
       deploymentCommands: options.state?.deploymentCommands ?? new DbDeploymentCommandRepository(db),
       envMetadata: options.state?.envMetadata ?? new DbEnvVariableMetadataRepository(db),
       envSecretValues: options.state?.envSecretValues ?? new DbEnvSecretValueRepository(db),
+      envSecretMaterialization: options.state?.envSecretMaterialization,
       envSecretCipher: options.state?.envSecretCipher
     })
   };
@@ -651,6 +677,71 @@ async function findEnvSecretValue(
   return records.find((record) => record.key === key && record.scope === scope) ?? null;
 }
 
+const agentIdSchema = z.string().uuid();
+const commandIdSchema = z.string().uuid();
+const agentClaimBodySchema = z.object({ agentId: agentIdSchema }).strict();
+const agentCompleteBodySchema = z.object({ output: z.record(z.unknown()).optional() }).strict();
+const agentFailBodySchema = z.object({ reason: z.string().min(1).max(1024) }).strict();
+
+function authenticateAgentRequest(
+  request: FastifyRequest,
+  reply: FastifyReply,
+  identity: PlatformRepositories["externalAgentIdentity"]
+): identity is NonNullable<PlatformRepositories["externalAgentIdentity"]> {
+  const authorization = getHeaderValue(request, "authorization");
+  if (!authorization?.startsWith("Bearer ")) {
+    void reply.code(401).send(errorEnvelope(request, "AGENT_AUTH_REQUIRED", "Agent authentication required."));
+    return false;
+  }
+  if (!identity || !constantTimeEqual(authorization.slice(7), identity.token)) {
+    void reply.code(403).send(errorEnvelope(request, "AGENT_AUTH_INVALID", "Agent authentication failed."));
+    return false;
+  }
+  return true;
+}
+
+function constantTimeEqual(left: string, right: string): boolean {
+  const leftDigest = createHash("sha256").update(left).digest();
+  const rightDigest = createHash("sha256").update(right).digest();
+  return timingSafeEqual(leftDigest, rightDigest);
+}
+
+async function materializeAgentExecutionInput(
+  state: PlatformRepositories,
+  command: DeploymentCommand
+): Promise<{
+  command: DeploymentCommand;
+  repoUrl: string;
+  ref: string;
+  projectSlug: string;
+  envFile: { contents: string };
+  healthUrl: string;
+} | null> {
+  if (command.kind !== "start" || command.state !== "pending") return null;
+  const deployment = await state.deployments.findById(command.deploymentId);
+  if (!deployment || deployment.agentId !== command.agentId) return null;
+  const project = await state.projects.findById(deployment.projectId);
+  if (!project || !project.port) return null;
+  const metadata = await state.envMetadata.listByProject(project.id);
+  const encrypted = await state.envSecretMaterialization.listEncryptedByProject(project.id);
+  const materializedKeys = new Set(encrypted.map((record) => `${record.scope}:${record.key}`));
+  if (metadata.some((record) => record.required && !materializedKeys.has(`${record.scope}:${record.key}`))) return null;
+  const envFile = buildDeployEnvFile(encrypted, state.envSecretCipher);
+  return {
+    command,
+    repoUrl: project.repoUrl,
+    ref: deployment.commitSha,
+    projectSlug: project.id,
+    envFile: { contents: envFile.contents },
+    healthUrl: `http://127.0.0.1:${project.port}/`
+  };
+}
+
+async function assignedCommand(state: PlatformRepositories, commandId: string, agentId: string): Promise<DeploymentCommand | null> {
+  const command = await state.deploymentCommandBus.findById(commandId);
+  return command?.agentId === agentId ? command : null;
+}
+
 function isAllowedCorsRequest(request: FastifyRequest, corsOrigin: string | null): boolean {
   return Boolean(corsOrigin && getHeaderValue(request, "origin") === corsOrigin);
 }
@@ -702,6 +793,65 @@ function registerRoutes(app: FastifyInstance, state: PlatformRepositories, adapt
   const requireAuditReadRole = createRolePreHandler(adapters, ["admin", "operator"]);
 
   app.get(`${API_PREFIX}/health`, async (request) => ok(request, { status: "ok", service: "deploylite-api", auth: "cookie-session" }));
+  app.get(`${API_PREFIX}/agent/commands/next`, async (request, reply) => {
+    if (!authenticateAgentRequest(request, reply, state.externalAgentIdentity)) return reply;
+    const parsed = z.object({ agentId: agentIdSchema }).safeParse(request.query);
+    if (!parsed.success) return reply.code(400).send(errorEnvelope(request, "VALIDATION_ERROR", "Invalid agent command request."));
+    if (parsed.data.agentId !== state.externalAgentIdentity.agentId) {
+      return reply.code(403).send(errorEnvelope(request, "AGENT_IDENTITY_MISMATCH", "Agent identity mismatch."));
+    }
+    if (!(await state.agents.findById(parsed.data.agentId))) return reply.code(204).send();
+    const commands = (await state.deploymentCommandBus.list())
+      .filter((command) => command.agentId === parsed.data.agentId && command.state === "pending")
+      .sort((left, right) => left.issuedAt.localeCompare(right.issuedAt));
+    try {
+      for (const command of commands) {
+        const input = await materializeAgentExecutionInput(state, command);
+        if (input) return reply.send(input);
+      }
+      return reply.code(204).send();
+    } catch (error) {
+      if (error instanceof EnvSecretKeyMissingError || error instanceof EnvSecretKeyInvalidError || error instanceof EnvSecretCipherError) {
+        return reply.code(503).send(errorEnvelope(request, "SECRET_MATERIAL_UNAVAILABLE", "Deployment secret material is unavailable."));
+      }
+      throw error;
+    }
+  });
+  app.post(`${API_PREFIX}/agent/commands/:commandId/claim`, async (request, reply) => {
+    if (!authenticateAgentRequest(request, reply, state.externalAgentIdentity)) return reply;
+    const params = z.object({ commandId: commandIdSchema }).safeParse(request.params);
+    const body = agentClaimBodySchema.safeParse(request.body);
+    if (!params.success || !body.success) return reply.code(400).send(errorEnvelope(request, "VALIDATION_ERROR", "Invalid agent command request."));
+    if (body.data.agentId !== state.externalAgentIdentity.agentId) return reply.code(403).send(errorEnvelope(request, "AGENT_IDENTITY_MISMATCH", "Agent identity mismatch."));
+    const existing = await assignedCommand(state, params.data.commandId, state.externalAgentIdentity.agentId);
+    if (!existing) return reply.code(404).send(errorEnvelope(request, "NOT_FOUND", "Command not found."));
+    const claimed = await state.deploymentCommandBus.claim(existing.id, state.externalAgentIdentity.agentId);
+    return claimed ? reply.send(claimed) : reply.code(409).send(errorEnvelope(request, "COMMAND_STATE_CONFLICT", "Command cannot be claimed in its current state."));
+  });
+  app.post(`${API_PREFIX}/agent/commands/:commandId/complete`, async (request, reply) => {
+    if (!authenticateAgentRequest(request, reply, state.externalAgentIdentity)) return reply;
+    const params = z.object({ commandId: commandIdSchema }).safeParse(request.params);
+    const body = agentCompleteBodySchema.safeParse(request.body ?? {});
+    if (!params.success || !body.success) return reply.code(400).send(errorEnvelope(request, "VALIDATION_ERROR", "Invalid agent command request."));
+    const existing = await assignedCommand(state, params.data.commandId, state.externalAgentIdentity.agentId);
+    if (!existing) return reply.code(404).send(errorEnvelope(request, "NOT_FOUND", "Command not found."));
+    if (existing.state === "completed") return reply.send(existing);
+    if (existing.state !== "claimed") return reply.code(409).send(errorEnvelope(request, "COMMAND_STATE_CONFLICT", "Command cannot be completed in its current state."));
+    const completed = await state.deploymentCommandBus.complete(existing.id, body.data.output ? redactSecrets(body.data.output) : undefined);
+    return reply.send(completed);
+  });
+  app.post(`${API_PREFIX}/agent/commands/:commandId/fail`, async (request, reply) => {
+    if (!authenticateAgentRequest(request, reply, state.externalAgentIdentity)) return reply;
+    const params = z.object({ commandId: commandIdSchema }).safeParse(request.params);
+    const body = agentFailBodySchema.safeParse(request.body);
+    if (!params.success || !body.success) return reply.code(400).send(errorEnvelope(request, "VALIDATION_ERROR", "Invalid agent command request."));
+    const existing = await assignedCommand(state, params.data.commandId, state.externalAgentIdentity.agentId);
+    if (!existing) return reply.code(404).send(errorEnvelope(request, "NOT_FOUND", "Command not found."));
+    if (existing.state === "failed") return reply.send(existing);
+    if (existing.state !== "claimed") return reply.code(409).send(errorEnvelope(request, "COMMAND_STATE_CONFLICT", "Command cannot fail in its current state."));
+    const failed = await state.deploymentCommandBus.fail(existing.id, redactLogMessage(body.data.reason));
+    return reply.send(failed);
+  });
   app.get(`${API_PREFIX}/bootstrap/status`, async (request) => ok(request, await getBootstrapStatus(adapters.users)));
   app.post(`${API_PREFIX}/bootstrap/initial-admin`, async (request, reply) => {
     const parsed = bootstrapInitialAdminRequestSchema.safeParse(request.body);
@@ -1052,11 +1202,9 @@ function registerRoutes(app: FastifyInstance, state: PlatformRepositories, adapt
         requestId: request.correlationContext.requestId,
         correlationId: request.correlationContext.correlationId
       });
-      // Dispatch inline so the response reflects the deployment status
-      // (e.g. `failed` for missing required env metadata) that the UI
-      // will see. Later slices can replace this with an out-of-process
-      // agent poll/claim loop without changing the route contract.
-      dispatched = await state.deploymentCommandBus.dispatch(command);
+      // Production leaves the command pending for the authenticated external
+      // agent. Local scaffold mode keeps the synchronous mock executor.
+      dispatched = state.externalAgentIdentity ? command : await state.deploymentCommandBus.dispatch(command);
       if (!dispatched) {
         throw new Error("Deployment command was not dispatched");
       }
