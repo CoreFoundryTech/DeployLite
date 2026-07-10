@@ -59,7 +59,7 @@ import {
 import Fastify, { type FastifyInstance, type FastifyReply, type FastifyRequest } from "fastify";
 import { createHash, timingSafeEqual } from "node:crypto";
 import { z } from "zod";
-import { buildDeployEnvFile } from "@deploylite/agent";
+import { buildDeployEnvFile, containerName } from "@deploylite/agent";
 import { DeploymentCommandBusService, MockDeploymentExecutor } from "./commands/index.js";
 
 declare module "fastify" {
@@ -721,7 +721,7 @@ async function materializeAgentExecutionInput(
   const deployment = await state.deployments.findById(command.deploymentId);
   if (!deployment || deployment.agentId !== command.agentId) return null;
   const project = await state.projects.findById(deployment.projectId);
-  if (!project || !project.port) return null;
+  if (!project || !Number.isInteger(project.port) || project.port === null || project.port < 1 || project.port > 65_535) return null;
   const metadata = await state.envMetadata.listByProject(project.id);
   const encrypted = await state.envSecretMaterialization.listEncryptedByProject(project.id);
   const materializedKeys = new Set(encrypted.map((record) => `${record.scope}:${record.key}`));
@@ -733,8 +733,65 @@ async function materializeAgentExecutionInput(
     ref: deployment.commitSha,
     projectSlug: project.id,
     envFile: { contents: envFile.contents },
-    healthUrl: `http://127.0.0.1:${project.port}/`
+    healthUrl: `http://${containerName(project.id, command.id)}:${project.port}/`
   };
+}
+
+type AgentDeploymentLifecycle = {
+  status: "running" | "succeeded" | "failed";
+  level: "info" | "error";
+  marker: string;
+  message: string;
+};
+
+async function ensureAgentDeploymentLifecycle(
+  state: PlatformRepositories,
+  command: DeploymentCommand,
+  lifecycle: AgentDeploymentLifecycle
+): Promise<void> {
+  const deployment = await state.deployments.findById(command.deploymentId);
+  if (!deployment || deployment.agentId !== command.agentId) throw new Error("Linked deployment is unavailable for agent lifecycle update");
+  const terminal = lifecycle.status === "succeeded" || lifecycle.status === "failed";
+  if (deployment.status !== lifecycle.status || (terminal && !deployment.finishedAt)) {
+    await state.deployments.save({
+      ...deployment,
+      status: lifecycle.status,
+      finishedAt: terminal ? deployment.finishedAt ?? new Date().toISOString() : null
+    });
+  }
+
+  const logs = await state.deployments.listLogs(deployment.id);
+  const correlated = (message: string, requestId: string, correlationId: string) =>
+    requestId === command.requestId && correlationId === command.correlationId && message.startsWith(lifecycle.marker);
+  if (logs.some((log) => correlated(log.message, log.requestId, log.correlationId))) return;
+  const event = {
+    id: createRequestId(),
+    deploymentId: deployment.id,
+    sequence: Math.max(0, ...logs.map((log) => log.sequence)) + 1,
+    level: lifecycle.level,
+    message: lifecycle.message,
+    timestamp: new Date().toISOString(),
+    redactionApplied: true,
+    requestId: command.requestId,
+    correlationId: command.correlationId
+  } as const;
+  try {
+    await state.deployments.appendLog(event);
+  } catch (error) {
+    const current = await state.deployments.listLogs(deployment.id);
+    if (!current.some((log) => correlated(log.message, log.requestId, log.correlationId))) throw error;
+  }
+}
+
+async function compensateAgentLifecycleFailure(state: PlatformRepositories, command: DeploymentCommand): Promise<void> {
+  const reason = "Deployment lifecycle persistence failed after the agent command transition";
+  try {
+    await ensureAgentDeploymentLifecycle(state, command, { status: "failed", level: "error", marker: "Agent lifecycle persistence failed", message: `Agent lifecycle persistence failed: ${reason}.` });
+  } catch { /* repository failure is reported by the original request error */ }
+  try {
+    const current = await state.deploymentCommandBus.findById(command.id);
+    if (current?.state === "claimed") await state.deploymentCommandBus.fail(command.id, reason);
+  } catch { /* best-effort compensation only */ }
 }
 
 async function assignedCommand(state: PlatformRepositories, commandId: string, agentId: string): Promise<DeploymentCommand | null> {
@@ -825,8 +882,15 @@ function registerRoutes(app: FastifyInstance, state: PlatformRepositories, adapt
     if (body.data.agentId !== state.externalAgentIdentity.agentId) return reply.code(403).send(errorEnvelope(request, "AGENT_IDENTITY_MISMATCH", "Agent identity mismatch."));
     const existing = await assignedCommand(state, params.data.commandId, state.externalAgentIdentity.agentId);
     if (!existing) return reply.code(404).send(errorEnvelope(request, "NOT_FOUND", "Command not found."));
-    const claimed = await state.deploymentCommandBus.claim(existing.id, state.externalAgentIdentity.agentId);
-    return claimed ? reply.send(claimed) : reply.code(409).send(errorEnvelope(request, "COMMAND_STATE_CONFLICT", "Command cannot be claimed in its current state."));
+    const claimed = existing.state === "claimed" ? existing : await state.deploymentCommandBus.claim(existing.id, state.externalAgentIdentity.agentId);
+    if (!claimed) return reply.code(409).send(errorEnvelope(request, "COMMAND_STATE_CONFLICT", "Command cannot be claimed in its current state."));
+    try {
+      await ensureAgentDeploymentLifecycle(state, claimed, { status: "running", level: "info", marker: "Agent claimed deployment command", message: "Agent claimed deployment command; deployment is running." });
+    } catch (error) {
+      await compensateAgentLifecycleFailure(state, claimed);
+      throw error;
+    }
+    return reply.send(claimed);
   });
   app.post(`${API_PREFIX}/agent/commands/:commandId/complete`, async (request, reply) => {
     if (!authenticateAgentRequest(request, reply, state.externalAgentIdentity)) return reply;
@@ -835,8 +899,17 @@ function registerRoutes(app: FastifyInstance, state: PlatformRepositories, adapt
     if (!params.success || !body.success) return reply.code(400).send(errorEnvelope(request, "VALIDATION_ERROR", "Invalid agent command request."));
     const existing = await assignedCommand(state, params.data.commandId, state.externalAgentIdentity.agentId);
     if (!existing) return reply.code(404).send(errorEnvelope(request, "NOT_FOUND", "Command not found."));
-    if (existing.state === "completed") return reply.send(existing);
+    if (existing.state === "completed") {
+      await ensureAgentDeploymentLifecycle(state, existing, { status: "succeeded", level: "info", marker: "Agent completed deployment command", message: "Agent completed deployment command; deployment succeeded." });
+      return reply.send(existing);
+    }
     if (existing.state !== "claimed") return reply.code(409).send(errorEnvelope(request, "COMMAND_STATE_CONFLICT", "Command cannot be completed in its current state."));
+    try {
+      await ensureAgentDeploymentLifecycle(state, existing, { status: "succeeded", level: "info", marker: "Agent completed deployment command", message: "Agent completed deployment command; deployment succeeded." });
+    } catch (error) {
+      await compensateAgentLifecycleFailure(state, existing);
+      throw error;
+    }
     const completed = await state.deploymentCommandBus.complete(existing.id, body.data.output ? redactSecrets(body.data.output) : undefined);
     return reply.send(completed);
   });
@@ -847,9 +920,19 @@ function registerRoutes(app: FastifyInstance, state: PlatformRepositories, adapt
     if (!params.success || !body.success) return reply.code(400).send(errorEnvelope(request, "VALIDATION_ERROR", "Invalid agent command request."));
     const existing = await assignedCommand(state, params.data.commandId, state.externalAgentIdentity.agentId);
     if (!existing) return reply.code(404).send(errorEnvelope(request, "NOT_FOUND", "Command not found."));
-    if (existing.state === "failed") return reply.send(existing);
+    const safeReason = redactLogMessage(body.data.reason);
+    if (existing.state === "failed") {
+      await ensureAgentDeploymentLifecycle(state, existing, { status: "failed", level: "error", marker: "Agent reported deployment failure", message: `Agent reported deployment failure: ${safeReason}` });
+      return reply.send(existing);
+    }
     if (existing.state !== "claimed") return reply.code(409).send(errorEnvelope(request, "COMMAND_STATE_CONFLICT", "Command cannot fail in its current state."));
-    const failed = await state.deploymentCommandBus.fail(existing.id, redactLogMessage(body.data.reason));
+    try {
+      await ensureAgentDeploymentLifecycle(state, existing, { status: "failed", level: "error", marker: "Agent reported deployment failure", message: `Agent reported deployment failure: ${safeReason}` });
+    } catch (error) {
+      await compensateAgentLifecycleFailure(state, existing);
+      throw error;
+    }
+    const failed = await state.deploymentCommandBus.fail(existing.id, safeReason);
     return reply.send(failed);
   });
   app.get(`${API_PREFIX}/bootstrap/status`, async (request) => ok(request, await getBootstrapStatus(adapters.users)));

@@ -81,51 +81,80 @@ async function fixture(commandOverrides: Partial<DeploymentCommand> = {}) {
     return new Response(response.statusCode === 204 ? null : response.body, { status: response.statusCode, headers: response.headers as Record<string, string> });
   });
   const transport = new HttpAgentCommandTransport({ apiUrl: "http://api.test", token, fetch });
-  return { app, commands, secrets, transport };
+  return { app, commands, deployments, secrets, transport };
 }
 
 afterEach(() => vi.restoreAllMocks());
 
 describe("agent command HTTP transport integration", () => {
   it("denies missing and invalid bearer credentials without exposing the configured token", async () => {
-    const { app } = await fixture();
+    const { app, commands, deployments } = await fixture();
     const missing = await app.inject({ method: "GET", url: `/api/v1/agent/commands/next?agentId=${agentId}` });
     const invalid = await app.inject({ method: "GET", url: `/api/v1/agent/commands/next?agentId=${agentId}`, headers: { authorization: "Bearer wrong-token" } });
+    const invalidClaim = await app.inject({ method: "POST", url: `/api/v1/agent/commands/${commandId}/claim`, headers: { authorization: "Bearer wrong-token", "content-type": "application/json" }, payload: { agentId } });
     expect(missing.statusCode).toBe(401);
     expect(invalid.statusCode).toBe(403);
-    expect(`${missing.body}${invalid.body}`).not.toContain(token);
+    expect(invalidClaim.statusCode).toBe(403);
+    expect(`${missing.body}${invalid.body}${invalidClaim.body}`).not.toContain(token);
+    expect((await commands.findById(commandId))?.state).toBe("pending");
+    expect(await deployments.findById(deploymentId)).toMatchObject({ status: "queued", finishedAt: null });
+    expect(await deployments.listLogs(deploymentId)).toEqual([]);
   });
 
   it("isolates the configured agent from cross-agent queries and commands", async () => {
-    const { app, commands } = await fixture();
+    const { app, commands, deployments } = await fixture();
     const crossQuery = await app.inject({ method: "GET", url: `/api/v1/agent/commands/next?agentId=${otherAgentId}`, headers: { authorization: `Bearer ${token}` } });
-    await commands.save(command({ id: "99999999-9999-4999-8999-999999999999", agentId: otherAgentId }));
-    const crossClaim = await app.inject({ method: "POST", url: "/api/v1/agent/commands/99999999-9999-4999-8999-999999999999/claim", headers: { authorization: `Bearer ${token}`, "content-type": "application/json" }, payload: { agentId } });
+    const crossCommandId = "99999999-9999-4999-8999-999999999999";
+    await commands.save(command({ id: crossCommandId, agentId: otherAgentId, state: "claimed", claimedAt: "2026-07-10T00:00:01.000Z" }));
+    const headers = { authorization: `Bearer ${token}`, "content-type": "application/json" };
+    const crossClaim = await app.inject({ method: "POST", url: `/api/v1/agent/commands/${crossCommandId}/claim`, headers, payload: { agentId } });
+    const crossComplete = await app.inject({ method: "POST", url: `/api/v1/agent/commands/${crossCommandId}/complete`, headers, payload: {} });
+    const crossFail = await app.inject({ method: "POST", url: `/api/v1/agent/commands/${crossCommandId}/fail`, headers, payload: { reason: "must not apply" } });
     expect(crossQuery.statusCode).toBe(403);
     expect(crossClaim.statusCode).toBe(404);
+    expect(crossComplete.statusCode).toBe(404);
+    expect(crossFail.statusCode).toBe(404);
+    expect(await deployments.findById(deploymentId)).toMatchObject({ status: "queued", finishedAt: null });
+    expect(await deployments.listLogs(deploymentId)).toEqual([]);
   });
 
   it("polls complete execution input, claims, and completes idempotently without persisting plaintext", async () => {
     const consoleError = vi.spyOn(console, "error").mockImplementation(() => undefined);
-    const { commands, secrets, transport } = await fixture();
+    const { commands, deployments, secrets, transport } = await fixture();
     const input = await transport.poll(agentId, new AbortController().signal);
-    expect(input).toMatchObject({ command: { id: commandId, agentId, state: "pending" }, repoUrl: "https://github.com/acme/service.git", ref: "abcdef1", projectSlug: projectId, healthUrl: "http://127.0.0.1:3000/" });
+    expect(input).toMatchObject({ command: { id: commandId, agentId, state: "pending" }, repoUrl: "https://github.com/acme/service.git", ref: "abcdef1", projectSlug: projectId, healthUrl: `http://deploylite-${commandId}:3000/` });
     expect(input?.envFile.contents).toBe(`private_key=${plaintext}\n`);
     expect((await transport.claim(commandId, agentId))?.state).toBe("claimed");
+    expect((await transport.claim(commandId, agentId))?.state).toBe("claimed");
+    expect((await deployments.findById(deploymentId))?.status).toBe("running");
     expect((await transport.complete(commandId, { token: plaintext }))?.state).toBe("completed");
     expect((await transport.complete(commandId))?.state).toBe("completed");
+    expect(await deployments.findById(deploymentId)).toMatchObject({ status: "succeeded", finishedAt: expect.any(String) });
+    const logs = await deployments.listLogs(deploymentId);
+    expect(logs).toEqual(expect.arrayContaining([
+      expect.objectContaining({ message: expect.stringContaining("deployment is running"), requestId: command().requestId, correlationId: command().correlationId }),
+      expect.objectContaining({ message: expect.stringContaining("deployment succeeded"), requestId: command().requestId, correlationId: command().correlationId })
+    ]));
+    expect(logs.filter((log) => log.message.startsWith("Agent completed deployment command"))).toHaveLength(1);
+    expect(logs.filter((log) => log.message.startsWith("Agent claimed deployment command"))).toHaveLength(1);
     expect(JSON.stringify(await commands.list())).not.toContain(plaintext);
     expect(JSON.stringify(await secrets.listByProject(projectId))).not.toContain(plaintext);
     expect(consoleError).not.toHaveBeenCalled();
   });
 
   it("fails an assigned claimed command idempotently with a redacted reason", async () => {
-    const { commands, transport } = await fixture({ state: "claimed", claimedAt: "2026-07-10T00:00:01.000Z" });
+    const { commands, deployments, transport } = await fixture({ state: "claimed", claimedAt: "2026-07-10T00:00:01.000Z" });
     const reason = `private_key=-----BEGIN PRIVATE KEY-----\n${plaintext}\n-----END PRIVATE KEY-----`;
     expect((await transport.fail(commandId, reason))?.state).toBe("failed");
     expect((await transport.fail(commandId, reason))?.state).toBe("failed");
     const persisted = await commands.findById(commandId);
     expect(persisted?.failureReason).not.toContain(plaintext);
     expect(persisted?.failureReason).toContain("private_key=[REDACTED]");
+    expect(await deployments.findById(deploymentId)).toMatchObject({ status: "failed", finishedAt: expect.any(String) });
+    const logs = await deployments.listLogs(deploymentId);
+    expect(logs).toEqual([
+      expect.objectContaining({ level: "error", message: expect.stringContaining("private_key=[REDACTED]"), requestId: command().requestId, correlationId: command().correlationId })
+    ]);
+    expect(JSON.stringify(logs)).not.toContain(plaintext);
   });
 });
