@@ -1,5 +1,6 @@
 import { agentSchema, deploymentCommandSchema, resourceSnapshotSchema, type Agent, type DeploymentCommand } from "@deploylite/contracts";
 import { z } from "zod";
+import { DEPLOYMENT_COMMAND_LEASE_RENEWAL_MS } from "@deploylite/domain";
 import type { CommandBusClient, DeploymentExecutionInput, DeploymentExecutionResult, ExecutorLogger } from "./executor/index.js";
 import { redactEnvFileForLog } from "./redaction.js";
 
@@ -17,6 +18,7 @@ export type AgentCommandTransport = CommandBusClient & {
   register(input: AgentRegistrationInput, signal: AbortSignal): Promise<Agent>;
   heartbeat(agentId: string, observedAt: string, resourceSnapshot: ResourceSnapshot, signal: AbortSignal): Promise<Agent>;
   poll(agentId: string, signal: AbortSignal): Promise<DeploymentExecutionInput | null>;
+  recoverClaimed(agentId: string, signal: AbortSignal): Promise<DeploymentExecutionInput | null>;
 };
 
 export type ResourceSnapshot = z.infer<typeof resourceSnapshotSchema>;
@@ -25,7 +27,8 @@ export type AgentRegistrationInput = { agentId: string; name: string; endpoint: 
 export type TerminalAcknowledgementReplayer = { replayPending(): Promise<boolean> };
 
 export type DeploymentExecutorPort = {
-  execute(input: DeploymentExecutionInput): Promise<DeploymentExecutionResult>;
+  execute(input: DeploymentExecutionInput, signal?: AbortSignal): Promise<DeploymentExecutionResult>;
+  reconcile(input: DeploymentExecutionInput): Promise<DeploymentExecutionResult>;
 };
 
 export type AgentWorkerOptions = {
@@ -40,6 +43,7 @@ export type AgentWorkerOptions = {
   retryDelayMs?: number;
   heartbeatIntervalMs?: number;
   maxHeartbeatBackoffMs?: number;
+  leaseRenewalIntervalMs?: number;
   now?: () => Date;
   wait?: (milliseconds: number, signal: AbortSignal) => Promise<void>;
 };
@@ -51,6 +55,7 @@ export class AgentWorker {
   readonly #heartbeatIntervalMs: number;
   readonly #maxHeartbeatBackoffMs: number;
   readonly #now: () => Date;
+  readonly #leaseRenewalIntervalMs: number;
 
   constructor(private readonly options: AgentWorkerOptions) {
     this.#logger = options.logger ?? { log: () => undefined };
@@ -59,6 +64,7 @@ export class AgentWorker {
     this.#heartbeatIntervalMs = Math.min(60_000, Math.max(5_000, options.heartbeatIntervalMs ?? 15_000));
     this.#maxHeartbeatBackoffMs = Math.min(60_000, Math.max(this.#retryDelayMs, options.maxHeartbeatBackoffMs ?? 30_000));
     this.#now = options.now ?? (() => new Date());
+    this.#leaseRenewalIntervalMs = Math.max(1, options.leaseRenewalIntervalMs ?? DEPLOYMENT_COMMAND_LEASE_RENEWAL_MS);
   }
 
   async run(signal: AbortSignal): Promise<void> {
@@ -76,6 +82,7 @@ export class AgentWorker {
 
   private async pollLoop(signal: AbortSignal): Promise<void> {
     let terminalRetryMs = this.#retryDelayMs;
+    let startupReconciled = false;
     while (!signal.aborted) {
       try {
         if (this.options.terminalAcks && !(await this.options.terminalAcks.replayPending())) {
@@ -85,6 +92,11 @@ export class AgentWorker {
           continue;
         }
         terminalRetryMs = this.#retryDelayMs;
+        if (!startupReconciled) {
+          const claimed = await this.options.transport.recoverClaimed(this.options.agentId, signal);
+          if (claimed) await this.options.executor.reconcile(claimed);
+          startupReconciled = true;
+        }
         const input = await this.options.transport.poll(this.options.agentId, signal);
         if (signal.aborted) break;
         if (!input) {
@@ -96,13 +108,42 @@ export class AgentWorker {
           await this.#wait(this.#retryDelayMs, signal);
           continue;
         }
-        await this.options.executor.execute(input);
+        await this.executeWithLease(input, signal);
       } catch (error) {
         if (signal.aborted) break;
         await this.safeLog("error", `Agent poll failed: ${safeError(error)}`);
         await this.#wait(this.#retryDelayMs, signal);
       }
     }
+  }
+
+  private async executeWithLease(input: DeploymentExecutionInput, parentSignal: AbortSignal): Promise<void> {
+    if (input.command.state !== "claimed" || !input.command.leaseExpiresAt) throw new Error("Polled command was not leased");
+    const execution = new AbortController();
+    const stop = () => execution.abort();
+    parentSignal.addEventListener("abort", stop, { once: true });
+    let finished = false;
+    const execute = this.options.executor.execute(input, execution.signal).finally(() => {
+      finished = true;
+      execution.abort();
+    });
+    const renew = (async () => {
+      while (!finished && !execution.signal.aborted) {
+        await this.#wait(this.#leaseRenewalIntervalMs, execution.signal);
+        if (finished || execution.signal.aborted) break;
+        try {
+          const command = await this.options.transport.renewLease(input.command.id, this.options.agentId);
+          if (!command || command.id !== input.command.id || command.agentId !== this.options.agentId || command.state !== "claimed" || !command.leaseExpiresAt) {
+            throw new Error("Command lease renewal was not confirmed");
+          }
+        } catch {
+          execution.abort();
+          break;
+        }
+      }
+    })();
+    try { await Promise.all([execute, renew]); }
+    finally { parentSignal.removeEventListener("abort", stop); }
   }
 
   private async heartbeatLoop(signal: AbortSignal): Promise<void> {
@@ -168,6 +209,12 @@ export class HttpAgentCommandTransport implements AgentCommandTransport {
     return executionInputSchema.parse(result);
   }
 
+  async recoverClaimed(agentId: string, signal: AbortSignal): Promise<DeploymentExecutionInput | null> {
+    const result = await this.request(`/api/v1/agent/commands/claimed?agentId=${encodeURIComponent(agentId)}`, { method: "GET", signal });
+    if (result === null) return null;
+    return executionInputSchema.parse(result);
+  }
+
   async claim(commandId: string, agentId: string): Promise<DeploymentCommand | null> {
     return this.commandRequest(commandId, "claim", { agentId });
   }
@@ -178,6 +225,10 @@ export class HttpAgentCommandTransport implements AgentCommandTransport {
 
   async fail(commandId: string, reason: string): Promise<DeploymentCommand | null> {
     return this.commandRequest(commandId, "fail", { reason: redactEnvFileForLog(reason) });
+  }
+
+  async renewLease(commandId: string, agentId: string): Promise<DeploymentCommand | null> {
+    return this.commandRequest(commandId, "renew", { agentId });
   }
 
   private async commandRequest(commandId: string, action: string, body: Record<string, unknown>): Promise<DeploymentCommand | null> {

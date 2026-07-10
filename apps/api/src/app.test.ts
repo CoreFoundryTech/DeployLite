@@ -1619,6 +1619,15 @@ describe("Phase 5 slice 1 — DeploymentCommandBus control plane", () => {
       payload: { name: "UUID agent", endpoint: "https://agent.uuid.test" }
     });
     const agentId = register.json().data.agent.id as string;
+    await app.inject({
+      method: "POST",
+      url: `/api/v1/agents/${agentId}/heartbeat`,
+      headers: { ...contentHeaders, cookie },
+      payload: {
+        observedAt: new Date().toISOString(),
+        resourceSnapshot: { cpuLoad: 0.1, memoryUsedBytes: 1, memoryTotalBytes: 2, diskUsedBytes: 1, diskTotalBytes: 2 }
+      }
+    });
 
     const createProject = await app.inject({
       method: "POST",
@@ -1805,6 +1814,12 @@ describe("Phase 5 slice 1 — DeploymentCommandBus control plane", () => {
     const deployments = new InMemoryDeploymentRepository();
     const deploymentCommands: DeploymentCommandRepository = {
       async save() {
+        throw new Error("command store unavailable");
+      },
+      async claim() {
+        throw new Error("command store unavailable");
+      },
+      async renewLease() {
         throw new Error("command store unavailable");
       },
       async findById() {

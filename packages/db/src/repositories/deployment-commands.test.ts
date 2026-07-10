@@ -18,6 +18,7 @@ function deploymentCommandRow(overrides: Partial<DeploymentCommandRow> = {}): De
     correlationId: "req_1",
     issuedAt: now,
     claimedAt: null,
+    leaseExpiresAt: null,
     completedAt: null,
     failureReason: null,
     createdAt: now,
@@ -40,6 +41,7 @@ describe("deployment command bus persistence mapping", () => {
       correlationId: "req_1",
       issuedAt: "2026-01-01T00:00:00.000Z",
       claimedAt: null,
+      leaseExpiresAt: null,
       completedAt: null,
       failureReason: null
     });

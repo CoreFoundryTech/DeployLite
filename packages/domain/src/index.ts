@@ -1,5 +1,13 @@
 import type { Agent, AgentHeartbeat, Deployment, DeploymentCommand, DeploymentCommandKind, DeploymentCommandState, EnvSecretValue, EnvVariableMetadata, LogEvent, Project, ScaffoldUser } from "@deploylite/contracts";
-import { redactLogMessage } from "@deploylite/config";
+import {
+  createEnvSecretCipher,
+  EnvSecretCipherError,
+  EnvSecretKeyMissingError,
+  loadEnvSecretKey,
+  redactLogMessage,
+  redactSecrets,
+  type EnvSecretCipher
+} from "@deploylite/config";
 
 export const canonicalRoleNames = ["admin", "operator", "read-only", "auditor"] as const;
 export type CanonicalRoleName = (typeof canonicalRoleNames)[number];
@@ -159,6 +167,7 @@ export type DeploymentCommandBusSubmitInput = {
 export type DeploymentCommandBus = {
   submit(input: DeploymentCommandBusSubmitInput): Promise<DeploymentCommandRecord>;
   claim(commandId: string, agentId: string): Promise<DeploymentCommandRecord | null>;
+  renewLease(commandId: string, agentId: string): Promise<DeploymentCommandRecord | null>;
   complete(commandId: string, output?: Record<string, unknown>): Promise<DeploymentCommandRecord | null>;
   fail(commandId: string, reason: string): Promise<DeploymentCommandRecord | null>;
   cancel(commandId: string, requestedBy: string | null): Promise<DeploymentCommandRecord | null>;
@@ -184,6 +193,8 @@ export type DeploymentExecutor = {
 
 export type DeploymentCommandRepository = {
   save(command: DeploymentCommandRecord): Promise<DeploymentCommandRecord>;
+  claim(commandId: string, agentId: string, claimedAt: string, leaseExpiresAt: string): Promise<DeploymentCommandRecord | null>;
+  renewLease(commandId: string, agentId: string, now: string, leaseExpiresAt: string): Promise<DeploymentCommandRecord | null>;
   findById(id: string): Promise<DeploymentCommandRecord | null>;
   findActiveForDeployment(deploymentId: string): Promise<DeploymentCommandRecord | null>;
   list(): Promise<DeploymentCommandRecord[]>;
@@ -330,6 +341,9 @@ export async function getBootstrapStatus(users: AuthUserRepository): Promise<{ s
 
 const STALE_AFTER_MS = 60_000;
 
+export const DEPLOYMENT_COMMAND_LEASE_MS = 30_000;
+export const DEPLOYMENT_COMMAND_LEASE_RENEWAL_MS = 10_000;
+
 export class InMemoryAgentRepository implements AgentRepository {
   readonly #agents = new Map<string, Agent>();
 
@@ -375,6 +389,77 @@ export class AgentStatusService {
   }
 }
 
+export type EnvMaterializedEntry = {
+  projectId: string;
+  agentId: string;
+  contents: string;
+  lines: string[];
+};
+
+export type EncryptedEnvRecord = {
+  key: string;
+  scope: "project" | "deployment";
+  encryptedValue: Buffer;
+  valueFingerprint: string;
+  keyVersion: number;
+};
+
+export type MaterializeDeployOptions = {
+  projectId: string;
+  agentId: string;
+  records: EncryptedEnvRecord[];
+  cipher?: EnvSecretCipher;
+  env?: NodeJS.ProcessEnv;
+};
+
+export function buildDeployEnvFile(records: EncryptedEnvRecord[], cipher: EnvSecretCipher): EnvMaterializedEntry {
+  const sorted = [...records].sort((left, right) => left.scope === right.scope ? left.key.localeCompare(right.key) : left.scope === "project" ? -1 : 1);
+  const lines = sorted.map((record) => {
+    if (!Buffer.isBuffer(record.encryptedValue) || record.encryptedValue.length === 0) {
+      throw new EnvSecretCipherError(`record ${record.key} is missing an encryptedValue buffer`);
+    }
+    return `${record.key}=${cipher.decrypt(record.encryptedValue.toString("base64"))}`;
+  });
+  return { projectId: "", agentId: "", contents: lines.join("\n") + (lines.length ? "\n" : ""), lines };
+}
+
+export function materializeMockDeploy(options: MaterializeDeployOptions): EnvMaterializedEntry {
+  let cipher = options.cipher;
+  if (!cipher) {
+    const raw = options.env?.DEPLOYLITE_SECRET_KEY;
+    if (!raw?.trim()) throw new EnvSecretKeyMissingError("DEPLOYLITE_SECRET_KEY is missing or empty");
+    cipher = createEnvSecretCipher(loadEnvSecretKey(raw));
+  }
+  return { ...buildDeployEnvFile(options.records, cipher), projectId: options.projectId, agentId: options.agentId };
+}
+
+const ENV_NEW_KEY_PATTERN = /^[A-Za-z_][A-Za-z0-9_]{0,63}=/;
+export function redactEnvFileForLog(contents: string): string {
+  const redacted: string[] = [];
+  let multiline = false;
+  for (const line of contents.split("\n")) {
+    if (multiline) {
+      redacted.push("[REDACTED]");
+      if (/^-----END [A-Z0-9 ]+-----\r?$/.test(line)) multiline = false;
+      continue;
+    }
+    const equalsIndex = line.indexOf("=");
+    if (equalsIndex < 0) {
+      redacted.push(redactSecrets(line));
+      continue;
+    }
+    redacted.push(`${line.slice(0, equalsIndex)}=[REDACTED]`);
+    if (equalsIndex > 0 && ENV_NEW_KEY_PATTERN.test(line)) multiline = /^-----BEGIN [A-Z0-9 ]+-----\r?$/.test(line.slice(equalsIndex + 1));
+  }
+  return redacted.join("\n");
+}
+
+const SAFE_DEPLOYMENT_ID = /^[a-z0-9][a-z0-9-]{0,62}$/;
+export function deploymentContainerName(projectSlug: string, commandId: string): string {
+  if (!SAFE_DEPLOYMENT_ID.test(projectSlug) || !SAFE_DEPLOYMENT_ID.test(commandId)) throw new Error("Invalid project slug or command id");
+  return `deploylite-${commandId}`;
+}
+
 export class InMemoryDeploymentRepository implements DeploymentRepository {
   readonly #deployments = new Map<string, Deployment>();
   readonly #logs = new Map<string, LogEvent[]>();
@@ -414,6 +499,18 @@ export class InMemoryDeploymentCommandRepository implements DeploymentCommandRep
     const clone = structuredClone(command);
     this.#commands.set(clone.id, clone);
     return clone;
+  }
+
+  async claim(commandId: string, agentId: string, claimedAt: string, leaseExpiresAt: string): Promise<DeploymentCommandRecord | null> {
+    const existing = this.#commands.get(commandId);
+    if (!existing || existing.agentId !== agentId || existing.state !== "pending") return null;
+    return this.save({ ...existing, state: "claimed", claimedAt, leaseExpiresAt });
+  }
+
+  async renewLease(commandId: string, agentId: string, now: string, leaseExpiresAt: string): Promise<DeploymentCommandRecord | null> {
+    const existing = this.#commands.get(commandId);
+    if (!existing || existing.agentId !== agentId || existing.state !== "claimed" || !existing.leaseExpiresAt || existing.leaseExpiresAt <= now) return null;
+    return this.save({ ...existing, leaseExpiresAt });
   }
 
   async findById(id: string): Promise<DeploymentCommandRecord | null> {

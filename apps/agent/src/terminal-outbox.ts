@@ -120,6 +120,11 @@ export class DurableTerminalCommandBus implements CommandBusClient {
     return this.transport.claim(commandId, agentId);
   }
 
+  renewLease(commandId: string, agentId: string): Promise<DeploymentCommand | null> {
+    if (agentId !== this.agentId) throw new Error("Agent identity mismatch");
+    return this.transport.renewLease(commandId, agentId);
+  }
+
   async complete(commandId: string, output?: Record<string, unknown>): Promise<DeploymentCommand | null> {
     await this.outbox.put(this.record(commandId, "complete"));
     const acknowledged = await this.transport.complete(commandId, output);
@@ -142,7 +147,7 @@ export class DurableTerminalCommandBus implements CommandBusClient {
         const acknowledged = record.action === "complete"
           ? await this.transport.complete(record.commandId)
           : await this.transport.fail(record.commandId, record.reason ?? SAFE_FAILURE_REASON);
-        await this.assertAndRemove(record.commandId, record.action === "complete" ? "completed" : "failed", acknowledged);
+        await this.assertReplayAndRemove(record.commandId, record.action === "complete" ? "completed" : "failed", acknowledged);
       } catch {
         return false;
       }
@@ -158,6 +163,14 @@ export class DurableTerminalCommandBus implements CommandBusClient {
     const parsed = deploymentCommandSchema.nullable().parse(command);
     if (!parsed || parsed.id !== commandId || parsed.agentId !== this.agentId || parsed.state !== state) {
       throw new Error("Terminal acknowledgement did not confirm the assigned command state");
+    }
+    await this.outbox.remove(commandId);
+  }
+
+  private async assertReplayAndRemove(commandId: string, state: "completed" | "failed", command: DeploymentCommand | null): Promise<void> {
+    const parsed = deploymentCommandSchema.nullable().parse(command);
+    if (!parsed || parsed.id !== commandId || parsed.agentId !== this.agentId || (parsed.state !== state && parsed.state !== "failed")) {
+      throw new Error("Terminal acknowledgement replay did not confirm an authoritative terminal command state");
     }
     await this.outbox.remove(commandId);
   }

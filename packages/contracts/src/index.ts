@@ -226,6 +226,7 @@ export const deploymentCommandSchema = z.object({
   correlationId: idSchema,
   issuedAt: isoDateSchema,
   claimedAt: isoDateSchema.nullable(),
+  leaseExpiresAt: isoDateSchema.nullable(),
   completedAt: isoDateSchema.nullable(),
   failureReason: z.string().nullable()
 });

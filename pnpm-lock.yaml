@@ -45,15 +45,15 @@ importers:
       '@deploylite/contracts':
         specifier: workspace:*
         version: link:../../packages/contracts
+      '@deploylite/domain':
+        specifier: workspace:*
+        version: link:../../packages/domain
       zod:
         specifier: ^3.24.1
         version: 3.25.76
 
   apps/api:
     dependencies:
-      '@deploylite/agent':
-        specifier: workspace:*
-        version: link:../agent
       '@deploylite/config':
         specifier: workspace:*
         version: link:../../packages/config

@@ -26,6 +26,9 @@ import {
 import { BcryptPasswordHasher, bootstrapInitialAdmin, closeDbPool, createDbClient, createDbPool, createOpaqueSessionToken, DbAgentRepository, DbAuditRepository, DbAuthUserRepository, DbDeploymentCommandRepository, DbDeploymentRepository, DbEnvSecretValueRepository, DbEnvVariableMetadataRepository, DbProjectRepository, DbSessionRepository, hashSessionToken, type DeployLiteDb } from "@deploylite/db";
 import {
   AgentStatusService,
+  buildDeployEnvFile,
+  deploymentContainerName,
+  redactEnvFileForLog,
   authenticateLocalUser,
   getBootstrapStatus,
   InMemoryAgentRepository,
@@ -61,7 +64,6 @@ import {
 import Fastify, { type FastifyInstance, type FastifyReply, type FastifyRequest } from "fastify";
 import { createHash, timingSafeEqual } from "node:crypto";
 import { z } from "zod";
-import { buildDeployEnvFile, containerName } from "@deploylite/agent";
 import { DeploymentCommandBusService, MockDeploymentExecutor } from "./commands/index.js";
 
 declare module "fastify" {
@@ -145,6 +147,8 @@ type BuildApiAppOptions = {
     closePool?: (pool: DbPool) => Promise<void>;
   };
   env?: NodeJS.ProcessEnv;
+  now?: () => Date;
+  commandReconciliationIntervalMs?: number;
 };
 
 class InMemoryAuthUserRepository implements AuthUserRepository {
@@ -456,6 +460,7 @@ type PlatformRepositories = PlatformRepositoryOptions & {
   deploymentExecutor: DeploymentExecutor;
   cancelDeploymentExecutorTimers: () => void;
   externalAgentIdentity: { agentId: string; token: string } | null;
+  now: () => Date;
 };
 
 type EnvSecretKeySource = NodeJS.ProcessEnv | Record<string, string | number | boolean | undefined>;
@@ -474,7 +479,7 @@ function createLazyEnvSecretCipher(env: EnvSecretKeySource): EnvSecretCipher {
   };
 }
 
-function createApiState(env: EnvSecretKeySource, overrides: Partial<PlatformRepositoryOptions> = {}): PlatformRepositories {
+function createApiState(env: EnvSecretKeySource, overrides: Partial<PlatformRepositoryOptions> = {}, now: () => Date = () => new Date()): PlatformRepositories {
   const agents = overrides.agents ?? new InMemoryAgentRepository();
   const deployments = overrides.deployments ?? new InMemoryDeploymentRepository();
   const projects = overrides.projects ?? new InMemoryProjectRepository();
@@ -495,7 +500,7 @@ function createApiState(env: EnvSecretKeySource, overrides: Partial<PlatformRepo
   // the executor in the API process so the route surface stays
   // socket-free; a later slice will replace the in-process executor
   // with a real agent that runs in a Docker-socket-mounted container.
-  const deploymentCommandBus = new DeploymentCommandBusService(deploymentCommands);
+  const deploymentCommandBus = new DeploymentCommandBusService(deploymentCommands, now);
   const deploymentExecutor = new MockDeploymentExecutor({
     bus: deploymentCommandBus,
     deployments,
@@ -519,7 +524,8 @@ function createApiState(env: EnvSecretKeySource, overrides: Partial<PlatformRepo
     deploymentCommandBus,
     deploymentExecutor,
     cancelDeploymentExecutorTimers: () => deploymentExecutor.cancelTimers(),
-    externalAgentIdentity: agentId && agentToken ? { agentId, token: agentToken } : null
+    externalAgentIdentity: agentId && agentToken ? { agentId, token: agentToken } : null,
+    now
   };
 }
 
@@ -580,7 +586,7 @@ function createDbAuthAdapters(env: DeployLiteEnv, options: BuildApiAppOptions): 
       envSecretValues: options.state?.envSecretValues ?? new DbEnvSecretValueRepository(db),
       envSecretMaterialization: options.state?.envSecretMaterialization,
       envSecretCipher: options.state?.envSecretCipher
-    })
+    }, options.now)
   };
 }
 
@@ -593,12 +599,12 @@ async function createRuntimeRepositories(env: DeployLiteEnv, options: BuildApiAp
   return {
     auth: { ...(await createSeededInMemoryAuthAdapters(env)), ...options.auth },
     shouldSeedMockData: true,
-    state: createApiState(env, options.state)
+    state: createApiState(env, options.state, options.now)
   };
 }
 
 async function seedMockData(state: PlatformRepositories): Promise<void> {
-  const startedAt = "2026-01-01T00:00:00.000Z";
+  const startedAt = state.now().toISOString();
   await state.agents.save({
     id: "agent_mock_1",
     name: "Mock VPS Agent",
@@ -684,6 +690,9 @@ const commandIdSchema = z.string().uuid();
 const agentClaimBodySchema = z.object({ agentId: agentIdSchema }).strict();
 const agentCompleteBodySchema = z.object({ output: z.record(z.unknown()).optional() }).strict();
 const agentFailBodySchema = z.object({ reason: z.string().min(1).max(1024) }).strict();
+const INVALID_COMMAND_REASON_MAX = 256;
+
+class InvalidCommandPrerequisiteError extends Error {}
 
 function authenticateAgentRequest(
   request: FastifyRequest,
@@ -719,24 +728,66 @@ async function materializeAgentExecutionInput(
   envFile: { contents: string };
   healthUrl: string;
 } | null> {
-  if (command.kind !== "start" || command.state !== "pending") return null;
+  if (command.kind !== "start" || (command.state !== "pending" && command.state !== "claimed")) {
+    throw new InvalidCommandPrerequisiteError("Deployment command has an unsupported execution prerequisite.");
+  }
   const deployment = await state.deployments.findById(command.deploymentId);
-  if (!deployment || deployment.agentId !== command.agentId) return null;
+  if (!deployment) throw new InvalidCommandPrerequisiteError("Linked deployment is missing.");
+  if (deployment.agentId !== command.agentId) throw new InvalidCommandPrerequisiteError("Deployment agent assignment does not match the command.");
   const project = await state.projects.findById(deployment.projectId);
-  if (!project || !Number.isInteger(project.port) || project.port === null || project.port < 1 || project.port > 65_535) return null;
+  if (!project) throw new InvalidCommandPrerequisiteError("Linked project is missing.");
+  if (!project.repoUrl) throw new InvalidCommandPrerequisiteError("Project repository is missing.");
+  if (!deployment.commitSha) throw new InvalidCommandPrerequisiteError("Deployment revision is missing.");
+  if (!Number.isInteger(project.port) || project.port === null || project.port < 1 || project.port > 65_535) {
+    throw new InvalidCommandPrerequisiteError("Project port is missing or invalid.");
+  }
   const metadata = await state.envMetadata.listByProject(project.id);
   const encrypted = await state.envSecretMaterialization.listEncryptedByProject(project.id);
   const materializedKeys = new Set(encrypted.map((record) => `${record.scope}:${record.key}`));
-  if (metadata.some((record) => record.required && !materializedKeys.has(`${record.scope}:${record.key}`))) return null;
-  const envFile = buildDeployEnvFile(encrypted, state.envSecretCipher);
+  if (metadata.some((record) => record.required && !materializedKeys.has(`${record.scope}:${record.key}`))) {
+    throw new InvalidCommandPrerequisiteError("A required deployment secret is unavailable.");
+  }
+  let envFile;
+  try {
+    envFile = buildDeployEnvFile(encrypted, state.envSecretCipher);
+  } catch (error) {
+    if (error instanceof EnvSecretKeyMissingError || error instanceof EnvSecretKeyInvalidError || error instanceof EnvSecretCipherError) {
+      throw new InvalidCommandPrerequisiteError("Deployment secret material cannot be decrypted.");
+    }
+    throw error;
+  }
   return {
     command,
     repoUrl: project.repoUrl,
     ref: deployment.commitSha,
     projectSlug: project.id,
     envFile: { contents: envFile.contents },
-    healthUrl: `http://${containerName(project.id, command.id)}:${project.port}/`
+    healthUrl: `http://${deploymentContainerName(project.id, command.id)}:${project.port}/`
   };
+}
+
+async function terminallyFailAgentCommand(state: PlatformRepositories, command: DeploymentCommand, reason: string, marker = "Agent command rejected"): Promise<void> {
+  const safeReason = redactLogMessage(reason).slice(0, INVALID_COMMAND_REASON_MAX);
+  if (await state.deployments.findById(command.deploymentId)) {
+    await ensureAgentDeploymentLifecycle(state, command, {
+      status: "failed",
+      level: "error",
+      marker,
+      message: `${marker}: ${safeReason}`
+    });
+  }
+  const current = await state.deploymentCommandBus.findById(command.id);
+  if (current && current.state !== "failed") await state.deploymentCommandBus.fail(command.id, safeReason);
+}
+
+async function reconcileExpiredClaims(state: PlatformRepositories, agentId: string): Promise<void> {
+  const now = state.now().getTime();
+  const claimed = (await state.deploymentCommandBus.list()).filter((command) => command.agentId === agentId && command.state === "claimed");
+  for (const command of claimed) {
+    if (!command.leaseExpiresAt || new Date(command.leaseExpiresAt).getTime() <= now) {
+      await terminallyFailAgentCommand(state, command, "Agent command lease expired; execution was not retried.", "Agent command lease expired");
+    }
+  }
 }
 
 type AgentDeploymentLifecycle = {
@@ -892,18 +943,39 @@ function registerRoutes(app: FastifyInstance, state: PlatformRepositories, adapt
       return reply.code(403).send(errorEnvelope(request, "AGENT_IDENTITY_MISMATCH", "Agent identity mismatch."));
     }
     if (!(await state.agents.findById(parsed.data.agentId))) return reply.code(204).send();
+    await reconcileExpiredClaims(state, parsed.data.agentId);
     const commands = (await state.deploymentCommandBus.list())
       .filter((command) => command.agentId === parsed.data.agentId && command.state === "pending")
       .sort((left, right) => left.issuedAt.localeCompare(right.issuedAt));
-    try {
-      for (const command of commands) {
+    for (const command of commands) {
+      try {
         const input = await materializeAgentExecutionInput(state, command);
-        if (input) return reply.send(input);
+        const claimed = await state.deploymentCommandBus.claim(command.id, parsed.data.agentId);
+        if (claimed) return reply.send({ ...input, command: claimed });
+      } catch (error) {
+        if (error instanceof InvalidCommandPrerequisiteError) {
+          await terminallyFailAgentCommand(state, command, error.message);
+          continue;
+        }
+        throw error;
       }
-      return reply.code(204).send();
+    }
+    return reply.code(204).send();
+  });
+  app.get(`${API_PREFIX}/agent/commands/claimed`, async (request, reply) => {
+    if (!authenticateAgentRequest(request, reply, state.externalAgentIdentity)) return reply;
+    const parsed = z.object({ agentId: agentIdSchema }).safeParse(request.query);
+    if (!parsed.success) return reply.code(400).send(errorEnvelope(request, "VALIDATION_ERROR", "Invalid agent command request."));
+    if (parsed.data.agentId !== state.externalAgentIdentity.agentId) return reply.code(403).send(errorEnvelope(request, "AGENT_IDENTITY_MISMATCH", "Agent identity mismatch."));
+    await reconcileExpiredClaims(state, parsed.data.agentId);
+    const command = (await state.deploymentCommandBus.list()).find((item) => item.agentId === parsed.data.agentId && item.state === "claimed");
+    if (!command) return reply.code(204).send();
+    try {
+      return reply.send(await materializeAgentExecutionInput(state, command));
     } catch (error) {
-      if (error instanceof EnvSecretKeyMissingError || error instanceof EnvSecretKeyInvalidError || error instanceof EnvSecretCipherError) {
-        return reply.code(503).send(errorEnvelope(request, "SECRET_MATERIAL_UNAVAILABLE", "Deployment secret material is unavailable."));
+      if (error instanceof InvalidCommandPrerequisiteError) {
+        await terminallyFailAgentCommand(state, command, error.message);
+        return reply.code(204).send();
       }
       throw error;
     }
@@ -926,6 +998,20 @@ function registerRoutes(app: FastifyInstance, state: PlatformRepositories, adapt
     }
     return reply.send(claimed);
   });
+  app.post(`${API_PREFIX}/agent/commands/:commandId/renew`, async (request, reply) => {
+    if (!authenticateAgentRequest(request, reply, state.externalAgentIdentity)) return reply;
+    const params = z.object({ commandId: commandIdSchema }).safeParse(request.params);
+    const body = agentClaimBodySchema.safeParse(request.body);
+    if (!params.success || !body.success) return reply.code(400).send(errorEnvelope(request, "VALIDATION_ERROR", "Invalid agent command request."));
+    if (body.data.agentId !== state.externalAgentIdentity.agentId) return reply.code(403).send(errorEnvelope(request, "AGENT_IDENTITY_MISMATCH", "Agent identity mismatch."));
+    const renewed = await state.deploymentCommandBus.renewLease(params.data.commandId, state.externalAgentIdentity.agentId);
+    if (!renewed) {
+      const existing = await assignedCommand(state, params.data.commandId, state.externalAgentIdentity.agentId);
+      if (existing?.state === "claimed") await reconcileExpiredClaims(state, state.externalAgentIdentity.agentId);
+      return reply.code(409).send(errorEnvelope(request, "COMMAND_LEASE_LOST", "Command lease could not be renewed."));
+    }
+    return reply.send(renewed);
+  });
   app.post(`${API_PREFIX}/agent/commands/:commandId/complete`, async (request, reply) => {
     if (!authenticateAgentRequest(request, reply, state.externalAgentIdentity)) return reply;
     const params = z.object({ commandId: commandIdSchema }).safeParse(request.params);
@@ -937,7 +1023,12 @@ function registerRoutes(app: FastifyInstance, state: PlatformRepositories, adapt
       await ensureAgentDeploymentLifecycle(state, existing, { status: "succeeded", level: "info", marker: "Agent completed deployment command", message: "Agent completed deployment command; deployment succeeded." });
       return reply.send(existing);
     }
+    if (existing.state === "failed" && existing.failureReason?.includes("lease expired")) return reply.send(existing);
     if (existing.state !== "claimed") return reply.code(409).send(errorEnvelope(request, "COMMAND_STATE_CONFLICT", "Command cannot be completed in its current state."));
+    if (!existing.leaseExpiresAt || new Date(existing.leaseExpiresAt).getTime() <= state.now().getTime()) {
+      await terminallyFailAgentCommand(state, existing, "Agent command lease expired; completion was rejected.", "Agent command lease expired");
+      return reply.code(409).send(errorEnvelope(request, "COMMAND_LEASE_LOST", "Command lease expired."));
+    }
     try {
       await ensureAgentDeploymentLifecycle(state, existing, { status: "succeeded", level: "info", marker: "Agent completed deployment command", message: "Agent completed deployment command; deployment succeeded." });
     } catch (error) {
@@ -954,7 +1045,7 @@ function registerRoutes(app: FastifyInstance, state: PlatformRepositories, adapt
     if (!params.success || !body.success) return reply.code(400).send(errorEnvelope(request, "VALIDATION_ERROR", "Invalid agent command request."));
     const existing = await assignedCommand(state, params.data.commandId, state.externalAgentIdentity.agentId);
     if (!existing) return reply.code(404).send(errorEnvelope(request, "NOT_FOUND", "Command not found."));
-    const safeReason = redactLogMessage(body.data.reason);
+    const safeReason = redactEnvFileForLog(body.data.reason).slice(0, 1024);
     if (existing.state === "failed") {
       await ensureAgentDeploymentLifecycle(state, existing, { status: "failed", level: "error", marker: "Agent reported deployment failure", message: `Agent reported deployment failure: ${safeReason}` });
       return reply.send(existing);
@@ -1280,14 +1371,18 @@ function registerRoutes(app: FastifyInstance, state: PlatformRepositories, adapt
       return reply.code(404).send(errorEnvelope(request, "NOT_FOUND", "Project not found."));
     }
     const body = parseBody(deployRequestSchema, request.body ?? {});
-    let agentId = body.agentId ?? null;
-    if (!agentId) {
-      const onlineAgents = (await state.agents.list()).filter((agent) => agent.status === "online" || agent.status === "stale");
-      agentId = onlineAgents[0]?.id ?? null;
+    if (body.agentId && state.externalAgentIdentity && body.agentId !== state.externalAgentIdentity.agentId) {
+      return reply.code(409).send(errorEnvelope(request, "AGENT_IDENTITY_MISMATCH", "Requested agent is not bound to this control plane."));
     }
-    if (!agentId) {
+    const candidates = body.agentId ? [await state.agents.findById(body.agentId)] : await state.agents.list();
+    const selected = candidates
+      .filter((agent): agent is Agent => Boolean(agent))
+      .map((agent) => state.agentStatus.markStale(agent, state.now()))
+      .find((agent) => agent.status === "online" && (!state.externalAgentIdentity || agent.id === state.externalAgentIdentity.agentId));
+    if (!selected) {
       return reply.code(409).send(errorEnvelope(request, "NO_AGENT_AVAILABLE", "No agent is online. Register an agent or bring one online before deploying."));
     }
+    const agentId = selected.id;
     const commitSha = body.commitSha ?? "0000000";
     const deployment: Deployment = {
       id: createRequestId(),
@@ -1437,6 +1532,17 @@ export async function buildApiApp(options: BuildApiAppOptions = {}): Promise<Fas
   }
   registerCoreHooks(app, corsOrigin);
   registerRoutes(app, repositories.state, repositories.auth, authConfig);
+  if (repositories.state.externalAgentIdentity) {
+    const agentId = repositories.state.externalAgentIdentity.agentId;
+    await reconcileExpiredClaims(repositories.state, agentId);
+    const reconciliationTimer = setInterval(() => {
+      void reconcileExpiredClaims(repositories.state, agentId).catch(() => {
+        if (typeof console !== "undefined") console.error("[deployment-command-reconciliation] reconciliation failed");
+      });
+    }, Math.max(100, options.commandReconciliationIntervalMs ?? 5_000));
+    reconciliationTimer.unref();
+    app.addHook("onClose", () => clearInterval(reconciliationTimer));
+  }
   app.addHook("onClose", () => {
     repositories.state.cancelDeploymentExecutorTimers();
   });

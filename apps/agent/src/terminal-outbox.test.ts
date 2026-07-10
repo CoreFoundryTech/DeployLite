@@ -11,7 +11,7 @@ const commandId = "22222222-2222-4222-8222-222222222222";
 const base: DeploymentCommand = {
   id: commandId, deploymentId: "33333333-3333-4333-8333-333333333333", agentId, kind: "start", state: "claimed", payload: {}, requestedBy: null,
   requestId: "44444444-4444-4444-8444-444444444444", correlationId: "55555555-5555-4555-8555-555555555555",
-  issuedAt: "2026-01-01T00:00:00.000Z", claimedAt: "2026-01-01T00:00:01.000Z", completedAt: null, failureReason: null
+  issuedAt: "2026-01-01T00:00:00.000Z", claimedAt: "2026-01-01T00:00:01.000Z", leaseExpiresAt: "2026-01-01T00:00:31.000Z", completedAt: null, failureReason: null
 };
 const temporaryDirectories: string[] = [];
 
@@ -22,8 +22,9 @@ afterEach(async () => {
 function transport(overrides: Partial<CommandBusClient> = {}): CommandBusClient {
   return {
     claim: vi.fn(async () => base),
-    complete: vi.fn(async () => ({ ...base, state: "completed" as const, completedAt: "2026-01-01T00:00:02.000Z" })),
-    fail: vi.fn(async () => ({ ...base, state: "failed" as const, completedAt: "2026-01-01T00:00:02.000Z", failureReason: "safe" })),
+    renewLease: vi.fn(async () => base),
+    complete: vi.fn(async () => ({ ...base, state: "completed" as const, leaseExpiresAt: null, completedAt: "2026-01-01T00:00:02.000Z" })),
+    fail: vi.fn(async () => ({ ...base, state: "failed" as const, leaseExpiresAt: null, completedAt: "2026-01-01T00:00:02.000Z", failureReason: "safe" })),
     ...overrides
   };
 }
@@ -54,6 +55,14 @@ describe("DurableTerminalCommandBus", () => {
     expect(persisted).not.toContain("extremely-secret-value");
     expect(persisted).not.toContain("TOKEN");
     await expect(new DurableTerminalCommandBus(agentId, transport(), outbox).replayPending()).resolves.toBe(true);
+    expect(await outbox.load()).toEqual([]);
+  });
+
+  it("clears a completion ACK when lease reconciliation already made failed authoritative", async () => {
+    const outbox = new InMemoryTerminalOutbox([{ version: 1, commandId, agentId, action: "complete", createdAt: "2026-01-01T00:00:02.000Z" }]);
+    const reconciled = { ...base, state: "failed" as const, leaseExpiresAt: null, completedAt: "2026-01-01T00:00:32.000Z", failureReason: "Agent command lease expired; execution was not retried." };
+    const bus = new DurableTerminalCommandBus(agentId, transport({ complete: vi.fn(async () => reconciled) }), outbox);
+    await expect(bus.replayPending()).resolves.toBe(true);
     expect(await outbox.load()).toEqual([]);
   });
 });

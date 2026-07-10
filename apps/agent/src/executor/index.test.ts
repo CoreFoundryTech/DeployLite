@@ -8,7 +8,7 @@ import { AgentDeploymentExecutor, assertSafeRuntimePlan, createDeploymentPlan, c
 
 const command: DeploymentCommand = {
   id: "command-1", deploymentId: "deployment-1", agentId: "agent-1", kind: "start", state: "pending", payload: {}, requestedBy: null,
-  requestId: "request-1", correlationId: "correlation-1", issuedAt: "2026-01-01T00:00:00.000Z", claimedAt: null, completedAt: null, failureReason: null
+  requestId: "request-1", correlationId: "correlation-1", issuedAt: "2026-01-01T00:00:00.000Z", claimedAt: null, leaseExpiresAt: null, completedAt: null, failureReason: null
 };
 const executorConfig = { workspaceRoot: "/var/lib/deploylite/workspaces", secretRoot: "/run/deploylite/secrets" };
 const input = { command, repoUrl: "https://github.com/acme/service.git", ref: "main", projectSlug: "service", healthUrl: "http://deploylite-command-1:3000/health", envFile: { contents: "TOKEN=super-secret" } };
@@ -16,7 +16,7 @@ const input = { command, repoUrl: "https://github.com/acme/service.git", ref: "m
 function setup(results = [{ code: 0, stdout: "", stderr: "", timedOut: false }]) {
   const runner: ProcessRunner = { run: vi.fn(async () => results.shift() ?? { code: 0, stdout: "", stderr: "", timedOut: false }) };
   const fail = vi.fn(async () => null);
-  const bus: CommandBusClient = { claim: vi.fn(async () => ({ ...command, state: "claimed" as const })), complete: vi.fn(async () => null), fail };
+  const bus: CommandBusClient = { claim: vi.fn(async () => ({ ...command, state: "claimed" as const, leaseExpiresAt: "2026-01-01T00:00:30.000Z" })), renewLease: vi.fn(async () => null), complete: vi.fn(async () => null), fail };
   const health: HealthProbe = { probe: vi.fn(async () => true) };
   const filesystem: WorkspaceFilesystem = {
     create: vi.fn(async () => undefined),
@@ -91,6 +91,20 @@ describe("AgentDeploymentExecutor", () => {
     expect(result.reason).toBe("Timed out: git");
     expect(test.runner.run).toHaveBeenCalledWith(expect.objectContaining({ command: "git" }), expect.any(Number));
     expect(test.filesystem.remove).toHaveBeenCalled();
+  });
+
+  it("aborts on lease loss, cleans managed resources, and terminally fails", async () => {
+    const test = setup();
+    const controller = new AbortController();
+    vi.mocked(test.runner.run).mockImplementation(async (_plan, _timeout, signal) => {
+      controller.abort();
+      if (signal?.aborted) throw new Error("Deployment execution lease was lost");
+      return { code: 0, stdout: "", stderr: "", timedOut: false };
+    });
+    const result = await test.executor.execute({ ...input, command: { ...input.command, state: "claimed", leaseExpiresAt: "2026-01-01T00:00:30.000Z" } }, controller.signal);
+    expect(result).toMatchObject({ ok: false, reason: "Deployment execution lease was lost" });
+    expect(test.filesystem.remove).toHaveBeenCalled();
+    expect(test.bus.fail).toHaveBeenCalledWith("command-1", "Deployment execution lease was lost");
   });
 
   it("performs explicit trusted Docker cleanup after a build timeout", async () => {
@@ -263,12 +277,13 @@ describe("agent-only Docker socket compose boundary", () => {
     expect(dockerfile).toContain("node:22.14.0-alpine3.21");
     expect(dockerfile).toContain("apk add --no-cache git docker-cli docker-cli-compose");
     expect(dockerfile).toContain('CMD ["node", "apps/agent/dist/main.js"]');
-    for (const runtimePath of ["apps/agent/node_modules", "packages/config/dist", "packages/config/node_modules", "packages/contracts/dist", "packages/contracts/node_modules"]) {
+    for (const runtimePath of ["apps/agent/node_modules", "packages/config/dist", "packages/config/node_modules", "packages/contracts/dist", "packages/contracts/node_modules", "packages/domain/dist", "packages/domain/node_modules"]) {
       expect(dockerfile).toContain(runtimePath);
     }
     const require = createRequire(import.meta.url);
     expect(require.resolve("@deploylite/config")).toMatch(/packages\/config\/dist\/index\.js$/);
     expect(require.resolve("@deploylite/contracts")).toMatch(/packages\/contracts\/dist\/index\.js$/);
+    expect(require.resolve("@deploylite/domain")).toMatch(/packages\/domain\/dist\/index\.js$/);
     expect(require.resolve("zod")).toMatch(/node_modules\/.pnpm\/zod@/);
   });
 

@@ -251,6 +251,7 @@ describe("contracts", () => {
       correlationId: "corr_1",
       issuedAt: now,
       claimedAt: null,
+      leaseExpiresAt: null,
       completedAt: null,
       failureReason: null
     });
@@ -268,6 +269,7 @@ describe("contracts", () => {
       requestedBy: null,
       issuedAt: now,
       claimedAt: null,
+      leaseExpiresAt: null,
       completedAt: null,
       failureReason: null
     });

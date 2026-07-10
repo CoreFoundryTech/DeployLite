@@ -8,7 +8,6 @@ import {
   InMemoryEnvVariableMetadataRepository,
   type ProjectRepository
 } from "@deploylite/domain";
-import { HttpAgentCommandTransport } from "@deploylite/agent";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { buildApiApp } from "./app.js";
 
@@ -20,6 +19,23 @@ const commandId = "55555555-5555-4555-8555-555555555555";
 const token = "agent-token-for-tests-1234567890abcdef";
 const secretKey = "env-secret-key-for-tests-1234567890abcdef";
 const plaintext = "lowercase-private-value-that-must-not-persist";
+
+class TestAgentTransport {
+  constructor(private readonly fetch: typeof globalThis.fetch) {}
+  register(input: unknown, signal: AbortSignal) { return this.request("/api/v1/agent/register", { method: "POST", signal, body: JSON.stringify(input) }); }
+  heartbeat(id: string, observedAt: string, resourceSnapshot: unknown, signal: AbortSignal) { return this.request(`/api/v1/agent/${id}/heartbeat`, { method: "POST", signal, body: JSON.stringify({ agentId: id, observedAt, resourceSnapshot }) }); }
+  poll(id: string, signal: AbortSignal) { return this.request(`/api/v1/agent/commands/next?agentId=${id}`, { method: "GET", signal }); }
+  claim(id: string, assignedAgentId: string) { return this.request(`/api/v1/agent/commands/${id}/claim`, { method: "POST", body: JSON.stringify({ agentId: assignedAgentId }) }); }
+  renewLease(id: string, assignedAgentId: string) { return this.request(`/api/v1/agent/commands/${id}/renew`, { method: "POST", body: JSON.stringify({ agentId: assignedAgentId }) }); }
+  complete(id: string, output?: Record<string, unknown>) { return this.request(`/api/v1/agent/commands/${id}/complete`, { method: "POST", body: JSON.stringify({ output }) }); }
+  fail(id: string, reason: string) { return this.request(`/api/v1/agent/commands/${id}/fail`, { method: "POST", body: JSON.stringify({ reason }) }); }
+  private async request(path: string, init: RequestInit): Promise<any | null> {
+    const response = await this.fetch(new URL(path, "http://api.test"), { ...init, headers: { "content-type": "application/json", authorization: `Bearer ${token}` } });
+    if (response.status === 204) return null;
+    if (!response.ok) throw new Error(`Agent API request failed with status ${response.status}`);
+    return response.json();
+  }
+}
 
 class MemoryProjectRepository implements ProjectRepository {
   readonly projects = new Map<string, Project>();
@@ -42,13 +58,14 @@ function command(overrides: Partial<DeploymentCommand> = {}): DeploymentCommand 
     correlationId: "77777777-7777-4777-8777-777777777777",
     issuedAt: "2026-07-10T00:00:00.000Z",
     claimedAt: null,
+    leaseExpiresAt: null,
     completedAt: null,
     failureReason: null,
     ...overrides
   };
 }
 
-async function fixture(commandOverrides: Partial<DeploymentCommand> = {}, registerAgent = true) {
+async function fixture(commandOverrides: Partial<DeploymentCommand> = {}, registerAgent = true, now: () => Date = () => new Date("2026-07-10T00:00:05.000Z"), commandReconciliationIntervalMs?: number) {
   const agents = new InMemoryAgentRepository();
   const deployments = new InMemoryDeploymentRepository();
   const projects = new MemoryProjectRepository();
@@ -68,7 +85,9 @@ async function fixture(commandOverrides: Partial<DeploymentCommand> = {}, regist
   const app = await buildApiApp({
     db: { pool: {} as never, client: {} as never },
     env: { NODE_ENV: "test", DATABASE_URL: "postgres://user:pass@localhost:5432/deploylite", DEPLOYLITE_AGENT_ID: agentId, DEPLOYLITE_AGENT_TOKEN: token, DEPLOYLITE_SECRET_KEY: secretKey },
-    state: { agents, deployments, projects, deploymentCommands: commands, envMetadata: metadata, envSecretValues: secrets, envSecretMaterialization: secrets, envSecretCipher: cipher }
+    state: { agents, deployments, projects, deploymentCommands: commands, envMetadata: metadata, envSecretValues: secrets, envSecretMaterialization: secrets, envSecretCipher: cipher },
+    now,
+    commandReconciliationIntervalMs
   });
   const fetch = vi.fn<typeof globalThis.fetch>(async (input, init) => {
     const url = new URL(String(input));
@@ -80,11 +99,11 @@ async function fixture(commandOverrides: Partial<DeploymentCommand> = {}, regist
     });
     return new Response(response.statusCode === 204 ? null : response.body, { status: response.statusCode, headers: response.headers as Record<string, string> });
   });
-  const transport = new HttpAgentCommandTransport({ apiUrl: "http://api.test", token, fetch });
-  return { app, agents, commands, deployments, secrets, transport };
+  const transport = new TestAgentTransport(fetch);
+  return { app, agents, commands, deployments, projects, metadata, secrets, transport };
 }
 
-afterEach(() => vi.restoreAllMocks());
+afterEach(() => { vi.useRealTimers(); vi.restoreAllMocks(); });
 
 describe("agent command HTTP transport integration", () => {
   it("registers a fresh agent idempotently and records authenticated heartbeats", async () => {
@@ -130,7 +149,7 @@ describe("agent command HTTP transport integration", () => {
     const { app, commands, deployments } = await fixture();
     const crossQuery = await app.inject({ method: "GET", url: `/api/v1/agent/commands/next?agentId=${otherAgentId}`, headers: { authorization: `Bearer ${token}` } });
     const crossCommandId = "99999999-9999-4999-8999-999999999999";
-    await commands.save(command({ id: crossCommandId, agentId: otherAgentId, state: "claimed", claimedAt: "2026-07-10T00:00:01.000Z" }));
+    await commands.save(command({ id: crossCommandId, agentId: otherAgentId, state: "claimed", claimedAt: "2026-07-10T00:00:01.000Z", leaseExpiresAt: "2026-07-10T00:00:31.000Z" }));
     const headers = { authorization: `Bearer ${token}`, "content-type": "application/json" };
     const crossClaim = await app.inject({ method: "POST", url: `/api/v1/agent/commands/${crossCommandId}/claim`, headers, payload: { agentId } });
     const crossComplete = await app.inject({ method: "POST", url: `/api/v1/agent/commands/${crossCommandId}/complete`, headers, payload: {} });
@@ -147,7 +166,7 @@ describe("agent command HTTP transport integration", () => {
     const consoleError = vi.spyOn(console, "error").mockImplementation(() => undefined);
     const { commands, deployments, secrets, transport } = await fixture();
     const input = await transport.poll(agentId, new AbortController().signal);
-    expect(input).toMatchObject({ command: { id: commandId, agentId, state: "pending" }, repoUrl: "https://github.com/acme/service.git", ref: "abcdef1", projectSlug: projectId, healthUrl: `http://deploylite-${commandId}:3000/` });
+    expect(input).toMatchObject({ command: { id: commandId, agentId, state: "claimed", leaseExpiresAt: expect.any(String) }, repoUrl: "https://github.com/acme/service.git", ref: "abcdef1", projectSlug: projectId, healthUrl: `http://deploylite-${commandId}:3000/` });
     expect(input?.envFile.contents).toBe(`private_key=${plaintext}\n`);
     expect((await transport.claim(commandId, agentId))?.state).toBe("claimed");
     expect((await transport.claim(commandId, agentId))?.state).toBe("claimed");
@@ -168,7 +187,7 @@ describe("agent command HTTP transport integration", () => {
   });
 
   it("fails an assigned claimed command idempotently with a redacted reason", async () => {
-    const { commands, deployments, transport } = await fixture({ state: "claimed", claimedAt: "2026-07-10T00:00:01.000Z" });
+    const { commands, deployments, transport } = await fixture({ state: "claimed", claimedAt: "2026-07-10T00:00:01.000Z", leaseExpiresAt: "2026-07-10T00:00:31.000Z" });
     const reason = `private_key=-----BEGIN PRIVATE KEY-----\n${plaintext}\n-----END PRIVATE KEY-----`;
     expect((await transport.fail(commandId, reason))?.state).toBe("failed");
     expect((await transport.fail(commandId, reason))?.state).toBe("failed");
@@ -182,4 +201,61 @@ describe("agent command HTTP transport integration", () => {
     ]);
     expect(JSON.stringify(logs)).not.toContain(plaintext);
   });
+
+  it("terminally fails an expired claim and its deployment without requeueing or duplicate reconciliation", async () => {
+    let now = new Date("2026-07-10T00:00:05.000Z");
+    const test = await fixture({}, true, () => now);
+    const claimed = await test.transport.poll(agentId, new AbortController().signal);
+    expect(claimed?.command.state).toBe("claimed");
+    now = new Date("2026-07-10T00:00:40.000Z");
+    await expect(test.transport.poll(agentId, new AbortController().signal)).resolves.toBeNull();
+    await expect(test.transport.poll(agentId, new AbortController().signal)).resolves.toBeNull();
+    await expect(test.transport.complete(commandId)).resolves.toMatchObject({ state: "failed" });
+    expect(await test.commands.findById(commandId)).toMatchObject({ state: "failed", failureReason: expect.stringContaining("lease expired") });
+    expect(await test.deployments.findById(deploymentId)).toMatchObject({ status: "failed", finishedAt: expect.any(String) });
+    const logs = await test.deployments.listLogs(deploymentId);
+    expect(logs.filter((log) => log.message.startsWith("Agent command lease expired"))).toHaveLength(1);
+  });
+
+  it("autonomously reconciles a crashed agent claim after lease expiry without another poll", async () => {
+    vi.useFakeTimers();
+    let now = new Date("2026-07-10T00:00:05.000Z");
+    const test = await fixture({}, true, () => now, 100);
+    await test.transport.poll(agentId, new AbortController().signal);
+    now = new Date("2026-07-10T00:00:40.000Z");
+    await vi.advanceTimersByTimeAsync(100);
+    expect(await test.commands.findById(commandId)).toMatchObject({ state: "failed", failureReason: expect.stringContaining("lease expired") });
+    expect(await test.deployments.findById(deploymentId)).toMatchObject({ status: "failed" });
+    await test.app.close();
+    vi.useRealTimers();
+  });
+
+  it("renews a claimed command lease only for the bound agent", async () => {
+    let now = new Date("2026-07-10T00:00:05.000Z");
+    const test = await fixture({}, true, () => now);
+    const claimed = await test.transport.poll(agentId, new AbortController().signal);
+    now = new Date("2026-07-10T00:00:20.000Z");
+    const renewed = await test.transport.renewLease(commandId, agentId);
+    expect(new Date(renewed!.leaseExpiresAt!).getTime()).toBeGreaterThan(new Date(claimed!.command.leaseExpiresAt!).getTime());
+    await expect(test.transport.renewLease(commandId, otherAgentId)).rejects.toThrow("status 403");
+  });
+
+  it.each(["missing-deployment", "missing-project", "invalid-port", "missing-required-secret", "cipher-failure", "unsupported-prerequisite"])(
+    "terminally fails poison command prerequisite: %s",
+    async (scenario) => {
+      const test = await fixture();
+      if (scenario === "missing-deployment") await test.commands.save(command({ deploymentId: otherAgentId }));
+      if (scenario === "missing-project") await test.deployments.save({ ...(await test.deployments.findById(deploymentId))!, projectId: otherAgentId });
+      if (scenario === "invalid-port") await test.projects.save({ ...(await test.projects.findById(projectId))!, port: null });
+      if (scenario === "missing-required-secret") await test.secrets.remove(projectId, "private_key", "project");
+      if (scenario === "cipher-failure") await test.secrets.upsert({ projectId, key: "private_key", scope: "project", encryptedValue: Buffer.from("invalid"), valueFingerprint: "redacted", keyVersion: 1 });
+      if (scenario === "unsupported-prerequisite") await test.commands.save(command({ kind: "restart" }));
+
+      await expect(test.transport.poll(agentId, new AbortController().signal)).resolves.toBeNull();
+      const persisted = await test.commands.findById(commandId);
+      expect(persisted).toMatchObject({ state: "failed", completedAt: expect.any(String), leaseExpiresAt: null });
+      expect(JSON.stringify([persisted, await test.deployments.listLogs(deploymentId)])).not.toContain(plaintext);
+      if (scenario !== "missing-deployment") expect(await test.deployments.findById(deploymentId)).toMatchObject({ status: "failed", finishedAt: expect.any(String) });
+    }
+  );
 });

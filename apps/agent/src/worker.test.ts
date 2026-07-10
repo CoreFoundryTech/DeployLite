@@ -4,10 +4,10 @@ import { AgentWorker, HttpAgentCommandTransport, type AgentCommandTransport } fr
 
 const command: DeploymentCommand = {
   id: "command-1", deploymentId: "deployment-1", agentId: "agent-1", kind: "start", state: "pending", payload: {}, requestedBy: null,
-  requestId: "request-1", correlationId: "correlation-1", issuedAt: "2026-01-01T00:00:00.000Z", claimedAt: null, completedAt: null, failureReason: null
+  requestId: "request-1", correlationId: "correlation-1", issuedAt: "2026-01-01T00:00:00.000Z", claimedAt: null, leaseExpiresAt: null, completedAt: null, failureReason: null
 };
 const input = {
-  command,
+  command: { ...command, state: "claimed" as const, claimedAt: "2026-01-01T00:00:00.000Z", leaseExpiresAt: "2026-01-01T00:00:30.000Z" },
   repoUrl: "https://github.com/acme/service.git",
   ref: "main",
   projectSlug: "service",
@@ -22,7 +22,9 @@ function transport(overrides: Partial<AgentCommandTransport> = {}): AgentCommand
     register: vi.fn(async () => agent),
     heartbeat: vi.fn(async () => agent),
     poll: vi.fn(async () => null),
-    claim: vi.fn(async () => ({ ...command, state: "claimed" as const })),
+    recoverClaimed: vi.fn(async () => null),
+    claim: vi.fn(async () => ({ ...command, state: "claimed" as const, leaseExpiresAt: "2026-01-01T00:00:30.000Z" })),
+    renewLease: vi.fn(async () => ({ ...command, state: "claimed" as const, leaseExpiresAt: "2026-01-01T00:00:30.000Z" })),
     complete: vi.fn(async () => ({ ...command, state: "completed" as const })),
     fail: vi.fn(async () => ({ ...command, state: "failed" as const })),
     ...overrides
@@ -37,7 +39,8 @@ describe("AgentWorker", () => {
       execute: vi.fn(async () => {
         shutdown.abort();
         return { ok: true, dryRun: false, commands: [] };
-      })
+      }),
+      reconcile: vi.fn(async () => ({ ok: false, dryRun: false, commands: [] }))
     };
     const worker = new AgentWorker({ agentId: "agent-1", agentName: "Agent", agentEndpoint: "http://agent.test", transport: commandTransport, executor, resourceCollector: { collect: async () => snapshot }, retryDelayMs: 0 });
 
@@ -45,13 +48,13 @@ describe("AgentWorker", () => {
 
     expect(commandTransport.register).toHaveBeenCalledOnce();
     expect(commandTransport.poll).toHaveBeenCalledWith("agent-1", shutdown.signal);
-    expect(executor.execute).toHaveBeenCalledWith(input);
+    expect(executor.execute).toHaveBeenCalledWith(input, expect.any(AbortSignal));
   });
 
   it("does not execute a command routed to another agent", async () => {
     const shutdown = new AbortController();
     const commandTransport = transport({ poll: vi.fn(async () => ({ ...input, command: { ...command, agentId: "agent-2" } })) });
-    const executor = { execute: vi.fn() };
+    const executor = { execute: vi.fn(), reconcile: vi.fn() };
     const logger = { log: vi.fn(async () => shutdown.abort()) };
     await new AgentWorker({ agentId: "agent-1", agentName: "Agent", agentEndpoint: "http://agent.test", transport: commandTransport, executor, resourceCollector: { collect: async () => snapshot }, logger }).run(shutdown.signal);
     expect(executor.execute).not.toHaveBeenCalled();
@@ -68,15 +71,59 @@ describe("AgentWorker", () => {
     const terminalAcks = { replayPending: vi.fn(async () => { order.push("replay"); return true; }) };
     await new AgentWorker({
       agentId: "agent-1", agentName: "Agent", agentEndpoint: "http://agent.test", transport: commandTransport,
-      executor: { execute: vi.fn() }, resourceCollector: { collect: async () => snapshot }, terminalAcks
+      executor: { execute: vi.fn(), reconcile: vi.fn() }, resourceCollector: { collect: async () => snapshot }, terminalAcks
     }).run(shutdown.signal);
     expect(order).toEqual(["register", "replay", "poll"]);
+  });
+
+  it("reconciles an owned claimed command after the durable outbox and never executes it again", async () => {
+    const shutdown = new AbortController();
+    const order: string[] = [];
+    const commandTransport = transport({
+      register: vi.fn(async () => { order.push("register"); return agent; }),
+      recoverClaimed: vi.fn(async () => { order.push("recover"); return input; }),
+      poll: vi.fn(async () => { order.push("poll"); shutdown.abort(); return null; })
+    });
+    const executor = {
+      execute: vi.fn(),
+      reconcile: vi.fn(async () => { order.push("reconcile"); return { ok: false, dryRun: false, commands: [] }; })
+    };
+    await new AgentWorker({
+      agentId: "agent-1", agentName: "Agent", agentEndpoint: "http://agent.test", transport: commandTransport,
+      executor, resourceCollector: { collect: async () => snapshot },
+      terminalAcks: { replayPending: vi.fn(async () => { order.push("replay"); return true; }) }
+    }).run(shutdown.signal);
+    expect(order).toEqual(["register", "replay", "recover", "reconcile", "poll"]);
+    expect(executor.execute).not.toHaveBeenCalled();
+  });
+
+  it("aborts execution when lease renewal cannot be confirmed and does not execute twice", async () => {
+    const shutdown = new AbortController();
+    const commandTransport = transport({
+      poll: vi.fn(async () => input),
+      renewLease: vi.fn(async () => { throw new Error("network partition"); })
+    });
+    const executor = {
+      reconcile: vi.fn(),
+      execute: vi.fn(async (_input: typeof input, signal?: AbortSignal) => {
+        await new Promise<void>((resolve) => signal!.addEventListener("abort", () => resolve(), { once: true }));
+        shutdown.abort();
+        return { ok: false, dryRun: false, commands: [], reason: "lease lost" };
+      })
+    };
+    await new AgentWorker({
+      agentId: "agent-1", agentName: "Agent", agentEndpoint: "http://agent.test", transport: commandTransport,
+      executor, resourceCollector: { collect: async () => snapshot }, leaseRenewalIntervalMs: 1,
+      wait: async (_milliseconds, signal) => { if (!signal.aborted) await Promise.resolve(); }
+    }).run(shutdown.signal);
+    expect(commandTransport.renewLease).toHaveBeenCalledOnce();
+    expect(executor.execute).toHaveBeenCalledOnce();
   });
 
   it("does not poll or execute while a terminal acknowledgement remains pending", async () => {
     const shutdown = new AbortController();
     const commandTransport = transport();
-    const executor = { execute: vi.fn() };
+    const executor = { execute: vi.fn(), reconcile: vi.fn() };
     const terminalAcks = { replayPending: vi.fn(async () => false) };
     await new AgentWorker({
       agentId: "agent-1", agentName: "Agent", agentEndpoint: "http://agent.test", transport: commandTransport,
@@ -92,7 +139,7 @@ describe("AgentWorker", () => {
     const commandTransport = transport({ poll: vi.fn(async () => { shutdown.abort(); return null; }) });
     await new AgentWorker({
       agentId: "agent-1", agentName: "Agent", agentEndpoint: "http://agent.test", transport: commandTransport,
-      executor: { execute: vi.fn() }, resourceCollector: { collect: async () => snapshot }
+      executor: { execute: vi.fn(), reconcile: vi.fn() }, resourceCollector: { collect: async () => snapshot }
     }).run(shutdown.signal);
     expect(commandTransport.poll).toHaveBeenCalledOnce();
     expect(commandTransport.heartbeat).not.toHaveBeenCalled();
@@ -110,7 +157,7 @@ describe("AgentWorker", () => {
     };
     await new AgentWorker({
       agentId: "agent-1", agentName: "Agent", agentEndpoint: "http://agent.test", transport: commandTransport,
-      executor: { execute: vi.fn() }, resourceCollector: { collect: async () => snapshot }, heartbeatIntervalMs: 1,
+      executor: { execute: vi.fn(), reconcile: vi.fn() }, resourceCollector: { collect: async () => snapshot }, heartbeatIntervalMs: 1,
       now: () => later, wait
     }).run(shutdown.signal);
     expect(commandTransport.heartbeat).toHaveBeenCalledWith("agent-1", later.toISOString(), snapshot, shutdown.signal);

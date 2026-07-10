@@ -3,11 +3,6 @@ import {
   ENCRYPTION_KEY_VERSION,
   type EnvSecretCipher
 } from "@deploylite/config";
-import {
-  materializeMockDeploy,
-  redactEnvFileForLog,
-  type EncryptedEnvRecord
-} from "@deploylite/agent";
 import type {
   AgentStatusService,
   Deployment,
@@ -18,6 +13,7 @@ import type {
   EnvVariableMetadataRepository,
   Project
 } from "@deploylite/domain";
+import { materializeMockDeploy, redactEnvFileForLog, type EncryptedEnvRecord } from "@deploylite/domain";
 
 /**
  * Deterministic set of mock env secret values used by the API's

@@ -18,13 +18,14 @@ const SAFE_REPOSITORY = /^(https:\/\/[^\s]+|git@[A-Za-z0-9._-]+:[A-Za-z0-9._/-]+
 
 export type CommandPlan = { command: string; args: string[]; cwd?: string };
 export type ProcessResult = { code: number; stdout: string; stderr: string; timedOut: boolean };
-export type ProcessRunner = { run(plan: CommandPlan, timeoutMs: number): Promise<ProcessResult> };
+export type ProcessRunner = { run(plan: CommandPlan, timeoutMs: number, signal?: AbortSignal): Promise<ProcessResult> };
 // Structural subset of the Phase 5 command-bus port. Keeping this local avoids
 // an agent -> API dependency while remaining compatible with the shared bus.
 export type CommandBusClient = {
   claim(commandId: string, agentId: string): Promise<DeploymentCommand | null>;
   complete(commandId: string, output?: Record<string, unknown>): Promise<DeploymentCommand | null>;
   fail(commandId: string, reason: string): Promise<DeploymentCommand | null>;
+  renewLease(commandId: string, agentId: string): Promise<DeploymentCommand | null>;
 };
 export type HealthProbe = { probe(url: string, timeoutMs: number): Promise<boolean> };
 export type ExecutorLogger = { log(level: "info" | "error", message: string): Promise<void> | void };
@@ -82,7 +83,7 @@ export function createSpawnProcessRunner(
   killProcessGroup: KillProcessGroup = process.kill
 ): ProcessRunner {
   return {
-    run(plan, timeoutMs) {
+    run(plan, timeoutMs, signal) {
     return new Promise((resolveRun, reject) => {
       const detached = process.platform !== "win32";
       const child = spawnChild(plan.command, plan.args, { cwd: plan.cwd, detached, shell: false, stdio: ["ignore", "pipe", "pipe"] });
@@ -91,12 +92,14 @@ export function createSpawnProcessRunner(
       let timedOut = false;
       let settled = false;
       let terminationTimer: NodeJS.Timeout | undefined;
+      let timeoutTimer: NodeJS.Timeout | undefined;
       const append = (current: string, chunk: Buffer) => (current + chunk.toString()).slice(-MAX_OUTPUT_BYTES);
       const finish = (callback: () => void) => {
         if (settled) return;
         settled = true;
-        clearTimeout(timeoutTimer);
+        if (timeoutTimer) clearTimeout(timeoutTimer);
         if (terminationTimer) clearTimeout(terminationTimer);
+        signal?.removeEventListener("abort", abort);
         callback();
       };
       child.stdout.on("data", (chunk: Buffer) => { stdout = append(stdout, chunk); });
@@ -107,7 +110,13 @@ export function createSpawnProcessRunner(
         }
         child.kill(signal);
       };
-      const timeoutTimer = setTimeout(() => {
+      const abort = () => {
+        terminate("SIGKILL");
+        finish(() => reject(new Error("Deployment execution lease was lost")));
+      };
+      if (signal?.aborted) return abort();
+      signal?.addEventListener("abort", abort, { once: true });
+      timeoutTimer = setTimeout(() => {
         timedOut = true;
         terminate("SIGTERM");
         terminationTimer = setTimeout(() => {
@@ -159,7 +168,7 @@ export class AgentDeploymentExecutor {
     private readonly config: ExecutorConfig = { workspaceRoot: `${AGENT_WORK_BASE}/workspaces`, secretRoot: AGENT_SECRET_BASE }
   ) {}
 
-  async execute(input: DeploymentExecutionInput): Promise<DeploymentExecutionResult> {
+  async execute(input: DeploymentExecutionInput, signal?: AbortSignal): Promise<DeploymentExecutionResult> {
     let plans: CommandPlan[];
     try {
       plans = createDeploymentPlan(input, this.config);
@@ -189,14 +198,14 @@ export class AgentDeploymentExecutor {
     let failure: unknown;
     try {
       await this.filesystem.create(workspace!);
-      for (const plan of plans.slice(0, 3)) await this.run(plan);
+      for (const plan of plans.slice(0, 3)) await this.run(plan, signal);
       buildAttempted = true;
-      await this.run(plans[3]!);
+      await this.run(plans[3]!, signal);
       await this.filesystem.createSecretDirectory(secretDirectory);
       envFileWritten = true;
       await this.filesystem.writeSecretFile(envFilePath, input.envFile.contents);
-      await this.run(plans.at(-1)!);
-      await this.waitForHealth(input.healthUrl);
+      await this.run(plans.at(-1)!, signal);
+      await this.waitForHealth(input.healthUrl, signal);
     } catch (error) {
       failure = error;
     }
@@ -212,14 +221,27 @@ export class AgentDeploymentExecutor {
     return { ok: true, dryRun: false, commands: plans };
   }
 
-  private async run(plan: CommandPlan): Promise<void> {
-    const result = await this.runner.run(plan, MAX_TIMEOUT_MS);
+  async reconcile(input: DeploymentExecutionInput): Promise<DeploymentExecutionResult> {
+    let plans: CommandPlan[] = [];
+    try { plans = createDeploymentPlan(input, this.config); } catch { /* cleanup still uses validated identifiers below */ }
+    await this.cleanupRuntime(input);
+    const workspace = plans[0]?.args.at(-1);
+    if (workspace) await this.bestEffort("Deployment workspace cleanup failed", () => this.filesystem.remove(workspace));
+    const secretDirectory = safeSecretDirectory(this.config.secretRoot, input.command.id);
+    await this.bestEffort("Deployment secret cleanup failed", () => this.filesystem.removeSecretDirectory(secretDirectory));
+    return this.fail(input.command, "Agent restarted with an owned claimed command; execution was not retried.", plans);
+  }
+
+  private async run(plan: CommandPlan, signal?: AbortSignal): Promise<void> {
+    if (signal?.aborted) throw new Error("Deployment execution lease was lost");
+    const result = signal ? await this.runner.run(plan, MAX_TIMEOUT_MS, signal) : await this.runner.run(plan, MAX_TIMEOUT_MS);
     if (result.timedOut) throw new Error(`Timed out: ${plan.command}`);
     if (result.code !== 0) throw new Error(`Command failed: ${plan.command}: ${redactOutput(`${result.stderr}\n${result.stdout}`).trim().slice(0, 1024)}`);
   }
 
-  private async waitForHealth(url: string): Promise<void> {
+  private async waitForHealth(url: string, signal?: AbortSignal): Promise<void> {
     for (const delay of [100, 200, 400, 800, 1_000]) {
+      if (signal?.aborted) throw new Error("Deployment execution lease was lost");
       if (await this.health.probe(url, 1_000)) return;
       await this.wait(delay);
     }

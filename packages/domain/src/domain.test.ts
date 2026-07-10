@@ -105,6 +105,7 @@ describe("domain foundation", () => {
       correlationId: "req_1",
       issuedAt: now.toISOString(),
       claimedAt: null,
+      leaseExpiresAt: null,
       completedAt: null,
       failureReason: null
     };
@@ -113,7 +114,7 @@ describe("domain foundation", () => {
     expect((await commands.findActiveForDeployment("dep_1"))?.state).toBe("pending");
     expect((await commands.findActiveForDeployment("dep_2"))).toBeNull();
 
-    await commands.save({ ...baseCommand, state: "claimed", claimedAt: now.toISOString() });
+    await commands.save({ ...baseCommand, state: "claimed", claimedAt: now.toISOString(), leaseExpiresAt: "2026-01-01T00:00:30.000Z" });
     expect((await commands.findActiveForDeployment("dep_1"))?.state).toBe("claimed");
 
     await commands.save({ ...baseCommand, state: "completed", completedAt: now.toISOString() });

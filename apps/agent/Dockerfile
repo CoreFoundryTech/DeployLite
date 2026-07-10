@@ -4,7 +4,8 @@ COPY package.json pnpm-lock.yaml pnpm-workspace.yaml tsconfig.base.json ./
 COPY apps/agent ./apps/agent
 COPY packages/config ./packages/config
 COPY packages/contracts ./packages/contracts
-RUN corepack enable && pnpm install --frozen-lockfile && pnpm --filter @deploylite/config --filter @deploylite/contracts --filter @deploylite/agent build
+COPY packages/domain ./packages/domain
+RUN corepack enable && pnpm install --frozen-lockfile && pnpm --filter @deploylite/config --filter @deploylite/contracts --filter @deploylite/domain --filter @deploylite/agent build
 
 FROM node:22.14.0-alpine3.21
 WORKDIR /app
@@ -22,4 +23,7 @@ COPY --from=build /app/packages/config/dist ./packages/config/dist
 COPY --from=build /app/packages/contracts/package.json ./packages/contracts/package.json
 COPY --from=build /app/packages/contracts/node_modules ./packages/contracts/node_modules
 COPY --from=build /app/packages/contracts/dist ./packages/contracts/dist
+COPY --from=build /app/packages/domain/package.json ./packages/domain/package.json
+COPY --from=build /app/packages/domain/node_modules ./packages/domain/node_modules
+COPY --from=build /app/packages/domain/dist ./packages/domain/dist
 CMD ["node", "apps/agent/dist/main.js"]

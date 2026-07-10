@@ -12,6 +12,7 @@ import {
   type DeploymentCommandRepository,
   type DeploymentExecutor
 } from "@deploylite/domain";
+import { DEPLOYMENT_COMMAND_LEASE_MS } from "@deploylite/domain";
 
 /**
  * Application-level deployment command bus.
@@ -41,7 +42,7 @@ export class DeploymentCommandBusService implements DeploymentCommandBus {
   readonly #listeners = new Set<DeploymentCommandEventListener>();
   #executor: DeploymentExecutor | null = null;
 
-  constructor(repository: DeploymentCommandRepository) {
+  constructor(repository: DeploymentCommandRepository, private readonly now: () => Date = () => new Date()) {
     this.#repository = repository;
   }
 
@@ -72,6 +73,7 @@ export class DeploymentCommandBusService implements DeploymentCommandBus {
       correlationId: input.correlationId,
       issuedAt,
       claimedAt: null,
+      leaseExpiresAt: null,
       completedAt: null,
       failureReason: null
     };
@@ -89,17 +91,21 @@ export class DeploymentCommandBusService implements DeploymentCommandBus {
       // protect the real agent from a misrouted claim.
       return null;
     }
+    if (existing.state === "claimed") return existing;
     if (!isDeploymentCommandTransitionAllowed(existing.state, "claimed")) {
       return null;
     }
-    const next: DeploymentCommandRecord = {
-      ...existing,
-      state: "claimed",
-      claimedAt: existing.claimedAt ?? new Date().toISOString()
-    };
-    const saved = await this.#repository.save(next);
+    const now = this.now();
+    const claimedAt = now.toISOString();
+    const saved = await this.#repository.claim(existing.id, agentId, claimedAt, new Date(now.getTime() + DEPLOYMENT_COMMAND_LEASE_MS).toISOString());
+    if (!saved) return null;
     await this.#emit("deployment.command.claimed", saved);
     return saved;
+  }
+
+  async renewLease(commandId: string, agentId: string): Promise<DeploymentCommandRecord | null> {
+    const now = this.now();
+    return this.#repository.renewLease(commandId, agentId, now.toISOString(), new Date(now.getTime() + DEPLOYMENT_COMMAND_LEASE_MS).toISOString());
   }
 
   async complete(commandId: string, output?: Record<string, unknown>): Promise<DeploymentCommandRecord | null> {
@@ -112,6 +118,7 @@ export class DeploymentCommandBusService implements DeploymentCommandBus {
       ...existing,
       state: "completed",
       completedAt: new Date().toISOString(),
+      leaseExpiresAt: null,
       payload: output ? { ...existing.payload, output } : existing.payload
     };
     const saved = await this.#repository.save(next);
@@ -129,6 +136,7 @@ export class DeploymentCommandBusService implements DeploymentCommandBus {
       ...existing,
       state: "failed",
       completedAt: new Date().toISOString(),
+      leaseExpiresAt: null,
       failureReason: reason
     };
     const saved = await this.#repository.save(next);
@@ -149,6 +157,7 @@ export class DeploymentCommandBusService implements DeploymentCommandBus {
       ...existing,
       state: "cancelled",
       completedAt: new Date().toISOString(),
+      leaseExpiresAt: null,
       payload: requestedBy ? { ...existing.payload, cancelledBy: requestedBy } : existing.payload
     };
     const saved = await this.#repository.save(next);
