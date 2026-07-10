@@ -1,4 +1,4 @@
-FROM node:22-alpine AS build
+FROM node:22.14.0-alpine3.21 AS build
 WORKDIR /app
 COPY package.json pnpm-lock.yaml pnpm-workspace.yaml tsconfig.base.json ./
 COPY apps/agent ./apps/agent
@@ -6,8 +6,12 @@ COPY packages/config ./packages/config
 COPY packages/contracts ./packages/contracts
 RUN corepack enable && pnpm install --frozen-lockfile && pnpm --filter @deploylite/config --filter @deploylite/contracts --filter @deploylite/agent build
 
-FROM node:22-alpine
+FROM node:22.14.0-alpine3.21
 WORKDIR /app
+# Alpine 3.21 repository packages provide Git plus the Docker CLI and Compose
+# v2 plugin required by the executor. Keep this image on Alpine 3.21 until a
+# deliberate tool-version refresh; Docker socket access remains privileged.
+RUN apk add --no-cache git docker-cli docker-cli-compose
 COPY --from=build /app/node_modules ./node_modules
 COPY --from=build /app/apps/agent/dist ./apps/agent/dist
 COPY --from=build /app/packages/config ./packages/config

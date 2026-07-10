@@ -1,11 +1,13 @@
-import { mkdir, rm } from "node:fs/promises";
+import { chmod, lstat, mkdir, realpath, rm, writeFile } from "node:fs/promises";
 import { spawn } from "node:child_process";
-import { resolve, relative } from "node:path";
+import { dirname, relative, resolve } from "node:path";
 import { redactSecrets } from "@deploylite/config";
 import type { DeploymentCommand } from "@deploylite/contracts";
 
 const MAX_OUTPUT_BYTES = 64 * 1024;
 const MAX_TIMEOUT_MS = 10 * 60 * 1000;
+const TERMINATION_GRACE_MS = 5_000;
+const AGENT_WORK_BASE = "/var/lib/deploylite";
 const SAFE_REF = /^[A-Za-z0-9][A-Za-z0-9._/-]{0,127}$/;
 const SAFE_ID = /^[a-z0-9][a-z0-9-]{0,62}$/;
 const SAFE_REPOSITORY = /^(https:\/\/[^\s]+|git@[A-Za-z0-9._-]+:[A-Za-z0-9._/-]+\.git)$/;
@@ -22,14 +24,23 @@ export type CommandBusClient = {
 };
 export type HealthProbe = { probe(url: string, timeoutMs: number): Promise<boolean> };
 export type ExecutorLogger = { log(level: "info" | "error", message: string): Promise<void> | void };
-export type WorkspaceFilesystem = { create(path: string): Promise<void>; remove(path: string): Promise<void> };
+export type WorkspaceFilesystem = {
+  create(path: string): Promise<void>;
+  remove(path: string): Promise<void>;
+  writeSecretFile(path: string, contents: string): Promise<void>;
+  removeSecretFile(path: string): Promise<void>;
+};
+
+export type ExecutorConfig = { workspaceRoot: string };
+export type SecretEnvFile = { contents: string };
 
 export type DeploymentExecutionInput = {
   command: DeploymentCommand;
   repoUrl: string;
   ref: string;
   projectSlug: string;
-  workspaceRoot: string;
+  /** Decrypted by the trusted agent transport; never included in a command plan or log. */
+  envFile: SecretEnvFile;
   healthUrl: string;
   dryRun?: boolean;
 };
@@ -44,26 +55,76 @@ export type DeploymentExecutionResult = {
  * Spawn-based runner: argv only, no shell, bounded output and timeout. Tests
  * must inject a fake runner; calling this runner performs real side effects.
  */
-export const spawnProcessRunner: ProcessRunner = {
-  run(plan, timeoutMs) {
+export type SpawnedProcess = {
+  stdout: { on(event: "data", listener: (chunk: Buffer) => void): unknown };
+  stderr: { on(event: "data", listener: (chunk: Buffer) => void): unknown };
+  once(event: "error" | "close", listener: (...args: any[]) => void): unknown;
+  kill(signal: NodeJS.Signals): boolean;
+};
+export type SpawnFunction = (command: string, args: string[], options: { cwd?: string; shell: false; stdio: ["ignore", "pipe", "pipe"] }) => SpawnedProcess;
+
+/**
+ * Uses TERM followed by KILL and rejects after the grace period even when a
+ * child ignores signals. The injectable spawn function keeps this testable
+ * without executing a process.
+ */
+export function createSpawnProcessRunner(spawnChild: SpawnFunction = spawn as unknown as SpawnFunction, terminationGraceMs = TERMINATION_GRACE_MS): ProcessRunner {
+  return {
+    run(plan, timeoutMs) {
     return new Promise((resolveRun, reject) => {
-      const child = spawn(plan.command, plan.args, { cwd: plan.cwd, shell: false, stdio: ["ignore", "pipe", "pipe"] });
+      const child = spawnChild(plan.command, plan.args, { cwd: plan.cwd, shell: false, stdio: ["ignore", "pipe", "pipe"] });
       let stdout = "";
       let stderr = "";
       let timedOut = false;
+      let settled = false;
+      let terminationTimer: NodeJS.Timeout | undefined;
       const append = (current: string, chunk: Buffer) => (current + chunk.toString()).slice(-MAX_OUTPUT_BYTES);
+      const finish = (callback: () => void) => {
+        if (settled) return;
+        settled = true;
+        clearTimeout(timeoutTimer);
+        if (terminationTimer) clearTimeout(terminationTimer);
+        callback();
+      };
       child.stdout.on("data", (chunk: Buffer) => { stdout = append(stdout, chunk); });
       child.stderr.on("data", (chunk: Buffer) => { stderr = append(stderr, chunk); });
-      const timer = setTimeout(() => { timedOut = true; child.kill("SIGTERM"); }, Math.min(timeoutMs, MAX_TIMEOUT_MS));
-      child.once("error", (error) => { clearTimeout(timer); reject(error); });
-      child.once("close", (code) => { clearTimeout(timer); resolveRun({ code: code ?? 1, stdout: redactOutput(stdout), stderr: redactOutput(stderr), timedOut }); });
+      const timeoutTimer = setTimeout(() => {
+        timedOut = true;
+        child.kill("SIGTERM");
+        terminationTimer = setTimeout(() => {
+          child.kill("SIGKILL");
+          finish(() => reject(new Error(`Command timed out after ${Math.min(timeoutMs, MAX_TIMEOUT_MS)}ms`)));
+        }, terminationGraceMs);
+      }, Math.min(timeoutMs, MAX_TIMEOUT_MS));
+      child.once("error", (error) => { finish(() => reject(error)); });
+      child.once("close", (code) => { finish(() => resolveRun({ code: code ?? 1, stdout: redactOutput(stdout), stderr: redactOutput(stderr), timedOut })); });
     });
-  }
-};
+    }
+  };
+}
+
+export const spawnProcessRunner = createSpawnProcessRunner();
 
 export const nodeWorkspaceFilesystem: WorkspaceFilesystem = {
-  create: async (path) => { await mkdir(path, { recursive: true, mode: 0o700 }); },
-  remove: async (path) => { await rm(path, { recursive: true, force: true }); }
+  create: async (path) => {
+    const root = await realpath(dirname(path));
+    assertTrustedWorkspaceRoot(root);
+    try {
+      const existing = await lstat(path);
+      if (existing.isSymbolicLink()) throw new Error("Deployment workspace may not be a symbolic link");
+      throw new Error("Deployment workspace already exists");
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+    }
+    await mkdir(path, { mode: 0o700 });
+    if (!isPathInside(root, await realpath(path))) throw new Error("Deployment workspace escaped its trusted root");
+  },
+  remove: async (path) => { await rm(path, { recursive: true, force: true }); },
+  writeSecretFile: async (path, contents) => {
+    await writeFile(path, contents, { encoding: "utf8", mode: 0o600, flag: "wx" });
+    await chmod(path, 0o600);
+  },
+  removeSecretFile: async (path) => { await rm(path, { force: true }); }
 };
 
 export class AgentDeploymentExecutor {
@@ -73,13 +134,14 @@ export class AgentDeploymentExecutor {
     private readonly health: HealthProbe,
     private readonly logger: ExecutorLogger = { log: () => undefined },
     private readonly wait: (milliseconds: number) => Promise<void> = (milliseconds) => new Promise((resolveWait) => setTimeout(resolveWait, milliseconds)),
-    private readonly filesystem: WorkspaceFilesystem = nodeWorkspaceFilesystem
+    private readonly filesystem: WorkspaceFilesystem = nodeWorkspaceFilesystem,
+    private readonly config: ExecutorConfig = { workspaceRoot: `${AGENT_WORK_BASE}/workspaces` }
   ) {}
 
   async execute(input: DeploymentExecutionInput): Promise<DeploymentExecutionResult> {
     let plans: CommandPlan[];
     try {
-      plans = createDeploymentPlan(input);
+      plans = createDeploymentPlan(input, this.config);
     } catch (error) {
       return this.fail(input.command, errorMessage(error), []);
     }
@@ -99,21 +161,33 @@ export class AgentDeploymentExecutor {
     if (!claimed) return { ok: false, dryRun: false, commands: plans, reason: "Command could not be claimed" };
 
     const workspace = plans[0]?.args.at(-1);
+    const envFilePath = resolve(workspace!, ".env");
     let composeStarted = false;
+    let envFileWritten = false;
+    let failure: unknown;
     try {
       await this.filesystem.create(workspace!);
-      for (const plan of plans.slice(0, -1)) await this.run(plan);
+      for (const plan of plans.slice(0, 3)) await this.run(plan);
+      await this.filesystem.writeSecretFile(envFilePath, input.envFile.contents);
+      envFileWritten = true;
+      await this.run(plans[3]!);
       composeStarted = true;
       await this.run(plans.at(-1)!);
       await this.waitForHealth(input.healthUrl);
-      await this.commandBus.complete(claimed.id, { imageTag: imageTag(input.projectSlug, claimed.id), workspace: "[REDACTED]" });
-      return { ok: true, dryRun: false, commands: plans };
     } catch (error) {
-      const reason = errorMessage(error);
+      failure = error;
+    }
+    if (envFileWritten) {
+      try { await this.filesystem.removeSecretFile(envFilePath); }
+      catch (error) { failure ??= new Error("Secret env-file cleanup failed"); await this.logger.log("error", "Secret env-file cleanup failed"); }
+    }
+    if (failure) {
       if (composeStarted) await this.cleanup(plans.at(-1)!);
       if (workspace) await this.filesystem.remove(workspace);
-      return this.fail(claimed, reason, plans);
+      return this.fail(claimed, errorMessage(failure), plans);
     }
+    await this.commandBus.complete(claimed.id, { imageTag: imageTag(input.projectSlug, claimed.id), workspace: "[REDACTED]" });
+    return { ok: true, dryRun: false, commands: plans };
   }
 
   private async run(plan: CommandPlan): Promise<void> {
@@ -144,9 +218,9 @@ export class AgentDeploymentExecutor {
   }
 }
 
-export function createDeploymentPlan(input: DeploymentExecutionInput): CommandPlan[] {
+export function createDeploymentPlan(input: DeploymentExecutionInput, config: ExecutorConfig): CommandPlan[] {
   validateInput(input);
-  const workspace = safeWorkspace(input.workspaceRoot, input.command.id);
+  const workspace = safeWorkspace(config.workspaceRoot, input.command.id);
   const tag = imageTag(input.projectSlug, input.command.id);
   const compose = ["compose", "--project-name", `deploylite-${input.projectSlug}`, "--project-directory", workspace, "up", "--detach", "--remove-orphans"];
   return [
@@ -164,21 +238,36 @@ export function imageTag(projectSlug: string, commandId: string): string {
 }
 
 function validateInput(input: DeploymentExecutionInput): void {
-  if (!SAFE_REPOSITORY.test(input.repoUrl)) throw new Error("Invalid repository URL");
+  if (!SAFE_REPOSITORY.test(input.repoUrl) || hasCredentialedUrl(input.repoUrl)) throw new Error("Invalid repository URL");
   if (!SAFE_REF.test(input.ref) || input.ref.includes("..") || input.ref.startsWith("-")) throw new Error("Invalid git ref");
   imageTag(input.projectSlug, input.command.id);
   if (!/^https?:\/\/[A-Za-z0-9._:-]+(?:\/[^\s]*)?$/.test(input.healthUrl)) throw new Error("Invalid health URL");
+  if (!input.envFile || typeof input.envFile.contents !== "string") throw new Error("A secret env-file is required for deployment");
 }
 
 function safeWorkspace(root: string, commandId: string): string {
+  assertTrustedWorkspaceRoot(root);
   const base = resolve(root);
   const workspace = resolve(base, commandId);
-  if (relative(base, workspace).startsWith("..") || !SAFE_ID.test(commandId)) throw new Error("Invalid deployment workspace");
+  if (!isPathInside(base, workspace) || !SAFE_ID.test(commandId)) throw new Error("Invalid deployment workspace");
   return workspace;
+}
+function assertTrustedWorkspaceRoot(root: string): void {
+  if (!root || !root.startsWith("/")) throw new Error("Deployment workspace root must be absolute");
+  if (!isPathInside(AGENT_WORK_BASE, resolve(root))) throw new Error("Deployment workspace root is outside the allowed agent work base");
+}
+function isPathInside(base: string, target: string): boolean {
+  const path = relative(resolve(base), resolve(target));
+  return path === "" || (!path.startsWith("..") && !path.includes(`..${process.platform === "win32" ? "\\" : "/"}`));
+}
+function hasCredentialedUrl(value: string): boolean {
+  if (!value.startsWith("https://")) return false;
+  try { const url = new URL(value); return Boolean(url.username || url.password); }
+  catch { return true; }
 }
 function publicPlan(plan: CommandPlan): Record<string, unknown> { return { command: plan.command, args: plan.args.map(redact), cwd: plan.cwd ? "[REDACTED]" : undefined }; }
 function render(plan: CommandPlan): string { return `${plan.command} ${plan.args.map(redact).join(" ")}`; }
-function redact(value: string): string { return redactSecrets(value); }
+function redact(value: string): string { return redactSecrets(value.replace(/https:\/\/[^\s/@]+(?::[^\s/@]*)?@/g, "https://[REDACTED]@")); }
 function redactOutput(value: string): string {
   return redact(value).split("\n").map((line) => /^[A-Za-z_][A-Za-z0-9_]{0,63}=/.test(line) ? `${line.slice(0, line.indexOf("="))}=[REDACTED]` : line).join("\n");
 }
