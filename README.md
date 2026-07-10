@@ -50,8 +50,8 @@ DeployLite is designed so AI tools can help operate it without getting broad des
 
 - MCP tools are read-only.
 - Secret-like values pass through shared redaction helpers before leaving a boundary.
-- Deployment control surfaces are split so the API/web/MCP layers do not need direct Docker socket access.
-- Agent-facing work is developed in isolated, reviewable slices before host mutation is enabled.
+- Only the deployment agent mounts the Docker socket; API, Web, MCP, and PostgreSQL do not.
+- Privileged agent changes are kept isolated, explicit, and reviewable.
 
 This is the architectural point: **AI can inspect, summarize, and recommend first; privileged execution stays gated and explicit.**
 
@@ -61,7 +61,7 @@ DeployLite is a private TypeScript monorepo today, structured so the repository 
 
 - `apps/api` — Fastify control-plane API.
 - `apps/web` — Next.js 15 App Router UI.
-- `apps/agent` — deployment agent surface; real executor work is still gated.
+- `apps/agent` — privileged deployment agent and real runtime executor.
 - `apps/mcp` — read-only MCP adapter.
 - `packages/config` — environment parsing, redaction, crypto helpers.
 - `packages/contracts` — shared Zod contracts.
@@ -70,11 +70,14 @@ DeployLite is a private TypeScript monorepo today, structured so the repository 
 
 ## Safety guardrails
 
-- API, web, and MCP do not get direct host mutation powers by default.
+- API, Web, MCP, and PostgreSQL do not mount the Docker socket.
+- The agent intentionally mounts the Docker socket and therefore has host-root-equivalent privilege. A compromised agent must be treated as a compromised host.
+- Separate control-plane/runtime networks and generated runtime restrictions reduce exposure; they do not sandbox a compromised socket-enabled agent.
+- Live activation requires an operational security review and least-privilege host controls.
 - MCP tools are read-only and non-destructive: `deploylite_get_server_status`, `deploylite_list_deployments`, and `deploylite_get_deployment_logs`.
 - Auth is an MVP cookie-session boundary for local administration. It is not a production hardening claim yet.
 - Secret-like values must pass through shared redaction helpers before leaving a boundary.
-- Traefik, ACME, production auth claims, and real Docker execution remain gated until their dedicated phases land.
+- Traefik, ACME, and production auth claims remain gated until their dedicated phases land.
 
 ## Development checks
 
@@ -96,14 +99,14 @@ pnpm check
 | PR3 | `feat/initial-platform-pr3-web-agent-shell` | Static/mock web shell, server status/log views, mock agent heartbeat client, and local-only infra note. |
 | PR4 | `feat/initial-platform-pr4-mcp-docs` | Read-only MCP adapter, cross-surface shape verification, and scaffold docs. |
 
-## Safety guardrails
+## Scaffold history
 
-- No Docker socket deployment-agent access or host mutation is implemented by the app.
+- The deployment agent now intentionally mounts the Docker socket and has host-root-equivalent privilege; API, Web, MCP, and PostgreSQL remain socket-free.
 - Auth is an MVP cookie-session boundary for local administration. It is not a production hardening claim.
 - Secret-like values must pass through shared redaction helpers before leaving a boundary.
-- API, web, agent, and MCP deployment-control surfaces are mock-only in this scaffold.
+- Historical scaffold surfaces were mock-only; the current agent includes a real executor.
 - MCP tools are read-only and non-destructive: `deploylite_get_server_status`, `deploylite_list_deployments`, and `deploylite_get_deployment_logs`.
-- Traefik, ACME, production auth claims, real secret storage, and host shell execution are out of scope.
+- Traefik, ACME, production auth claims, and host shell execution outside the reviewed agent path are out of scope.
 
 ## VPS plug-and-play install
 
@@ -144,7 +147,7 @@ Included:
 
 Deferred non-goals:
 
-- Upgrades, uninstall/reset, backups, firewall mutation, Dokploy access, deployment-agent/server Docker socket integration, Traefik, ACME, domains, and HTTPS automation.
+- Upgrades, uninstall/reset, backups, firewall mutation, Dokploy access, Traefik, ACME, domains, and HTTPS automation.
 
 For local review without starting services, render the Compose configuration with the checked-in example env:
 

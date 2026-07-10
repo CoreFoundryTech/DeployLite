@@ -3,7 +3,7 @@
 This directory contains local-development infrastructure and the first reviewable VPS runtime contract used by `scripts/bootstrap.sh` and `scripts/install.sh`.
 
 - No production Traefik, ACME, DNS, or certificate mutation is performed here.
-- No Docker socket path or host shell command is required by these templates.
+- The deployment agent intentionally mounts the Docker socket; API, Web, MCP, and PostgreSQL do not.
 - Future infrastructure changes must stay behind explicit review and real environment configuration.
 
 ## Local PostgreSQL
@@ -20,6 +20,8 @@ This directory contains local-development infrastructure and the first reviewabl
 - `web` builds `apps/web/Dockerfile`, serves Next.js on container `:3000`, and is temporarily exposed on host `:80`.
 - `deploylite-control-plane` connects PostgreSQL, migrations, API, Web, and the agent. `deploylite-runtime` connects only the agent and dynamically launched project runtimes, so untrusted runtime containers cannot resolve control-plane services through Compose network membership.
 - The agent is the only service on both networks and the only service with the Docker socket mount.
+- Docker socket access gives the agent host-root-equivalent privilege. The network split and generated runtime policy reduce exposure but do not sandbox a compromised agent.
+- Live activation requires an operational security review and least-privilege host controls.
 - Health checks gate API/Web startup where Compose supports dependency conditions.
 
 For local review, render the configuration without starting services:
@@ -60,4 +62,4 @@ On failure, the installer reports changed steps with secret redaction, stops new
 
 ### HTTP-first limits
 
-This slice intentionally uses plain HTTP for reviewability: Web `:80`, API `:3001`, `DEPLOYLITE_SESSION_COOKIE_SECURE=false`, and credentialed CORS only for `DEPLOYLITE_CORS_ORIGIN`. It does not configure Traefik, ACME, domains, HTTPS, firewall rules, backups, upgrades, uninstall/reset, Dokploy, or a deployment agent/server Docker socket. The first owner/admin is still created only in the browser while the user table is empty; no default admin is seeded or documented.
+This slice intentionally uses plain HTTP for reviewability: Web `:80`, API `:3001`, `DEPLOYLITE_SESSION_COOKIE_SECURE=false`, and credentialed CORS only for `DEPLOYLITE_CORS_ORIGIN`. It does not configure Traefik, ACME, domains, HTTPS, firewall rules, backups, upgrades, uninstall/reset, or Dokploy. The first owner/admin is still created only in the browser while the user table is empty; no default admin is seeded or documented.
