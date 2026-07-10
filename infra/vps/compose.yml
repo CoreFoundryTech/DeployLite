@@ -80,10 +80,14 @@ services:
     environment:
       NODE_ENV: production
       DEPLOYLITE_API_URL: http://api:3001
+      DEPLOYLITE_AGENT_ID: ${DEPLOYLITE_AGENT_ID:?DEPLOYLITE_AGENT_ID is required}
+      DEPLOYLITE_AGENT_TOKEN: ${DEPLOYLITE_AGENT_TOKEN:?DEPLOYLITE_AGENT_TOKEN is required}
       DEPLOYLITE_AGENT_WORKSPACE_ROOT: /var/lib/deploylite/workspaces
     volumes:
       - /var/run/docker.sock:/var/run/docker.sock
       - agent-workspaces:/var/lib/deploylite/workspaces
+    tmpfs:
+      - /run/deploylite/secrets:mode=0700,size=16m
     networks:
       - deploylite
 

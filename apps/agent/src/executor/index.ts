@@ -3,11 +3,13 @@ import { spawn } from "node:child_process";
 import { dirname, relative, resolve } from "node:path";
 import { redactSecrets } from "@deploylite/config";
 import type { DeploymentCommand } from "@deploylite/contracts";
+import { redactEnvFileForLog } from "../redaction.js";
 
 const MAX_OUTPUT_BYTES = 64 * 1024;
 const MAX_TIMEOUT_MS = 10 * 60 * 1000;
 const TERMINATION_GRACE_MS = 5_000;
 const AGENT_WORK_BASE = "/var/lib/deploylite";
+const AGENT_SECRET_BASE = "/run/deploylite/secrets";
 const SAFE_REF = /^[A-Za-z0-9][A-Za-z0-9._/-]{0,127}$/;
 const SAFE_ID = /^[a-z0-9][a-z0-9-]{0,62}$/;
 const SAFE_REPOSITORY = /^(https:\/\/[^\s]+|git@[A-Za-z0-9._-]+:[A-Za-z0-9._/-]+\.git)$/;
@@ -27,11 +29,13 @@ export type ExecutorLogger = { log(level: "info" | "error", message: string): Pr
 export type WorkspaceFilesystem = {
   create(path: string): Promise<void>;
   remove(path: string): Promise<void>;
+  createSecretDirectory(path: string): Promise<void>;
+  removeSecretDirectory(path: string): Promise<void>;
   writeSecretFile(path: string, contents: string): Promise<void>;
   removeSecretFile(path: string): Promise<void>;
 };
 
-export type ExecutorConfig = { workspaceRoot: string };
+export type ExecutorConfig = { workspaceRoot: string; secretRoot: string };
 export type SecretEnvFile = { contents: string };
 
 export type DeploymentExecutionInput = {
@@ -56,23 +60,30 @@ export type DeploymentExecutionResult = {
  * must inject a fake runner; calling this runner performs real side effects.
  */
 export type SpawnedProcess = {
+  pid?: number;
   stdout: { on(event: "data", listener: (chunk: Buffer) => void): unknown };
   stderr: { on(event: "data", listener: (chunk: Buffer) => void): unknown };
   once(event: "error" | "close", listener: (...args: any[]) => void): unknown;
   kill(signal: NodeJS.Signals): boolean;
 };
-export type SpawnFunction = (command: string, args: string[], options: { cwd?: string; shell: false; stdio: ["ignore", "pipe", "pipe"] }) => SpawnedProcess;
+export type SpawnFunction = (command: string, args: string[], options: { cwd?: string; detached: boolean; shell: false; stdio: ["ignore", "pipe", "pipe"] }) => SpawnedProcess;
+export type KillProcessGroup = (pid: number, signal: NodeJS.Signals) => void;
 
 /**
- * Uses TERM followed by KILL and rejects after the grace period even when a
- * child ignores signals. The injectable spawn function keeps this testable
- * without executing a process.
+ * Uses a detached process group on POSIX and TERM followed by KILL. This only
+ * bounds the local CLI process tree: Docker daemon work is not cancellable by
+ * killing its client, so the executor also performs labelled resource cleanup.
  */
-export function createSpawnProcessRunner(spawnChild: SpawnFunction = spawn as unknown as SpawnFunction, terminationGraceMs = TERMINATION_GRACE_MS): ProcessRunner {
+export function createSpawnProcessRunner(
+  spawnChild: SpawnFunction = spawn as unknown as SpawnFunction,
+  terminationGraceMs = TERMINATION_GRACE_MS,
+  killProcessGroup: KillProcessGroup = process.kill
+): ProcessRunner {
   return {
     run(plan, timeoutMs) {
     return new Promise((resolveRun, reject) => {
-      const child = spawnChild(plan.command, plan.args, { cwd: plan.cwd, shell: false, stdio: ["ignore", "pipe", "pipe"] });
+      const detached = process.platform !== "win32";
+      const child = spawnChild(plan.command, plan.args, { cwd: plan.cwd, detached, shell: false, stdio: ["ignore", "pipe", "pipe"] });
       let stdout = "";
       let stderr = "";
       let timedOut = false;
@@ -88,11 +99,17 @@ export function createSpawnProcessRunner(spawnChild: SpawnFunction = spawn as un
       };
       child.stdout.on("data", (chunk: Buffer) => { stdout = append(stdout, chunk); });
       child.stderr.on("data", (chunk: Buffer) => { stderr = append(stderr, chunk); });
+      const terminate = (signal: NodeJS.Signals) => {
+        if (detached && child.pid) {
+          try { killProcessGroup(-child.pid, signal); return; } catch { /* fall back to the direct child */ }
+        }
+        child.kill(signal);
+      };
       const timeoutTimer = setTimeout(() => {
         timedOut = true;
-        child.kill("SIGTERM");
+        terminate("SIGTERM");
         terminationTimer = setTimeout(() => {
-          child.kill("SIGKILL");
+          terminate("SIGKILL");
           finish(() => reject(new Error(`Command timed out after ${Math.min(timeoutMs, MAX_TIMEOUT_MS)}ms`)));
         }, terminationGraceMs);
       }, Math.min(timeoutMs, MAX_TIMEOUT_MS));
@@ -120,6 +137,8 @@ export const nodeWorkspaceFilesystem: WorkspaceFilesystem = {
     if (!isPathInside(root, await realpath(path))) throw new Error("Deployment workspace escaped its trusted root");
   },
   remove: async (path) => { await rm(path, { recursive: true, force: true }); },
+  createSecretDirectory: async (path) => { await mkdir(path, { recursive: false, mode: 0o700 }); },
+  removeSecretDirectory: async (path) => { await rm(path, { recursive: true, force: true }); },
   writeSecretFile: async (path, contents) => {
     await writeFile(path, contents, { encoding: "utf8", mode: 0o600, flag: "wx" });
     await chmod(path, 0o600);
@@ -135,7 +154,7 @@ export class AgentDeploymentExecutor {
     private readonly logger: ExecutorLogger = { log: () => undefined },
     private readonly wait: (milliseconds: number) => Promise<void> = (milliseconds) => new Promise((resolveWait) => setTimeout(resolveWait, milliseconds)),
     private readonly filesystem: WorkspaceFilesystem = nodeWorkspaceFilesystem,
-    private readonly config: ExecutorConfig = { workspaceRoot: `${AGENT_WORK_BASE}/workspaces` }
+    private readonly config: ExecutorConfig = { workspaceRoot: `${AGENT_WORK_BASE}/workspaces`, secretRoot: AGENT_SECRET_BASE }
   ) {}
 
   async execute(input: DeploymentExecutionInput): Promise<DeploymentExecutionResult> {
@@ -150,7 +169,7 @@ export class AgentDeploymentExecutor {
         ? input.command
         : await this.commandBus.claim(input.command.id, input.command.agentId);
       if (!claimed) return { ok: false, dryRun: true, commands: plans, reason: "Command could not be claimed" };
-      await this.logger.log("info", `Dry-run deployment ${input.command.id}: ${plans.map(render).join("; ")}`);
+      await this.safeLog("info", `Dry-run deployment ${input.command.id}: ${plans.map(render).join("; ")}`);
       await this.commandBus.complete(claimed.id, { dryRun: true, commands: plans.map(publicPlan) });
       return { ok: true, dryRun: true, commands: plans };
     }
@@ -161,31 +180,32 @@ export class AgentDeploymentExecutor {
     if (!claimed) return { ok: false, dryRun: false, commands: plans, reason: "Command could not be claimed" };
 
     const workspace = plans[0]?.args.at(-1);
-    const envFilePath = resolve(workspace!, ".env");
-    let composeStarted = false;
+    const secretDirectory = safeSecretDirectory(this.config.secretRoot, claimed.id);
+    const envFilePath = resolve(secretDirectory, "runtime.env");
+    let buildAttempted = false;
     let envFileWritten = false;
     let failure: unknown;
     try {
       await this.filesystem.create(workspace!);
       for (const plan of plans.slice(0, 3)) await this.run(plan);
+      buildAttempted = true;
+      await this.run(plans[3]!);
+      await this.filesystem.createSecretDirectory(secretDirectory);
       envFileWritten = true;
       await this.filesystem.writeSecretFile(envFilePath, input.envFile.contents);
-      await this.run(plans[3]!);
-      composeStarted = true;
       await this.run(plans.at(-1)!);
       await this.waitForHealth(input.healthUrl);
     } catch (error) {
       failure = error;
     }
-    if (envFileWritten) {
-      try { await this.filesystem.removeSecretFile(envFilePath); }
-      catch (error) { failure ??= new Error("Secret env-file cleanup failed"); await this.logger.log("error", "Secret env-file cleanup failed"); }
-    }
+    const secretCleanupError = await this.cleanupSecret(envFileWritten, envFilePath, secretDirectory);
+    failure ??= secretCleanupError;
     if (failure) {
-      if (composeStarted) await this.cleanup(plans.at(-1)!);
-      if (workspace) await this.filesystem.remove(workspace);
+      if (buildAttempted) await this.cleanupRuntime(input);
+      if (workspace) await this.bestEffort("Deployment workspace cleanup failed", () => this.filesystem.remove(workspace));
       return this.fail(claimed, errorMessage(failure), plans);
     }
+    if (workspace) await this.bestEffort("Deployment workspace cleanup failed", () => this.filesystem.remove(workspace));
     await this.commandBus.complete(claimed.id, { imageTag: imageTag(input.projectSlug, claimed.id), workspace: "[REDACTED]" });
     return { ok: true, dryRun: false, commands: plans };
   }
@@ -204,15 +224,37 @@ export class AgentDeploymentExecutor {
     throw new Error("Health probe timed out");
   }
 
-  private async cleanup(composeUp: CommandPlan): Promise<void> {
-    const upIndex = composeUp.args.indexOf("up");
-    const cleanup: CommandPlan = { command: "docker", args: [...composeUp.args.slice(0, upIndex), "down", "--remove-orphans"], cwd: composeUp.cwd };
-    try { await this.runner.run(cleanup, 60_000); } catch { await this.logger.log("error", "Partial deployment cleanup failed"); }
+  private async cleanupSecret(written: boolean, envFilePath: string, secretDirectory: string): Promise<Error | undefined> {
+    let cleanupError: Error | undefined;
+    if (written) {
+      try { await this.filesystem.removeSecretFile(envFilePath); }
+      catch { cleanupError = new Error("Secret env-file cleanup failed"); await this.safeLog("error", cleanupError.message); }
+    }
+    try { await this.filesystem.removeSecretDirectory(secretDirectory); }
+    catch { cleanupError ??= new Error("Secret directory cleanup failed"); await this.safeLog("error", "Secret directory cleanup failed"); }
+    return cleanupError;
+  }
+
+  private async cleanupRuntime(input: DeploymentExecutionInput): Promise<void> {
+    const cleanupPlans = createRuntimeCleanupPlans(input);
+    for (const plan of cleanupPlans) {
+      await this.bestEffort("Managed Docker resource cleanup failed", async () => {
+        await this.runner.run(plan, 60_000);
+      });
+    }
+  }
+
+  private async bestEffort(message: string, operation: () => Promise<unknown>): Promise<void> {
+    try { await operation(); } catch (error) { await this.safeLog("error", `${message}: ${errorMessage(error)}`); }
+  }
+
+  private async safeLog(level: "info" | "error", message: string): Promise<void> {
+    try { await this.logger.log(level, redactOutput(message)); } catch { /* logging must not block terminal state */ }
   }
 
   private async fail(command: DeploymentCommand, reason: string, commands: CommandPlan[]): Promise<DeploymentExecutionResult> {
-    const safeReason = redact(reason).slice(0, 1024);
-    await this.logger.log("error", safeReason);
+    const safeReason = redactOutput(reason).slice(0, 1024);
+    await this.safeLog("error", safeReason);
     await this.commandBus.fail(command.id, safeReason);
     return { ok: false, dryRun: false, commands, reason: safeReason };
   }
@@ -222,19 +264,69 @@ export function createDeploymentPlan(input: DeploymentExecutionInput, config: Ex
   validateInput(input);
   const workspace = safeWorkspace(config.workspaceRoot, input.command.id);
   const tag = imageTag(input.projectSlug, input.command.id);
-  const compose = ["compose", "--project-name", `deploylite-${input.projectSlug}`, "--project-directory", workspace, "up", "--detach", "--remove-orphans"];
+  const envFilePath = resolve(safeSecretDirectory(config.secretRoot, input.command.id), "runtime.env");
+  const container = containerName(input.projectSlug, input.command.id);
+  const runtime: CommandPlan = {
+    command: "docker",
+    args: [
+      "run", "--detach", "--name", container,
+      "--label", "com.deploylite.managed=true",
+      "--label", `com.deploylite.command-id=${input.command.id}`,
+      "--read-only", "--cap-drop", "ALL", "--security-opt", "no-new-privileges",
+      "--pids-limit", "256", "--memory", "1g", "--cpus", "1",
+      "--tmpfs", "/tmp:rw,noexec,nosuid,size=64m",
+      "--env-file", envFilePath,
+      tag
+    ]
+  };
+  assertSafeRuntimePlan(runtime);
   return [
     { command: "git", args: ["clone", "--no-checkout", "--depth", "1", input.repoUrl, workspace] },
     { command: "git", args: ["-C", workspace, "fetch", "--depth", "1", "origin", input.ref] },
     { command: "git", args: ["-C", workspace, "checkout", "--detach", "FETCH_HEAD"] },
-    { command: "docker", args: ["build", "--tag", tag, workspace] },
-    { command: "docker", args: compose, cwd: workspace }
+    {
+      command: "docker",
+      args: [
+        "build", "--tag", tag,
+        "--label", "com.deploylite.managed=true",
+        "--label", `com.deploylite.command-id=${input.command.id}`,
+        workspace
+      ]
+    },
+    runtime
   ];
+}
+
+export function createRuntimeCleanupPlans(input: DeploymentExecutionInput): CommandPlan[] {
+  return [
+    { command: "docker", args: ["rm", "--force", containerName(input.projectSlug, input.command.id)] },
+    { command: "docker", args: ["image", "rm", "--force", imageTag(input.projectSlug, input.command.id)] }
+  ];
+}
+
+export function assertSafeRuntimePlan(plan: CommandPlan): true {
+  const forbidden = ["--privileged", "--network", "--pid", "--ipc", "--device", "--cap-add", "--volume", "--mount", "-v"];
+  if (plan.command !== "docker" || plan.args[0] !== "run") throw new Error("Runtime plan must be a controlled docker run");
+  if (plan.args.some((arg) => forbidden.some((option) => arg === option || arg.startsWith(`${option}=`)) || arg.includes("docker.sock"))) {
+    throw new Error("Unsafe Docker runtime option rejected");
+  }
+  for (const required of ["--read-only", "--cap-drop", "--security-opt", "--pids-limit", "--memory", "--cpus", "--env-file"]) {
+    if (!plan.args.includes(required)) throw new Error(`Runtime plan is missing ${required}`);
+  }
+  if (valueAfter(plan.args, "--cap-drop") !== "ALL" || valueAfter(plan.args, "--security-opt") !== "no-new-privileges") {
+    throw new Error("Runtime plan weakens container isolation");
+  }
+  return true;
 }
 
 export function imageTag(projectSlug: string, commandId: string): string {
   if (!SAFE_ID.test(projectSlug) || !SAFE_ID.test(commandId)) throw new Error("Invalid project slug or command id");
   return `deploylite/${projectSlug}:${commandId}`;
+}
+
+export function containerName(projectSlug: string, commandId: string): string {
+  if (!SAFE_ID.test(projectSlug) || !SAFE_ID.test(commandId)) throw new Error("Invalid project slug or command id");
+  return `deploylite-${projectSlug}-${commandId}`;
 }
 
 function validateInput(input: DeploymentExecutionInput): void {
@@ -256,6 +348,12 @@ function assertTrustedWorkspaceRoot(root: string): void {
   if (!root || !root.startsWith("/")) throw new Error("Deployment workspace root must be absolute");
   if (!isPathInside(AGENT_WORK_BASE, resolve(root))) throw new Error("Deployment workspace root is outside the allowed agent work base");
 }
+function safeSecretDirectory(root: string, commandId: string): string {
+  if (resolve(root) !== AGENT_SECRET_BASE || !SAFE_ID.test(commandId)) throw new Error("Invalid deployment secret directory");
+  const directory = resolve(root, commandId);
+  if (!isPathInside(root, directory)) throw new Error("Deployment secret directory escaped its trusted root");
+  return directory;
+}
 function isPathInside(base: string, target: string): boolean {
   const path = relative(resolve(base), resolve(target));
   return path === "" || (!path.startsWith("..") && !path.includes(`..${process.platform === "win32" ? "\\" : "/"}`));
@@ -265,10 +363,14 @@ function hasCredentialedUrl(value: string): boolean {
   try { const url = new URL(value); return Boolean(url.username || url.password); }
   catch { return true; }
 }
+function valueAfter(args: string[], option: string): string | undefined {
+  const index = args.indexOf(option);
+  return index === -1 ? undefined : args[index + 1];
+}
 function publicPlan(plan: CommandPlan): Record<string, unknown> { return { command: plan.command, args: plan.args.map(redact), cwd: plan.cwd ? "[REDACTED]" : undefined }; }
 function render(plan: CommandPlan): string { return `${plan.command} ${plan.args.map(redact).join(" ")}`; }
 function redact(value: string): string { return redactSecrets(value.replace(/https:\/\/[^\s/@]+(?::[^\s/@]*)?@/g, "https://[REDACTED]@")); }
 function redactOutput(value: string): string {
-  return redact(value).split("\n").map((line) => /^[A-Za-z_][A-Za-z0-9_]{0,63}=/.test(line) ? `${line.slice(0, line.indexOf("="))}=[REDACTED]` : line).join("\n");
+  return redactEnvFileForLog(redact(value));
 }
-function errorMessage(error: unknown): string { return error instanceof Error ? error.message : "Deployment executor failed"; }
+function errorMessage(error: unknown): string { return redactOutput(error instanceof Error ? error.message : "Deployment executor failed"); }

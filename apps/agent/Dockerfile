@@ -13,7 +13,13 @@ WORKDIR /app
 # deliberate tool-version refresh; Docker socket access remains privileged.
 RUN apk add --no-cache git docker-cli docker-cli-compose
 COPY --from=build /app/node_modules ./node_modules
+COPY --from=build /app/apps/agent/package.json ./apps/agent/package.json
+COPY --from=build /app/apps/agent/node_modules ./apps/agent/node_modules
 COPY --from=build /app/apps/agent/dist ./apps/agent/dist
-COPY --from=build /app/packages/config ./packages/config
-COPY --from=build /app/packages/contracts ./packages/contracts
-CMD ["node", "apps/agent/dist/index.js"]
+COPY --from=build /app/packages/config/package.json ./packages/config/package.json
+COPY --from=build /app/packages/config/node_modules ./packages/config/node_modules
+COPY --from=build /app/packages/config/dist ./packages/config/dist
+COPY --from=build /app/packages/contracts/package.json ./packages/contracts/package.json
+COPY --from=build /app/packages/contracts/node_modules ./packages/contracts/node_modules
+COPY --from=build /app/packages/contracts/dist ./packages/contracts/dist
+CMD ["node", "apps/agent/dist/main.js"]
