@@ -187,7 +187,7 @@ export class MockDeploymentExecutor implements DeploymentExecutor {
     const next = (this.#sequenceByDeployment.get(deployment.id) ?? 0) + 1;
     this.#sequenceByDeployment.set(deployment.id, next);
     await this.#deployments.appendLog({
-      id: `log_${createRequestId()}`,
+      id: createRequestId(),
       deploymentId: deployment.id,
       sequence: next,
       level,

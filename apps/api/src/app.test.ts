@@ -25,6 +25,7 @@ const password = "correct horse battery staple";
 const testEnvSecretKey = "deploylite-test-env-secret-key-1234567890";
 const testEnvSecretCipher = createEnvSecretCipher(loadEnvSecretKey(testEnvSecretKey));
 const testEnv: NodeJS.ProcessEnv = { ...process.env, DEPLOYLITE_SECRET_KEY: testEnvSecretKey };
+const UUID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
 
 function projectFixture(id = "project-1") {
   return {
@@ -1606,6 +1607,61 @@ describe("DeployLite API scaffold", () => {
 });
 
 describe("Phase 5 slice 1 — DeploymentCommandBus control plane", () => {
+  it("creates UUID-backed agent, project, and deployment records with command-compatible foreign keys", async () => {
+    const deploymentCommands = new InMemoryDeploymentCommandRepository();
+    const { app } = await authFixture({ state: { deploymentCommands } });
+    const cookie = await loginCookie(app);
+
+    const register = await app.inject({
+      method: "POST",
+      url: "/api/v1/agents/register",
+      headers: { ...contentHeaders, cookie },
+      payload: { name: "UUID agent", endpoint: "https://agent.uuid.test" }
+    });
+    const agentId = register.json().data.agent.id as string;
+
+    const createProject = await app.inject({
+      method: "POST",
+      url: "/api/v1/projects",
+      headers: { ...contentHeaders, cookie },
+      payload: { name: "UUID project", repoUrl: "https://github.com/example/uuid-project", defaultBranch: "main", runCommand: "node server.js" }
+    });
+    const projectId = createProject.json().data.project.id as string;
+
+    const trigger = await app.inject({
+      method: "POST",
+      url: `/api/v1/projects/${projectId}/deployments`,
+      headers: { ...contentHeaders, cookie },
+      payload: { agentId, commitSha: "abcdef1" }
+    });
+    const deploymentId = trigger.json().data.deployment.id as string;
+    const commands = await deploymentCommands.list();
+
+    const directCreate = await app.inject({
+      method: "POST",
+      url: "/api/v1/deployments",
+      headers: { ...contentHeaders, cookie },
+      payload: { projectId, agentId, status: "queued", commitSha: "abcdef2" }
+    });
+
+    expect(register.statusCode).toBe(200);
+    expect(createProject.statusCode).toBe(200);
+    expect(trigger.statusCode).toBe(200);
+    expect(directCreate.statusCode).toBe(200);
+    expect(agentId).toMatch(UUID_PATTERN);
+    expect(projectId).toMatch(UUID_PATTERN);
+    expect(deploymentId).toMatch(UUID_PATTERN);
+    expect(directCreate.json().data.deployment.id).toMatch(UUID_PATTERN);
+    expect(commands).toHaveLength(1);
+    expect(commands[0]).toMatchObject({ deploymentId, agentId });
+    expect(commands[0]?.id).toMatch(UUID_PATTERN);
+
+    const logs = await app.inject({ method: "GET", url: `/api/v1/deployments/${deploymentId}/logs`, headers: { cookie } });
+    expect((logs.json().data.events as Array<{ id: string }>).every((event) => UUID_PATTERN.test(event.id))).toBe(true);
+
+    await app.close();
+  });
+
   it("persists a `start` command for every triggered deployment and resolves to `completed` when the lifecycle finishes", async () => {
     const deploymentCommands = new InMemoryDeploymentCommandRepository();
     const { app } = await authFixture({ state: { deploymentCommands } });

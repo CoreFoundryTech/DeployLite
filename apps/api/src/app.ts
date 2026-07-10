@@ -740,7 +740,7 @@ function registerRoutes(app: FastifyInstance, state: PlatformRepositories, adapt
   });
   app.post(`${API_PREFIX}/agents/register`, { preHandler: [requireAuth, requireMutationRole] }, async (request) => {
     const body = parseBody(agentRegistrationSchema, request.body);
-    const agent: Agent = { id: `agent_${createRequestId()}`, name: body.name, endpoint: body.endpoint, status: "offline", lastHeartbeatAt: null, resourceSnapshot: null };
+    const agent: Agent = { id: createRequestId(), name: body.name, endpoint: body.endpoint, status: "offline", lastHeartbeatAt: null, resourceSnapshot: null };
     await state.agents.save(agent);
     return ok(request, { agent, audit: auditMutation(request, "agent.register", "agent", agent.id) });
   });
@@ -758,7 +758,7 @@ function registerRoutes(app: FastifyInstance, state: PlatformRepositories, adapt
   app.post(`${API_PREFIX}/projects`, { preHandler: [requireAuth, requireMutationRole] }, async (request) => {
     const body = parseBody(projectCreateRequestSchema, request.body);
     const project: Project = {
-      id: `project_${createRequestId()}`,
+      id: createRequestId(),
       name: body.name,
       repoUrl: body.repoUrl,
       defaultBranch: body.defaultBranch,
@@ -1023,7 +1023,7 @@ function registerRoutes(app: FastifyInstance, state: PlatformRepositories, adapt
     }
     const commitSha = body.commitSha ?? "0000000";
     const deployment: Deployment = {
-      id: `dep_${createRequestId()}`,
+      id: createRequestId(),
       projectId: project.id,
       agentId,
       status: "queued",
@@ -1066,7 +1066,7 @@ function registerRoutes(app: FastifyInstance, state: PlatformRepositories, adapt
       const existingLogs = await state.deployments.listLogs(deployment.id);
       const sequence = Math.max(0, ...existingLogs.map((event) => event.sequence)) + 1;
       await state.deployments.appendLog({
-        id: `log_${createRequestId()}`,
+        id: createRequestId(),
         deploymentId: deployment.id,
         sequence,
         level: "error",
@@ -1147,7 +1147,7 @@ function registerRoutes(app: FastifyInstance, state: PlatformRepositories, adapt
   });
   app.post(`${API_PREFIX}/deployments`, { preHandler: [requireAuth, requireMutationRole] }, async (request) => {
     const body = parseBody(deploymentSchema.omit({ id: true, startedAt: true, finishedAt: true }), request.body);
-    const deployment: Deployment = { id: `dep_${createRequestId()}`, startedAt: new Date().toISOString(), finishedAt: null, ...body };
+    const deployment: Deployment = { id: createRequestId(), startedAt: new Date().toISOString(), finishedAt: null, ...body };
     await state.deployments.save(deployment);
     return ok(request, { deployment, audit: auditMutation(request, "deployment.create", "deployment", deployment.id) });
   });
