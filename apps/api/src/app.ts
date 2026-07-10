@@ -793,13 +793,22 @@ async function terminallyFailAgentCommand(state: PlatformRepositories, command: 
   return authoritative;
 }
 
+async function terminallyExpireAgentCommand(state: PlatformRepositories, command: DeploymentCommand, reason: string, marker: string): Promise<DeploymentCommand | null> {
+  const safeReason = redactLogMessage(reason).slice(0, INVALID_COMMAND_REASON_MAX);
+  const authoritative = await state.deploymentCommandBus.failExpiredClaim(command.id, safeReason);
+  if (authoritative && authoritative.state !== "claimed") {
+    await projectAuthoritativeTerminalCommand(state, authoritative, { marker, message: `${marker}: ${safeReason}` });
+  }
+  return authoritative;
+}
+
 async function reconcileExpiredClaims(state: PlatformRepositories, agentId: string): Promise<void> {
   const now = state.now().getTime();
   const assigned = (await state.deploymentCommandBus.list()).filter((command) => command.agentId === agentId);
   const claimed = assigned.filter((command) => command.state === "claimed");
   for (const command of claimed) {
     if (!command.leaseExpiresAt || new Date(command.leaseExpiresAt).getTime() <= now) {
-      await terminallyFailAgentCommand(state, command, "Agent command lease expired; execution was not retried.", "Agent command lease expired");
+      await terminallyExpireAgentCommand(state, command, "Agent command lease expired; execution was not retried.", "Agent command lease expired");
     }
   }
   for (const command of assigned) {
@@ -1081,10 +1090,10 @@ function registerRoutes(app: FastifyInstance, state: PlatformRepositories, adapt
     }
     if (existing.state !== "claimed") return reply.code(409).send(errorEnvelope(request, "COMMAND_STATE_CONFLICT", "Command cannot be completed in its current state."));
     if (!existing.leaseExpiresAt || new Date(existing.leaseExpiresAt).getTime() <= state.now().getTime()) {
-      const authoritative = await terminallyFailAgentCommand(state, existing, "Agent command lease expired; completion was rejected.", "Agent command lease expired");
+      const authoritative = await terminallyExpireAgentCommand(state, existing, "Agent command lease expired; completion was rejected.", "Agent command lease expired");
       if (authoritative?.state === "completed") return reply.send(authoritative);
-      if (authoritative) return reply.code(409).send(terminalConflictResponse(request, authoritative, "completed"));
-      return reply.code(404).send(errorEnvelope(request, "NOT_FOUND", "Command not found."));
+      if (authoritative && authoritative.state !== "claimed") return reply.code(409).send(terminalConflictResponse(request, authoritative, "completed"));
+      if (!authoritative) return reply.code(404).send(errorEnvelope(request, "NOT_FOUND", "Command not found."));
     }
     const completed = await state.deploymentCommandBus.complete(existing.id, body.data.output ? redactSecrets(body.data.output) : undefined);
     if (!completed) return reply.code(404).send(errorEnvelope(request, "NOT_FOUND", "Command not found."));

@@ -312,6 +312,30 @@ describe("agent command HTTP transport integration", () => {
     await expect(test.transport.renewLease(commandId, otherAgentId)).rejects.toThrow("status 403");
   });
 
+  it("does not expire a renewed lease from an older reconciliation snapshot", async () => {
+    let now = new Date("2026-07-10T00:00:05.000Z");
+    const test = await fixture({}, true, () => now);
+    await test.transport.poll(agentId, new AbortController().signal);
+    now = new Date("2026-07-10T00:00:20.000Z");
+    await test.transport.renewLease(commandId, agentId);
+    now = new Date("2026-07-10T00:00:40.000Z");
+    await expect(test.transport.poll(agentId, new AbortController().signal)).resolves.toBeNull();
+
+    expect(await test.commands.findById(commandId)).toMatchObject({ state: "claimed", leaseExpiresAt: "2026-07-10T00:00:50.000Z" });
+    expect(await test.deployments.findById(deploymentId)).toMatchObject({ status: "running", finishedAt: null });
+    expect((await test.deployments.listLogs(deploymentId)).filter((log) => log.message.startsWith("Agent command lease expired"))).toHaveLength(0);
+
+    await expect(test.transport.complete(commandId)).resolves.toMatchObject({ state: "completed" });
+    now = new Date("2026-07-10T00:00:51.000Z");
+    await expect(test.transport.poll(agentId, new AbortController().signal)).resolves.toBeNull();
+    await expect(test.transport.poll(agentId, new AbortController().signal)).resolves.toBeNull();
+    expect(await test.commands.findById(commandId)).toMatchObject({ state: "completed" });
+    expect(await test.deployments.findById(deploymentId)).toMatchObject({ status: "succeeded", finishedAt: expect.any(String) });
+    const logs = await test.deployments.listLogs(deploymentId);
+    expect(logs.filter((log) => log.message.startsWith("Agent command lease expired"))).toHaveLength(0);
+    expect(logs.filter((log) => log.message.startsWith("Agent completed deployment command"))).toHaveLength(1);
+  });
+
   it.each(["missing-deployment", "missing-project", "invalid-port", "missing-required-secret", "cipher-failure", "unsupported-prerequisite"])(
     "terminally fails poison command prerequisite: %s",
     async (scenario) => {

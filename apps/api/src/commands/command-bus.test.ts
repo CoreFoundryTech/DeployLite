@@ -21,6 +21,12 @@ const baseInput = {
   correlationId: "corr_1"
 };
 
+function deferred() {
+  let resolve!: () => void;
+  const promise = new Promise<void>((done) => { resolve = done; });
+  return { promise, resolve };
+}
+
 async function newBus(): Promise<DeploymentCommandBusService> {
   const repository = new InMemoryDeploymentCommandRepository();
   return new DeploymentCommandBusService(repository);
@@ -133,6 +139,156 @@ describe("DeploymentCommandBusService", () => {
 
     const second = await bus.cancel(command.id, "user_1");
     expect(second?.state).toBe("cancelled");
+  });
+
+  it.each([
+    { competingState: "completed" as const, winner: "cancelled" as const },
+    { competingState: "completed" as const, winner: "completed" as const },
+    { competingState: "failed" as const, winner: "cancelled" as const },
+    { competingState: "failed" as const, winner: "failed" as const }
+  ])("keeps $winner authoritative in a cancel versus $competingState race", async ({ competingState, winner }) => {
+    const inner = new InMemoryDeploymentCommandRepository();
+    const cancelGate = deferred();
+    const competingGate = deferred();
+    const cancelEntered = deferred();
+    const competingEntered = deferred();
+    const repository: DeploymentCommandRepository = {
+      save: (command) => inner.save(command),
+      claim: (...args) => inner.claim(...args),
+      renewLease: (...args) => inner.renewLease(...args),
+      findById: (id) => inner.findById(id),
+      findActiveForDeployment: (id) => inner.findActiveForDeployment(id),
+      list: () => inner.list(),
+      async transitionTerminal(...args) {
+        const nextState = args[3].state;
+        if (nextState === "cancelled") {
+          cancelEntered.resolve();
+          await cancelGate.promise;
+        } else {
+          competingEntered.resolve();
+          await competingGate.promise;
+        }
+        return inner.transitionTerminal(...args);
+      }
+    };
+    const cancelBus = new DeploymentCommandBusService(repository, () => new Date(NOW));
+    const competingBus = new DeploymentCommandBusService(repository, () => new Date(NOW));
+    const events: DeploymentCommandEvent[] = [];
+    cancelBus.onEvent((event) => { events.push(event); });
+    competingBus.onEvent((event) => { events.push(event); });
+    const command = await cancelBus.submit(baseInput);
+    await cancelBus.claim(command.id, command.agentId);
+
+    const cancelPromise = cancelBus.cancel(command.id, "sk_1234567890secret");
+    const competingPromise = competingState === "completed"
+      ? competingBus.complete(command.id)
+      : competingBus.fail(command.id, "agent failed");
+    await Promise.all([cancelEntered.promise, competingEntered.promise]);
+    if (winner === "cancelled") {
+      cancelGate.resolve();
+      await cancelPromise;
+      competingGate.resolve();
+    } else {
+      competingGate.resolve();
+      await competingPromise;
+      cancelGate.resolve();
+    }
+    const [cancelled, competing] = await Promise.all([cancelPromise, competingPromise]);
+
+    expect(cancelled?.state).toBe(winner);
+    expect(competing?.state).toBe(winner);
+    expect((await inner.findById(command.id))?.state).toBe(winner);
+    const persisted = await inner.findById(command.id);
+    if (winner === "cancelled") {
+      expect(persisted?.payload).toEqual({ cancelledBy: "[REDACTED]" });
+    } else {
+      expect(persisted?.payload).not.toHaveProperty("cancelledBy");
+    }
+    expect(events.filter((event) => ["deployment.command.completed", "deployment.command.failed", "deployment.command.cancelled"].includes(event.type))).toEqual([
+      expect.objectContaining({ type: `deployment.command.${winner}` })
+    ]);
+    await expect(cancelBus.cancel(command.id, "different-user")).resolves.toMatchObject({ state: winner });
+  });
+
+  it("lets a renewal that reaches persistence first defeat expiry of the stale lease snapshot", async () => {
+    const inner = new InMemoryDeploymentCommandRepository();
+    const renewGate = deferred();
+    const expiryGate = deferred();
+    const renewEntered = deferred();
+    const expiryEntered = deferred();
+    const repository: DeploymentCommandRepository = {
+      save: (command) => inner.save(command),
+      claim: (...args) => inner.claim(...args),
+      findById: (id) => inner.findById(id),
+      findActiveForDeployment: (id) => inner.findActiveForDeployment(id),
+      list: () => inner.list(),
+      async renewLease(...args) {
+        renewEntered.resolve();
+        await renewGate.promise;
+        return inner.renewLease(...args);
+      },
+      async transitionTerminal(...args) {
+        expiryEntered.resolve();
+        await expiryGate.promise;
+        return inner.transitionTerminal(...args);
+      }
+    };
+    const claimBus = new DeploymentCommandBusService(repository, () => new Date(NOW));
+    const renewalBus = new DeploymentCommandBusService(repository, () => new Date("2026-01-01T00:00:20.000Z"));
+    const expiryBus = new DeploymentCommandBusService(repository, () => new Date("2026-01-01T00:00:31.000Z"));
+    const command = await claimBus.submit(baseInput);
+    await claimBus.claim(command.id, command.agentId);
+
+    const renewal = renewalBus.renewLease(command.id, command.agentId);
+    const expiry = expiryBus.failExpiredClaim(command.id, "lease expired");
+    await Promise.all([renewEntered.promise, expiryEntered.promise]);
+    renewGate.resolve();
+    await renewal;
+    expiryGate.resolve();
+
+    await expect(expiry).resolves.toMatchObject({ state: "claimed", leaseExpiresAt: "2026-01-01T00:00:50.000Z" });
+    expect(await inner.findById(command.id)).toMatchObject({ state: "claimed", leaseExpiresAt: "2026-01-01T00:00:50.000Z" });
+  });
+
+  it("keeps expiry authoritative when it reaches persistence before renewal", async () => {
+    const inner = new InMemoryDeploymentCommandRepository();
+    const renewGate = deferred();
+    const expiryGate = deferred();
+    const renewEntered = deferred();
+    const expiryEntered = deferred();
+    const repository: DeploymentCommandRepository = {
+      save: (command) => inner.save(command),
+      claim: (...args) => inner.claim(...args),
+      findById: (id) => inner.findById(id),
+      findActiveForDeployment: (id) => inner.findActiveForDeployment(id),
+      list: () => inner.list(),
+      async renewLease(...args) {
+        renewEntered.resolve();
+        await renewGate.promise;
+        return inner.renewLease(...args);
+      },
+      async transitionTerminal(...args) {
+        expiryEntered.resolve();
+        await expiryGate.promise;
+        return inner.transitionTerminal(...args);
+      }
+    };
+    const claimBus = new DeploymentCommandBusService(repository, () => new Date(NOW));
+    const renewalBus = new DeploymentCommandBusService(repository, () => new Date("2026-01-01T00:00:20.000Z"));
+    const expiryBus = new DeploymentCommandBusService(repository, () => new Date("2026-01-01T00:00:31.000Z"));
+    const command = await claimBus.submit(baseInput);
+    await claimBus.claim(command.id, command.agentId);
+
+    const renewal = renewalBus.renewLease(command.id, command.agentId);
+    const expiry = expiryBus.failExpiredClaim(command.id, "lease expired");
+    await Promise.all([renewEntered.promise, expiryEntered.promise]);
+    expiryGate.resolve();
+    await expiry;
+    renewGate.resolve();
+
+    await expect(renewal).resolves.toBeNull();
+    await expect(expiryBus.failExpiredClaim(command.id, "lease expired again")).resolves.toMatchObject({ state: "failed", failureReason: "lease expired" });
+    expect(await inner.findById(command.id)).toMatchObject({ state: "failed", failureReason: "lease expired" });
   });
 
   it("looks up the active command for a deployment and ignores terminal states", async () => {

@@ -170,6 +170,7 @@ export type DeploymentCommandBus = {
   renewLease(commandId: string, agentId: string): Promise<DeploymentCommandRecord | null>;
   complete(commandId: string, output?: Record<string, unknown>): Promise<DeploymentCommandRecord | null>;
   fail(commandId: string, reason: string): Promise<DeploymentCommandRecord | null>;
+  failExpiredClaim(commandId: string, reason: string): Promise<DeploymentCommandRecord | null>;
   cancel(commandId: string, requestedBy: string | null): Promise<DeploymentCommandRecord | null>;
   list(): Promise<DeploymentCommandRecord[]>;
   findById(commandId: string): Promise<DeploymentCommandRecord | null>;
@@ -199,7 +200,8 @@ export type DeploymentCommandRepository = {
     commandId: string,
     agentId: string,
     expectedState: "pending" | "claimed",
-    next: Pick<DeploymentCommandRecord, "state" | "completedAt" | "leaseExpiresAt" | "failureReason" | "payload">
+    next: Pick<DeploymentCommandRecord, "state" | "completedAt" | "leaseExpiresAt" | "failureReason" | "payload">,
+    condition?: { leaseExpiresAtNotAfter: string }
   ): Promise<{ command: DeploymentCommandRecord; applied: boolean } | null>;
   findById(id: string): Promise<DeploymentCommandRecord | null>;
   findActiveForDeployment(deploymentId: string): Promise<DeploymentCommandRecord | null>;
@@ -523,11 +525,15 @@ export class InMemoryDeploymentCommandRepository implements DeploymentCommandRep
     commandId: string,
     agentId: string,
     expectedState: "pending" | "claimed",
-    next: Pick<DeploymentCommandRecord, "state" | "completedAt" | "leaseExpiresAt" | "failureReason" | "payload">
+    next: Pick<DeploymentCommandRecord, "state" | "completedAt" | "leaseExpiresAt" | "failureReason" | "payload">,
+    condition?: { leaseExpiresAtNotAfter: string }
   ): Promise<{ command: DeploymentCommandRecord; applied: boolean } | null> {
     const existing = this.#commands.get(commandId);
     if (!existing || existing.agentId !== agentId) return null;
     if (existing.state !== expectedState) return { command: structuredClone(existing), applied: false };
+    if (condition && (!existing.leaseExpiresAt || existing.leaseExpiresAt > condition.leaseExpiresAtNotAfter)) {
+      return { command: structuredClone(existing), applied: false };
+    }
     const command = structuredClone({ ...existing, ...next });
     this.#commands.set(command.id, command);
     return { command: structuredClone(command), applied: true };

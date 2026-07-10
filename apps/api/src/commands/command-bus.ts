@@ -146,6 +146,26 @@ export class DeploymentCommandBusService implements DeploymentCommandBus {
     return result?.command ?? null;
   }
 
+  async failExpiredClaim(commandId: string, reason: string): Promise<DeploymentCommandRecord | null> {
+    const existing = await this.#repository.findById(commandId);
+    if (!existing) return null;
+    if (existing.state === "completed" || existing.state === "failed" || existing.state === "cancelled") return existing;
+    if (existing.state !== "claimed") return existing;
+    const now = this.now().toISOString();
+    const next: DeploymentCommandRecord = {
+      ...existing,
+      state: "failed",
+      completedAt: now,
+      leaseExpiresAt: null,
+      failureReason: reason
+    };
+    const result = await this.#repository.transitionTerminal(existing.id, existing.agentId, "claimed", next, {
+      leaseExpiresAtNotAfter: now
+    });
+    if (result?.applied) await this.#emit("deployment.command.failed", result.command);
+    return result?.command ?? null;
+  }
+
   async cancel(commandId: string, requestedBy: string | null): Promise<DeploymentCommandRecord | null> {
     const existing = await this.#repository.findById(commandId);
     if (!existing) return null;
@@ -155,16 +175,17 @@ export class DeploymentCommandBusService implements DeploymentCommandBus {
       // row so the caller can treat the request as idempotent.
       return existing;
     }
+    if (existing.state !== "pending" && existing.state !== "claimed") return existing;
     const next: DeploymentCommandRecord = {
       ...existing,
       state: "cancelled",
-      completedAt: new Date().toISOString(),
+      completedAt: this.now().toISOString(),
       leaseExpiresAt: null,
-      payload: requestedBy ? { ...existing.payload, cancelledBy: requestedBy } : existing.payload
+      payload: requestedBy ? { ...existing.payload, cancelledBy: redactSecrets(requestedBy) } : existing.payload
     };
-    const saved = await this.#repository.save(next);
-    await this.#emit("deployment.command.cancelled", saved);
-    return saved;
+    const result = await this.#repository.transitionTerminal(existing.id, existing.agentId, existing.state, next);
+    if (result?.applied) await this.#emit("deployment.command.cancelled", result.command);
+    return result?.command ?? null;
   }
 
   async list(): Promise<DeploymentCommandRecord[]> {
