@@ -46,6 +46,17 @@ describe("AgentDeploymentExecutor", () => {
     expect(vi.mocked(test.runner.run).mock.invocationCallOrder[3]).toBeLessThan(vi.mocked(test.filesystem.writeSecretFile).mock.invocationCallOrder[0]!);
   });
 
+  it("does not fail or clean a healthy runtime when completion acknowledgement delivery fails", async () => {
+    const test = setup();
+    test.bus.complete = vi.fn(async () => { throw new Error("completion ACK lost"); });
+
+    await expect(test.executor.execute(input)).rejects.toThrow("completion ACK lost");
+
+    expect(test.bus.fail).not.toHaveBeenCalled();
+    expect(test.runner.run).not.toHaveBeenCalledWith(expect.objectContaining({ args: ["rm", "--force", "deploylite-command-1"] }), expect.any(Number));
+    expect(test.runner.run).not.toHaveBeenCalledWith(expect.objectContaining({ args: ["image", "rm", "--force", "deploylite/service:command-1"] }), expect.any(Number));
+  });
+
   it("records a redacted command failure and cleans only DeployLite-labelled runtime resources", async () => {
     const test = setup([{ code: 0, stdout: "", stderr: "", timedOut: false }, { code: 0, stdout: "", stderr: "", timedOut: false }, { code: 0, stdout: "", stderr: "", timedOut: false }, { code: 0, stdout: "", stderr: "", timedOut: false }, { code: 1, stdout: "token=super-secret", stderr: "failed", timedOut: false }]);
     const result = await test.executor.execute(input);

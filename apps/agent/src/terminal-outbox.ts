@@ -31,6 +31,15 @@ export type TerminalOutbox = {
   remove(commandId: string): Promise<void>;
 };
 
+function mergeCompatibleRecord(records: TerminalAckRecord[], record: TerminalAckRecord): TerminalAckRecord[] {
+  const existing = records.find((item) => item.commandId === record.commandId);
+  if (!existing) return [...records, record];
+  if (existing.agentId !== record.agentId || existing.action !== record.action) {
+    throw new Error("Conflicting terminal acknowledgement intent");
+  }
+  return records;
+}
+
 export class CorruptTerminalOutboxError extends Error {
   constructor() {
     super("Terminal acknowledgement outbox is corrupt and was quarantined");
@@ -74,9 +83,9 @@ export class FileTerminalOutbox implements TerminalOutbox {
   async put(record: TerminalAckRecord): Promise<void> {
     const parsed = terminalAckRecordSchema.parse(record);
     const records = await this.load();
-    const next = [...records.filter((item) => item.commandId !== parsed.commandId), parsed];
+    const next = mergeCompatibleRecord(records, parsed);
     if (next.length > MAX_RECORDS) throw new Error("Terminal acknowledgement outbox is full");
-    await this.#persist(next);
+    if (next !== records) await this.#persist(next);
   }
 
   async remove(commandId: string): Promise<void> {
@@ -103,7 +112,14 @@ export class InMemoryTerminalOutbox implements TerminalOutbox {
     for (const record of records) this.#records.set(record.commandId, terminalAckRecordSchema.parse(record));
   }
   async load(): Promise<TerminalAckRecord[]> { return structuredClone([...this.#records.values()]); }
-  async put(record: TerminalAckRecord): Promise<void> { this.#records.set(record.commandId, terminalAckRecordSchema.parse(record)); }
+  async put(record: TerminalAckRecord): Promise<void> {
+    const parsed = terminalAckRecordSchema.parse(record);
+    const existing = this.#records.get(parsed.commandId);
+    if (existing && (existing.agentId !== parsed.agentId || existing.action !== parsed.action)) {
+      throw new Error("Conflicting terminal acknowledgement intent");
+    }
+    if (!existing) this.#records.set(parsed.commandId, parsed);
+  }
   async remove(commandId: string): Promise<void> { this.#records.delete(commandId); }
 }
 
@@ -169,7 +185,7 @@ export class DurableTerminalCommandBus implements CommandBusClient {
 
   private async assertReplayAndRemove(commandId: string, state: "completed" | "failed", command: DeploymentCommand | null): Promise<void> {
     const parsed = deploymentCommandSchema.nullable().parse(command);
-    if (!parsed || parsed.id !== commandId || parsed.agentId !== this.agentId || (parsed.state !== state && parsed.state !== "failed")) {
+    if (!parsed || parsed.id !== commandId || parsed.agentId !== this.agentId || parsed.state !== state) {
       throw new Error("Terminal acknowledgement replay did not confirm an authoritative terminal command state");
     }
     await this.outbox.remove(commandId);

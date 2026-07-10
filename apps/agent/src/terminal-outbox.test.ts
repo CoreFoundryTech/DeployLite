@@ -40,6 +40,10 @@ describe("DurableTerminalCommandBus", () => {
     expect(await outbox.load()).toEqual([expect.objectContaining({ commandId, action: "complete" })]);
     expect(JSON.stringify(await outbox.load())).not.toContain("must-not-persist");
 
+    await expect(first.fail(commandId, "must not replace completion")).rejects.toThrow("Conflicting terminal acknowledgement intent");
+    expect(firstTransport.fail).not.toHaveBeenCalled();
+    expect(await outbox.load()).toEqual([expect.objectContaining({ commandId, action: "complete" })]);
+
     const restartedTransport = transport();
     const restarted = new DurableTerminalCommandBus(agentId, restartedTransport, outbox);
     await expect(restarted.replayPending()).resolves.toBe(true);
@@ -58,12 +62,12 @@ describe("DurableTerminalCommandBus", () => {
     expect(await outbox.load()).toEqual([]);
   });
 
-  it("clears a completion ACK when lease reconciliation already made failed authoritative", async () => {
+  it("retains a completion ACK when the API reports a conflicting failed state", async () => {
     const outbox = new InMemoryTerminalOutbox([{ version: 1, commandId, agentId, action: "complete", createdAt: "2026-01-01T00:00:02.000Z" }]);
     const reconciled = { ...base, state: "failed" as const, leaseExpiresAt: null, completedAt: "2026-01-01T00:00:32.000Z", failureReason: "Agent command lease expired; execution was not retried." };
     const bus = new DurableTerminalCommandBus(agentId, transport({ complete: vi.fn(async () => reconciled) }), outbox);
-    await expect(bus.replayPending()).resolves.toBe(true);
-    expect(await outbox.load()).toEqual([]);
+    await expect(bus.replayPending()).resolves.toBe(false);
+    expect(await outbox.load()).toEqual([expect.objectContaining({ commandId, action: "complete" })]);
   });
 });
 
@@ -74,8 +78,9 @@ describe("FileTerminalOutbox", () => {
     const path = join(directory, "state", "terminal.json");
     const outbox = new FileTerminalOutbox(path);
     await outbox.put({ version: 1, commandId, agentId, action: "complete", createdAt: "2026-01-01T00:00:00.000Z" });
+    await expect(outbox.put({ version: 1, commandId, agentId, action: "fail", reason: "safe", createdAt: "2026-01-01T00:00:01.000Z" })).rejects.toThrow("Conflicting terminal acknowledgement intent");
     expect((await stat(path)).mode & 0o777).toBe(0o600);
-    expect(await new FileTerminalOutbox(path).load()).toHaveLength(1);
+    expect(await new FileTerminalOutbox(path).load()).toEqual([expect.objectContaining({ commandId, action: "complete" })]);
     expect((await readFile(path, "utf8"))).not.toContain("token");
   });
 
