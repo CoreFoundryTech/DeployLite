@@ -168,8 +168,11 @@ describe("agent command HTTP transport integration", () => {
     const input = await transport.poll(agentId, new AbortController().signal);
     expect(input).toMatchObject({ command: { id: commandId, agentId, state: "claimed", leaseExpiresAt: expect.any(String) }, repoUrl: "https://github.com/acme/service.git", ref: "abcdef1", projectSlug: projectId, healthUrl: `http://deploylite-${commandId}:3000/` });
     expect(input?.envFile.contents).toBe(`private_key=${plaintext}\n`);
+    expect(await deployments.findById(deploymentId)).toMatchObject({ status: "running", startedAt: "2026-07-10T00:00:00.000Z", finishedAt: null });
+    expect((await deployments.listLogs(deploymentId)).filter((log) => log.message.startsWith("Agent claimed deployment command"))).toHaveLength(1);
     expect((await transport.claim(commandId, agentId))?.state).toBe("claimed");
     expect((await transport.claim(commandId, agentId))?.state).toBe("claimed");
+    expect((await transport.renewLease(commandId, agentId))?.state).toBe("claimed");
     expect((await deployments.findById(deploymentId))?.status).toBe("running");
     expect((await transport.complete(commandId, { token: plaintext }))?.state).toBe("completed");
     expect((await transport.complete(commandId))?.state).toBe("completed");
@@ -184,6 +187,17 @@ describe("agent command HTTP transport integration", () => {
     expect(JSON.stringify(await commands.list())).not.toContain(plaintext);
     expect(JSON.stringify(await secrets.listByProject(projectId))).not.toContain(plaintext);
     expect(consoleError).not.toHaveBeenCalled();
+  });
+
+  it("terminally compensates when poll claim lifecycle persistence fails", async () => {
+    const test = await fixture();
+    vi.spyOn(test.deployments, "save").mockRejectedValueOnce(new Error("running lifecycle write failed"));
+
+    await expect(test.transport.poll(agentId, new AbortController().signal)).rejects.toThrow("status 500");
+
+    expect(await test.commands.findById(commandId)).toMatchObject({ state: "failed", failureReason: expect.stringContaining("lifecycle persistence failed") });
+    expect(await test.deployments.findById(deploymentId)).toMatchObject({ status: "failed", finishedAt: expect.any(String) });
+    expect((await test.deployments.listLogs(deploymentId)).filter((log) => log.message.startsWith("Agent lifecycle persistence failed"))).toHaveLength(1);
   });
 
   it("fails an assigned claimed command idempotently with a redacted reason", async () => {

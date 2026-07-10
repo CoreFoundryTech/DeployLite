@@ -805,10 +805,12 @@ async function ensureAgentDeploymentLifecycle(
   const deployment = await state.deployments.findById(command.deploymentId);
   if (!deployment || deployment.agentId !== command.agentId) throw new Error("Linked deployment is unavailable for agent lifecycle update");
   const terminal = lifecycle.status === "succeeded" || lifecycle.status === "failed";
-  if (deployment.status !== lifecycle.status || (terminal && !deployment.finishedAt)) {
+  const startedAt = lifecycle.status === "running" ? deployment.startedAt ?? state.now().toISOString() : deployment.startedAt;
+  if (deployment.status !== lifecycle.status || deployment.startedAt !== startedAt || (terminal && !deployment.finishedAt)) {
     await state.deployments.save({
       ...deployment,
       status: lifecycle.status,
+      startedAt,
       finishedAt: terminal ? deployment.finishedAt ?? new Date().toISOString() : null
     });
   }
@@ -951,7 +953,15 @@ function registerRoutes(app: FastifyInstance, state: PlatformRepositories, adapt
       try {
         const input = await materializeAgentExecutionInput(state, command);
         const claimed = await state.deploymentCommandBus.claim(command.id, parsed.data.agentId);
-        if (claimed) return reply.send({ ...input, command: claimed });
+        if (claimed) {
+          try {
+            await ensureAgentDeploymentLifecycle(state, claimed, { status: "running", level: "info", marker: "Agent claimed deployment command", message: "Agent claimed deployment command; deployment is running." });
+          } catch (error) {
+            await compensateAgentLifecycleFailure(state, claimed);
+            throw error;
+          }
+          return reply.send({ ...input, command: claimed });
+        }
       } catch (error) {
         if (error instanceof InvalidCommandPrerequisiteError) {
           await terminallyFailAgentCommand(state, command, error.message);
