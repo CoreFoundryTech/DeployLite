@@ -1,10 +1,10 @@
 import { describe, expect, it, vi } from "vitest";
 import {
-  IllegalDeploymentCommandTransitionError,
   InMemoryDeploymentCommandRepository,
   type DeploymentCommandEvent,
   type DeploymentCommandEventListener,
   type DeploymentCommandRecord,
+  type DeploymentCommandRepository,
   type DeploymentExecutor
 } from "@deploylite/domain";
 
@@ -85,7 +85,41 @@ describe("DeploymentCommandBusService", () => {
     await bus.claim(command.id, "agent_1");
     await bus.complete(command.id);
 
-    await expect(bus.fail(command.id, "boom")).rejects.toBeInstanceOf(IllegalDeploymentCommandTransitionError);
+    await expect(bus.fail(command.id, "boom")).resolves.toMatchObject({ state: "completed" });
+  });
+
+  it("lets simultaneous complete and fail transitions elect one authoritative terminal outcome", async () => {
+    const inner = new InMemoryDeploymentCommandRepository();
+    let arrivals = 0;
+    let release!: () => void;
+    const barrier = new Promise<void>((resolve) => { release = resolve; });
+    const repository: DeploymentCommandRepository = {
+      save: (command) => inner.save(command),
+      claim: (...args) => inner.claim(...args),
+      renewLease: (...args) => inner.renewLease(...args),
+      findById: (id) => inner.findById(id),
+      findActiveForDeployment: (id) => inner.findActiveForDeployment(id),
+      list: () => inner.list(),
+      async transitionTerminal(...args) {
+        arrivals += 1;
+        if (arrivals === 2) release();
+        await barrier;
+        return inner.transitionTerminal(...args);
+      }
+    };
+    const completeBus = new DeploymentCommandBusService(repository, () => new Date(NOW));
+    const expiryBus = new DeploymentCommandBusService(repository, () => new Date(NOW));
+    const command = await completeBus.submit(baseInput);
+    await completeBus.claim(command.id, "agent_1");
+
+    const [completeResult, failResult] = await Promise.all([
+      completeBus.complete(command.id),
+      expiryBus.fail(command.id, "lease expired")
+    ]);
+
+    expect(completeResult?.state).toBe(failResult?.state);
+    expect(["completed", "failed"]).toContain(completeResult?.state);
+    expect((await completeBus.findById(command.id))?.state).toBe(completeResult?.state);
   });
 
   it("cancels a pending command idempotently and keeps an already-cancelled command as a no-op", async () => {

@@ -14,6 +14,21 @@ const executionInputSchema = z.object({
   dryRun: z.boolean().optional()
 });
 
+const terminalConflictResponseSchema = z.object({
+  data: z.object({
+    authoritativeCommand: deploymentCommandSchema,
+    attemptedState: z.enum(["completed", "failed"])
+  }),
+  error: z.object({ code: z.literal("AUTHORITATIVE_TERMINAL_CONFLICT") })
+}).passthrough();
+
+export class AuthoritativeTerminalConflictError extends Error {
+  constructor(public readonly authoritativeCommand: DeploymentCommand, public readonly attemptedState: "completed" | "failed") {
+    super("Agent command has a different authoritative terminal outcome");
+    this.name = "AuthoritativeTerminalConflictError";
+  }
+}
+
 export type AgentCommandTransport = CommandBusClient & {
   register(input: AgentRegistrationInput, signal: AbortSignal): Promise<Agent>;
   heartbeat(agentId: string, observedAt: string, resourceSnapshot: ResourceSnapshot, signal: AbortSignal): Promise<Agent>;
@@ -248,6 +263,11 @@ export class HttpAgentCommandTransport implements AgentCommandTransport {
       headers: { ...init.headers, authorization: `Bearer ${this.options.token}` }
     });
     if (response.status === 204) return null;
+    if (response.status === 409) {
+      const parsed = terminalConflictResponseSchema.safeParse(await response.json());
+      if (parsed.success) throw new AuthoritativeTerminalConflictError(parsed.data.data.authoritativeCommand, parsed.data.data.attemptedState);
+      throw new Error("Agent API returned an invalid terminal conflict response");
+    }
     if (!response.ok) throw new Error(`Agent API request failed with status ${response.status}`);
     return response.json();
   }

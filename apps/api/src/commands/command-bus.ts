@@ -111,6 +111,7 @@ export class DeploymentCommandBusService implements DeploymentCommandBus {
   async complete(commandId: string, output?: Record<string, unknown>): Promise<DeploymentCommandRecord | null> {
     const existing = await this.#repository.findById(commandId);
     if (!existing) return null;
+    if (existing.state === "completed" || existing.state === "failed" || existing.state === "cancelled") return existing;
     if (!isDeploymentCommandTransitionAllowed(existing.state, "completed")) {
       throw new IllegalDeploymentCommandTransitionError(existing.state, "completed", commandId);
     }
@@ -121,14 +122,15 @@ export class DeploymentCommandBusService implements DeploymentCommandBus {
       leaseExpiresAt: null,
       payload: output ? { ...existing.payload, output } : existing.payload
     };
-    const saved = await this.#repository.save(next);
-    await this.#emit("deployment.command.completed", saved);
-    return saved;
+    const result = await this.#repository.transitionTerminal(existing.id, existing.agentId, "claimed", next);
+    if (result?.applied) await this.#emit("deployment.command.completed", result.command);
+    return result?.command ?? null;
   }
 
   async fail(commandId: string, reason: string): Promise<DeploymentCommandRecord | null> {
     const existing = await this.#repository.findById(commandId);
     if (!existing) return null;
+    if (existing.state === "completed" || existing.state === "failed" || existing.state === "cancelled") return existing;
     if (!isDeploymentCommandTransitionAllowed(existing.state, "failed")) {
       throw new IllegalDeploymentCommandTransitionError(existing.state, "failed", commandId);
     }
@@ -139,9 +141,9 @@ export class DeploymentCommandBusService implements DeploymentCommandBus {
       leaseExpiresAt: null,
       failureReason: reason
     };
-    const saved = await this.#repository.save(next);
-    await this.#emit("deployment.command.failed", saved);
-    return saved;
+    const result = await this.#repository.transitionTerminal(existing.id, existing.agentId, existing.state, next);
+    if (result?.applied) await this.#emit("deployment.command.failed", result.command);
+    return result?.command ?? null;
   }
 
   async cancel(commandId: string, requestedBy: string | null): Promise<DeploymentCommandRecord | null> {

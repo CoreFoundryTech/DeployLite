@@ -102,6 +102,29 @@ export class DbDeploymentCommandRepository implements DeploymentCommandRepositor
     return row ? toDeploymentCommand(row) : null;
   }
 
+  async transitionTerminal(
+    commandId: string,
+    agentId: string,
+    expectedState: "pending" | "claimed",
+    next: Pick<DeploymentCommandRecord, "state" | "completedAt" | "leaseExpiresAt" | "failureReason" | "payload">
+  ): Promise<{ command: DeploymentCommandRecord; applied: boolean } | null> {
+    const [row] = await this.db.update(deploymentCommands).set({
+      state: next.state,
+      payload: next.payload,
+      completedAt: next.completedAt ? new Date(next.completedAt) : null,
+      leaseExpiresAt: null,
+      failureReason: next.failureReason,
+      updatedAt: new Date()
+    }).where(and(
+      eq(deploymentCommands.id, commandId),
+      eq(deploymentCommands.agentId, agentId),
+      eq(deploymentCommands.state, expectedState)
+    )).returning();
+    if (row) return { command: toDeploymentCommand(row), applied: true };
+    const authoritative = await this.findById(commandId);
+    return authoritative?.agentId === agentId ? { command: authoritative, applied: false } : null;
+  }
+
   async findActiveForDeployment(deploymentId: string): Promise<DeploymentCommandRecord | null> {
     const [row] = await this.db
       .select()

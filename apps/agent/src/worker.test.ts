@@ -134,6 +134,18 @@ describe("AgentWorker", () => {
     expect(executor.execute).not.toHaveBeenCalled();
   });
 
+  it("continues polling after a terminal conflict is authoritatively resolved", async () => {
+    const shutdown = new AbortController();
+    const commandTransport = transport({ poll: vi.fn(async () => { shutdown.abort(); return null; }) });
+    const terminalAcks = { replayPending: vi.fn(async () => true) };
+    await new AgentWorker({
+      agentId: "agent-1", agentName: "Agent", agentEndpoint: "http://agent.test", transport: commandTransport,
+      executor: { execute: vi.fn(), reconcile: vi.fn() }, resourceCollector: { collect: async () => snapshot }, terminalAcks
+    }).run(shutdown.signal);
+    expect(terminalAcks.replayPending).toHaveBeenCalledOnce();
+    expect(commandTransport.poll).toHaveBeenCalledOnce();
+  });
+
   it("stops polling and heartbeat loops on shutdown", async () => {
     const shutdown = new AbortController();
     const commandTransport = transport({ poll: vi.fn(async () => { shutdown.abort(); return null; }) });

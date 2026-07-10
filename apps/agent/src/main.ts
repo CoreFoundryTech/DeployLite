@@ -19,7 +19,9 @@ export async function runAgentEntrypoint(env: NodeJS.ProcessEnv = process.env): 
   const terminalBus = new DurableTerminalCommandBus(
     agentId,
     transport,
-    new FileTerminalOutbox(env.DEPLOYLITE_AGENT_OUTBOX_PATH ?? "/var/lib/deploylite/state/terminal-acks.json")
+    new FileTerminalOutbox(env.DEPLOYLITE_AGENT_OUTBOX_PATH ?? "/var/lib/deploylite/state/terminal-acks.json"),
+    undefined,
+    (event) => logger.log("error", `${event.message} command=${event.commandId} attempted=${event.attemptedState} authoritative=${event.authoritativeState}`)
   );
   const health: HealthProbe = {
     async probe(url, timeoutMs) {

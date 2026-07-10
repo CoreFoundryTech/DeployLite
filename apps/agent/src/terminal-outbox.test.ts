@@ -5,6 +5,7 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 import type { DeploymentCommand } from "@deploylite/contracts";
 import type { CommandBusClient } from "./executor/index.js";
 import { CorruptTerminalOutboxError, DurableTerminalCommandBus, FileTerminalOutbox, InMemoryTerminalOutbox } from "./terminal-outbox.js";
+import { AuthoritativeTerminalConflictError } from "./worker.js";
 
 const agentId = "11111111-1111-4111-8111-111111111111";
 const commandId = "22222222-2222-4222-8222-222222222222";
@@ -62,10 +63,20 @@ describe("DurableTerminalCommandBus", () => {
     expect(await outbox.load()).toEqual([]);
   });
 
-  it("retains a completion ACK when the API reports a conflicting failed state", async () => {
+  it("records and drains a completion intent after an assignment-scoped authoritative failure", async () => {
     const outbox = new InMemoryTerminalOutbox([{ version: 1, commandId, agentId, action: "complete", createdAt: "2026-01-01T00:00:02.000Z" }]);
     const reconciled = { ...base, state: "failed" as const, leaseExpiresAt: null, completedAt: "2026-01-01T00:00:32.000Z", failureReason: "Agent command lease expired; execution was not retried." };
-    const bus = new DurableTerminalCommandBus(agentId, transport({ complete: vi.fn(async () => reconciled) }), outbox);
+    const recordConflict = vi.fn();
+    const bus = new DurableTerminalCommandBus(agentId, transport({ complete: vi.fn(async () => { throw new AuthoritativeTerminalConflictError(reconciled, "completed"); }) }), outbox, undefined, recordConflict);
+    await expect(bus.replayPending()).resolves.toBe(true);
+    expect(recordConflict).toHaveBeenCalledWith(expect.objectContaining({ commandId, agentId, attemptedState: "completed", authoritativeState: "failed" }));
+    expect(await outbox.load()).toEqual([]);
+  });
+
+  it("keeps the monotonic completion intent unless the conflict proves command and assignment identity", async () => {
+    const outbox = new InMemoryTerminalOutbox([{ version: 1, commandId, agentId, action: "complete", createdAt: "2026-01-01T00:00:02.000Z" }]);
+    const foreign = { ...base, id: "foreign-command", state: "failed" as const, leaseExpiresAt: null, completedAt: "2026-01-01T00:00:32.000Z", failureReason: "expired" };
+    const bus = new DurableTerminalCommandBus(agentId, transport({ complete: vi.fn(async () => { throw new AuthoritativeTerminalConflictError(foreign, "completed"); }) }), outbox);
     await expect(bus.replayPending()).resolves.toBe(false);
     expect(await outbox.load()).toEqual([expect.objectContaining({ commandId, action: "complete" })]);
   });
@@ -91,5 +102,25 @@ describe("FileTerminalOutbox", () => {
     await writeFile(path, "{not-json", { mode: 0o644 });
     await chmod(path, 0o644);
     await expect(new FileTerminalOutbox(path).load()).rejects.toBeInstanceOf(CorruptTerminalOutboxError);
+  });
+
+  it("replays after restart, drains only the proven conflict, and processes unrelated records", async () => {
+    const directory = await mkdtemp(join(tmpdir(), "deploylite-outbox-restart-"));
+    temporaryDirectories.push(directory);
+    const path = join(directory, "terminal.json");
+    const first = new FileTerminalOutbox(path);
+    const otherCommandId = "66666666-6666-4666-8666-666666666666";
+    await first.put({ version: 1, commandId, agentId, action: "complete", createdAt: "2026-01-01T00:00:00.000Z" });
+    await first.put({ version: 1, commandId: otherCommandId, agentId, action: "complete", createdAt: "2026-01-01T00:00:01.000Z" });
+    const reconciled = { ...base, state: "failed" as const, leaseExpiresAt: null, completedAt: "2026-01-01T00:00:32.000Z", failureReason: "lease expired" };
+    const complete = vi.fn(async (id: string) => {
+      if (id === commandId) throw new AuthoritativeTerminalConflictError(reconciled, "completed");
+      return { ...base, id, state: "completed" as const, leaseExpiresAt: null, completedAt: "2026-01-01T00:00:02.000Z" };
+    });
+
+    const restarted = new DurableTerminalCommandBus(agentId, transport({ complete }), new FileTerminalOutbox(path));
+    await expect(restarted.replayPending()).resolves.toBe(true);
+    expect(complete).toHaveBeenCalledTimes(2);
+    expect(await new FileTerminalOutbox(path).load()).toEqual([]);
   });
 });

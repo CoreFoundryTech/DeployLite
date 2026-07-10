@@ -1,3 +1,4 @@
+import { readFile } from "node:fs/promises";
 import { describe, expect, it } from "vitest";
 
 import type { DeploymentCommandRow } from "../schema.js";
@@ -61,5 +62,14 @@ describe("deployment command bus persistence mapping", () => {
     // surface as `undefined` from the helper and is treated as a
     // programming error by callers.
     expect((describeDeploymentCommandEventType as (state: string) => unknown)("unknown")).toBeUndefined();
+  });
+
+  it("guards terminal updates with command, assignment, and expected-state predicates", async () => {
+    const source = await readFile(new URL("./deployment-commands.ts", import.meta.url), "utf8");
+    const method = source.slice(source.indexOf("async transitionTerminal"), source.indexOf("async findActiveForDeployment"));
+    expect(method).toContain("eq(deploymentCommands.id, commandId)");
+    expect(method).toContain("eq(deploymentCommands.agentId, agentId)");
+    expect(method).toContain("eq(deploymentCommands.state, expectedState)");
+    expect(method).toContain("const authoritative = await this.findById(commandId)");
   });
 });

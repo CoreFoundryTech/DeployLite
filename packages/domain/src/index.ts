@@ -195,6 +195,12 @@ export type DeploymentCommandRepository = {
   save(command: DeploymentCommandRecord): Promise<DeploymentCommandRecord>;
   claim(commandId: string, agentId: string, claimedAt: string, leaseExpiresAt: string): Promise<DeploymentCommandRecord | null>;
   renewLease(commandId: string, agentId: string, now: string, leaseExpiresAt: string): Promise<DeploymentCommandRecord | null>;
+  transitionTerminal(
+    commandId: string,
+    agentId: string,
+    expectedState: "pending" | "claimed",
+    next: Pick<DeploymentCommandRecord, "state" | "completedAt" | "leaseExpiresAt" | "failureReason" | "payload">
+  ): Promise<{ command: DeploymentCommandRecord; applied: boolean } | null>;
   findById(id: string): Promise<DeploymentCommandRecord | null>;
   findActiveForDeployment(deploymentId: string): Promise<DeploymentCommandRecord | null>;
   list(): Promise<DeploymentCommandRecord[]>;
@@ -364,7 +370,7 @@ export class InMemoryAgentRepository implements AgentRepository {
 export class AgentStatusService {
   constructor(private readonly agents: AgentRepository) {}
 
-  async recordHeartbeat(heartbeat: AgentHeartbeat): Promise<Agent> {
+  async recordHeartbeat(heartbeat: AgentHeartbeat, receivedAt = new Date()): Promise<Agent> {
     const existing = await this.agents.findById(heartbeat.agentId);
     if (!existing) {
       throw new Error("Agent is not registered");
@@ -373,7 +379,7 @@ export class AgentStatusService {
     const updated: Agent = {
       ...existing,
       status: "online",
-      lastHeartbeatAt: heartbeat.observedAt,
+      lastHeartbeatAt: receivedAt.toISOString(),
       resourceSnapshot: heartbeat.resourceSnapshot
     };
     return this.agents.save(updated);
@@ -511,6 +517,20 @@ export class InMemoryDeploymentCommandRepository implements DeploymentCommandRep
     const existing = this.#commands.get(commandId);
     if (!existing || existing.agentId !== agentId || existing.state !== "claimed" || !existing.leaseExpiresAt || existing.leaseExpiresAt <= now) return null;
     return this.save({ ...existing, leaseExpiresAt });
+  }
+
+  async transitionTerminal(
+    commandId: string,
+    agentId: string,
+    expectedState: "pending" | "claimed",
+    next: Pick<DeploymentCommandRecord, "state" | "completedAt" | "leaseExpiresAt" | "failureReason" | "payload">
+  ): Promise<{ command: DeploymentCommandRecord; applied: boolean } | null> {
+    const existing = this.#commands.get(commandId);
+    if (!existing || existing.agentId !== agentId) return null;
+    if (existing.state !== expectedState) return { command: structuredClone(existing), applied: false };
+    const command = structuredClone({ ...existing, ...next });
+    this.#commands.set(command.id, command);
+    return { command: structuredClone(command), applied: true };
   }
 
   async findById(id: string): Promise<DeploymentCommandRecord | null> {

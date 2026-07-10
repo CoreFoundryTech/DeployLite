@@ -1,6 +1,7 @@
 import { createEnvSecretCipher, loadEnvSecretKey } from "@deploylite/config";
 import type { Agent, Deployment, DeploymentCommand, Project } from "@deploylite/contracts";
 import {
+  AgentStatusService,
   InMemoryAgentRepository,
   InMemoryDeploymentCommandRepository,
   InMemoryDeploymentRepository,
@@ -107,15 +108,40 @@ afterEach(() => { vi.useRealTimers(); vi.restoreAllMocks(); });
 
 describe("agent command HTTP transport integration", () => {
   it("registers a fresh agent idempotently and records authenticated heartbeats", async () => {
-    const { agents, transport } = await fixture({}, false);
+    let now = new Date("2026-07-10T00:00:05.000Z");
+    const { agents, transport } = await fixture({}, false, () => now);
     const resourceSnapshot = { cpuLoad: 0.2, memoryUsedBytes: 10, memoryTotalBytes: 100, diskUsedBytes: 20, diskTotalBytes: 200 };
     const registration = { agentId, name: "Production agent", endpoint: "http://agent:3002", observedAt: "2026-07-10T00:00:00.000Z", resourceSnapshot };
     await expect(transport.poll(agentId, new AbortController().signal)).resolves.toBeNull();
-    await expect(transport.register(registration, new AbortController().signal)).resolves.toMatchObject({ id: agentId, status: "online", lastHeartbeatAt: registration.observedAt });
+    await expect(transport.register(registration, new AbortController().signal)).resolves.toMatchObject({ id: agentId, status: "online", lastHeartbeatAt: now.toISOString() });
     await expect(transport.register({ ...registration, name: "Production agent restarted" }, new AbortController().signal)).resolves.toMatchObject({ id: agentId, name: "Production agent restarted" });
-    await expect(transport.heartbeat(agentId, "2026-07-10T00:00:30.000Z", { ...resourceSnapshot, cpuLoad: 0.3 }, new AbortController().signal)).resolves.toMatchObject({ id: agentId, status: "online", lastHeartbeatAt: "2026-07-10T00:00:30.000Z", resourceSnapshot: { cpuLoad: 0.3 } });
-    expect(await agents.findById(agentId)).toMatchObject({ status: "online", lastHeartbeatAt: "2026-07-10T00:00:30.000Z" });
+    now = new Date("2026-07-10T00:00:30.000Z");
+    await expect(transport.heartbeat(agentId, "2026-07-10T00:00:29.000Z", { ...resourceSnapshot, cpuLoad: 0.3 }, new AbortController().signal)).resolves.toMatchObject({ id: agentId, status: "online", lastHeartbeatAt: now.toISOString(), resourceSnapshot: { cpuLoad: 0.3 } });
+    await expect(transport.heartbeat(agentId, "2026-07-10T01:00:30.000Z", resourceSnapshot, new AbortController().signal)).rejects.toThrow("status 400");
+    expect(await agents.findById(agentId)).toMatchObject({ status: "online", lastHeartbeatAt: now.toISOString() });
     expect(await agents.list()).toHaveLength(1);
+  });
+
+  it("rejects future and past observedAt skew without making an agent eligible", async () => {
+    const { agents, commands, transport } = await fixture({}, false, () => new Date("2026-07-10T00:05:00.000Z"));
+    const resourceSnapshot = { cpuLoad: 0.2, memoryUsedBytes: 10, memoryTotalBytes: 100, diskUsedBytes: 20, diskTotalBytes: 200 };
+    const registration = { agentId, name: "Skewed agent", endpoint: "http://agent:3002", resourceSnapshot };
+    await expect(transport.register({ ...registration, observedAt: "2026-07-10T01:05:00.000Z" }, new AbortController().signal)).rejects.toThrow("status 400");
+    await expect(transport.register({ ...registration, observedAt: "2026-07-09T23:05:00.000Z" }, new AbortController().signal)).rejects.toThrow("status 400");
+    await expect(transport.poll(agentId, new AbortController().signal)).resolves.toBeNull();
+    expect(await agents.list()).toEqual([]);
+    expect((await commands.findById(commandId))?.state).toBe("pending");
+  });
+
+  it("uses server receipt time for freshness and becomes stale after the server threshold", async () => {
+    let now = new Date("2026-07-10T00:05:00.000Z");
+    const test = await fixture({}, false, () => now);
+    const resourceSnapshot = { cpuLoad: 0.2, memoryUsedBytes: 10, memoryTotalBytes: 100, diskUsedBytes: 20, diskTotalBytes: 200 };
+    await test.transport.register({ agentId, name: "Agent", endpoint: "http://agent:3002", observedAt: "2026-07-10T00:05:30.000Z", resourceSnapshot }, new AbortController().signal);
+    expect((await test.agents.findById(agentId))?.lastHeartbeatAt).toBe("2026-07-10T00:05:00.000Z");
+    now = new Date("2026-07-10T00:06:01.001Z");
+    const stored = await test.agents.findById(agentId);
+    expect(stored && new AgentStatusService(test.agents).markStale(stored, now).status).toBe("stale");
   });
 
   it("denies registration token failures and isolates the bound agent id", async () => {
@@ -224,11 +250,25 @@ describe("agent command HTTP transport integration", () => {
     now = new Date("2026-07-10T00:00:40.000Z");
     await expect(test.transport.poll(agentId, new AbortController().signal)).resolves.toBeNull();
     await expect(test.transport.poll(agentId, new AbortController().signal)).resolves.toBeNull();
-    await expect(test.transport.complete(commandId)).resolves.toMatchObject({ state: "failed" });
+    const lateComplete = await test.app.inject({ method: "POST", url: `/api/v1/agent/commands/${commandId}/complete`, headers: { authorization: `Bearer ${token}`, "content-type": "application/json" }, payload: {} });
+    expect(lateComplete.statusCode).toBe(409);
+    expect(lateComplete.json()).toMatchObject({ data: { authoritativeCommand: { id: commandId, agentId, state: "failed" }, attemptedState: "completed" }, error: { code: "AUTHORITATIVE_TERMINAL_CONFLICT" } });
     expect(await test.commands.findById(commandId)).toMatchObject({ state: "failed", failureReason: expect.stringContaining("lease expired") });
     expect(await test.deployments.findById(deploymentId)).toMatchObject({ status: "failed", finishedAt: expect.any(String) });
     const logs = await test.deployments.listLogs(deploymentId);
     expect(logs.filter((log) => log.message.startsWith("Agent command lease expired"))).toHaveLength(1);
+  });
+
+  it("keeps completion authoritative when expiry reconciliation runs later", async () => {
+    let now = new Date("2026-07-10T00:00:05.000Z");
+    const test = await fixture({}, true, () => now);
+    await test.transport.poll(agentId, new AbortController().signal);
+    await expect(test.transport.complete(commandId)).resolves.toMatchObject({ state: "completed" });
+    now = new Date("2026-07-10T00:00:40.000Z");
+    await expect(test.transport.poll(agentId, new AbortController().signal)).resolves.toBeNull();
+    expect(await test.commands.findById(commandId)).toMatchObject({ state: "completed" });
+    expect(await test.deployments.findById(deploymentId)).toMatchObject({ status: "succeeded" });
+    expect((await test.deployments.listLogs(deploymentId)).filter((log) => log.message.startsWith("Agent completed deployment command"))).toHaveLength(1);
   });
 
   it("autonomously reconciles a crashed agent claim after lease expiry without another poll", async () => {

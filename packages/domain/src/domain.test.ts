@@ -32,6 +32,22 @@ describe("domain foundation", () => {
     expect(agent ? service.markStale(agent, now).status : "missing").toBe("stale");
   });
 
+  it("uses server receipt time rather than a future observedAt for heartbeat freshness", async () => {
+    const agents = new InMemoryAgentRepository();
+    const service = new AgentStatusService(agents);
+    await agents.save({ id: "agent_1", name: "Agent", endpoint: "https://agent.test", status: "offline", lastHeartbeatAt: null, resourceSnapshot: null });
+    await service.recordHeartbeat({
+      agentId: "agent_1",
+      observedAt: "2099-01-01T00:00:00.000Z",
+      resourceSnapshot: { cpuLoad: 0.1, memoryUsedBytes: 1, memoryTotalBytes: 2, diskUsedBytes: 3, diskTotalBytes: 4 },
+      requestId: "req_1",
+      correlationId: "req_1"
+    }, now);
+    const stored = await agents.findById("agent_1");
+    expect(stored?.lastHeartbeatAt).toBe(now.toISOString());
+    expect(stored && service.markStale(stored, new Date(now.getTime() + 60_001)).status).toBe("stale");
+  });
+
   it("updates deployment records when status transitions to a terminal state", async () => {
     const deployments = new InMemoryDeploymentRepository();
     const deployment = {

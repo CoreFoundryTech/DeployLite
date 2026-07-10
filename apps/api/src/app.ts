@@ -691,6 +691,7 @@ const agentClaimBodySchema = z.object({ agentId: agentIdSchema }).strict();
 const agentCompleteBodySchema = z.object({ output: z.record(z.unknown()).optional() }).strict();
 const agentFailBodySchema = z.object({ reason: z.string().min(1).max(1024) }).strict();
 const INVALID_COMMAND_REASON_MAX = 256;
+const MAX_AGENT_OBSERVED_SKEW_MS = 60_000;
 
 class InvalidCommandPrerequisiteError extends Error {}
 
@@ -766,18 +767,30 @@ async function materializeAgentExecutionInput(
   };
 }
 
-async function terminallyFailAgentCommand(state: PlatformRepositories, command: DeploymentCommand, reason: string, marker = "Agent command rejected"): Promise<void> {
-  const safeReason = redactLogMessage(reason).slice(0, INVALID_COMMAND_REASON_MAX);
-  if (await state.deployments.findById(command.deploymentId)) {
+async function projectAuthoritativeTerminalCommand(
+  state: PlatformRepositories,
+  command: DeploymentCommand,
+  failedLifecycle?: { marker: string; message: string }
+): Promise<void> {
+  if (!(await state.deployments.findById(command.deploymentId))) return;
+  if (command.state === "completed") {
+    await ensureAgentDeploymentLifecycle(state, command, { status: "succeeded", level: "info", marker: "Agent completed deployment command", message: "Agent completed deployment command; deployment succeeded." });
+  } else if (command.state === "failed") {
+    const fallback = `Agent command failed: ${redactLogMessage(command.failureReason ?? "Unknown failure").slice(0, INVALID_COMMAND_REASON_MAX)}`;
     await ensureAgentDeploymentLifecycle(state, command, {
       status: "failed",
       level: "error",
-      marker,
-      message: `${marker}: ${safeReason}`
+      marker: failedLifecycle?.marker ?? "Agent command failed",
+      message: failedLifecycle?.message ?? fallback
     });
   }
-  const current = await state.deploymentCommandBus.findById(command.id);
-  if (current && current.state !== "failed") await state.deploymentCommandBus.fail(command.id, safeReason);
+}
+
+async function terminallyFailAgentCommand(state: PlatformRepositories, command: DeploymentCommand, reason: string, marker = "Agent command rejected"): Promise<DeploymentCommand | null> {
+  const safeReason = redactLogMessage(reason).slice(0, INVALID_COMMAND_REASON_MAX);
+  const authoritative = await state.deploymentCommandBus.fail(command.id, safeReason);
+  if (authoritative) await projectAuthoritativeTerminalCommand(state, authoritative, { marker, message: `${marker}: ${safeReason}` });
+  return authoritative;
 }
 
 async function reconcileExpiredClaims(state: PlatformRepositories, agentId: string): Promise<void> {
@@ -841,17 +854,29 @@ async function ensureAgentDeploymentLifecycle(
 async function compensateAgentLifecycleFailure(state: PlatformRepositories, command: DeploymentCommand): Promise<void> {
   const reason = "Deployment lifecycle persistence failed after the agent command transition";
   try {
-    await ensureAgentDeploymentLifecycle(state, command, { status: "failed", level: "error", marker: "Agent lifecycle persistence failed", message: `Agent lifecycle persistence failed: ${reason}.` });
-  } catch { /* repository failure is reported by the original request error */ }
-  try {
-    const current = await state.deploymentCommandBus.findById(command.id);
-    if (current?.state === "claimed") await state.deploymentCommandBus.fail(command.id, reason);
-  } catch { /* best-effort compensation only */ }
+    await terminallyFailAgentCommand(state, command, reason, "Agent lifecycle persistence failed");
+  } catch { /* best-effort compensation only; the original request reports the repository failure */ }
 }
 
 async function assignedCommand(state: PlatformRepositories, commandId: string, agentId: string): Promise<DeploymentCommand | null> {
   const command = await state.deploymentCommandBus.findById(commandId);
   return command?.agentId === agentId ? command : null;
+}
+
+function hasAcceptableAgentClockSkew(observedAt: string, receivedAt: Date): boolean {
+  return Math.abs(new Date(observedAt).getTime() - receivedAt.getTime()) <= MAX_AGENT_OBSERVED_SKEW_MS;
+}
+
+function terminalConflictResponse(request: FastifyRequest, command: DeploymentCommand, attemptedState: "completed" | "failed") {
+  return {
+    data: { authoritativeCommand: command, attemptedState },
+    error: {
+      code: "AUTHORITATIVE_TERMINAL_CONFLICT",
+      message: "The command already has a different authoritative terminal outcome.",
+      correlationId: request.correlationContext.correlationId
+    },
+    requestId: request.correlationContext.requestId
+  };
 }
 
 function isAllowedCorsRequest(request: FastifyRequest, corsOrigin: string | null): boolean {
@@ -912,13 +937,17 @@ function registerRoutes(app: FastifyInstance, state: PlatformRepositories, adapt
     if (parsed.data.agentId !== state.externalAgentIdentity.agentId) {
       return reply.code(403).send(errorEnvelope(request, "AGENT_IDENTITY_MISMATCH", "Agent identity mismatch."));
     }
+    const receivedAt = state.now();
+    if (!hasAcceptableAgentClockSkew(parsed.data.observedAt, receivedAt)) {
+      return reply.code(400).send(errorEnvelope(request, "AGENT_CLOCK_SKEW", "Agent observedAt is outside the accepted clock-skew window."));
+    }
     const existing = await state.agents.findById(parsed.data.agentId);
     const agent: Agent = {
       id: parsed.data.agentId,
       name: parsed.data.name,
       endpoint: parsed.data.endpoint,
       status: "online",
-      lastHeartbeatAt: parsed.data.observedAt,
+      lastHeartbeatAt: receivedAt.toISOString(),
       resourceSnapshot: parsed.data.resourceSnapshot
     };
     await state.agents.save(agent);
@@ -932,9 +961,13 @@ function registerRoutes(app: FastifyInstance, state: PlatformRepositories, adapt
     if (params.data.agentId !== state.externalAgentIdentity.agentId || body.data.agentId !== state.externalAgentIdentity.agentId) {
       return reply.code(403).send(errorEnvelope(request, "AGENT_IDENTITY_MISMATCH", "Agent identity mismatch."));
     }
+    const receivedAt = state.now();
+    if (!hasAcceptableAgentClockSkew(body.data.observedAt, receivedAt)) {
+      return reply.code(400).send(errorEnvelope(request, "AGENT_CLOCK_SKEW", "Agent observedAt is outside the accepted clock-skew window."));
+    }
     const existing = await state.agents.findById(params.data.agentId);
     if (!existing) return reply.code(404).send(errorEnvelope(request, "AGENT_NOT_REGISTERED", "Agent is not registered."));
-    const agent = await state.agentStatus.recordHeartbeat({ ...body.data, ...request.correlationContext });
+    const agent = await state.agentStatus.recordHeartbeat({ ...body.data, ...request.correlationContext }, receivedAt);
     return reply.send(agent);
   });
   app.get(`${API_PREFIX}/agent/commands/next`, async (request, reply) => {
@@ -1030,22 +1063,24 @@ function registerRoutes(app: FastifyInstance, state: PlatformRepositories, adapt
     const existing = await assignedCommand(state, params.data.commandId, state.externalAgentIdentity.agentId);
     if (!existing) return reply.code(404).send(errorEnvelope(request, "NOT_FOUND", "Command not found."));
     if (existing.state === "completed") {
-      await ensureAgentDeploymentLifecycle(state, existing, { status: "succeeded", level: "info", marker: "Agent completed deployment command", message: "Agent completed deployment command; deployment succeeded." });
+      await projectAuthoritativeTerminalCommand(state, existing);
       return reply.send(existing);
     }
-    if (existing.state === "failed" && existing.failureReason?.includes("lease expired")) return reply.send(existing);
+    if (existing.state === "failed") {
+      await projectAuthoritativeTerminalCommand(state, existing);
+      return reply.code(409).send(terminalConflictResponse(request, existing, "completed"));
+    }
     if (existing.state !== "claimed") return reply.code(409).send(errorEnvelope(request, "COMMAND_STATE_CONFLICT", "Command cannot be completed in its current state."));
     if (!existing.leaseExpiresAt || new Date(existing.leaseExpiresAt).getTime() <= state.now().getTime()) {
-      await terminallyFailAgentCommand(state, existing, "Agent command lease expired; completion was rejected.", "Agent command lease expired");
-      return reply.code(409).send(errorEnvelope(request, "COMMAND_LEASE_LOST", "Command lease expired."));
-    }
-    try {
-      await ensureAgentDeploymentLifecycle(state, existing, { status: "succeeded", level: "info", marker: "Agent completed deployment command", message: "Agent completed deployment command; deployment succeeded." });
-    } catch (error) {
-      await compensateAgentLifecycleFailure(state, existing);
-      throw error;
+      const authoritative = await terminallyFailAgentCommand(state, existing, "Agent command lease expired; completion was rejected.", "Agent command lease expired");
+      if (authoritative?.state === "completed") return reply.send(authoritative);
+      if (authoritative) return reply.code(409).send(terminalConflictResponse(request, authoritative, "completed"));
+      return reply.code(404).send(errorEnvelope(request, "NOT_FOUND", "Command not found."));
     }
     const completed = await state.deploymentCommandBus.complete(existing.id, body.data.output ? redactSecrets(body.data.output) : undefined);
+    if (!completed) return reply.code(404).send(errorEnvelope(request, "NOT_FOUND", "Command not found."));
+    await projectAuthoritativeTerminalCommand(state, completed);
+    if (completed.state !== "completed") return reply.code(409).send(terminalConflictResponse(request, completed, "completed"));
     return reply.send(completed);
   });
   app.post(`${API_PREFIX}/agent/commands/:commandId/fail`, async (request, reply) => {
@@ -1057,17 +1092,18 @@ function registerRoutes(app: FastifyInstance, state: PlatformRepositories, adapt
     if (!existing) return reply.code(404).send(errorEnvelope(request, "NOT_FOUND", "Command not found."));
     const safeReason = redactEnvFileForLog(body.data.reason).slice(0, 1024);
     if (existing.state === "failed") {
-      await ensureAgentDeploymentLifecycle(state, existing, { status: "failed", level: "error", marker: "Agent reported deployment failure", message: `Agent reported deployment failure: ${safeReason}` });
+      await projectAuthoritativeTerminalCommand(state, existing, { marker: "Agent reported deployment failure", message: `Agent reported deployment failure: ${safeReason}` });
       return reply.send(existing);
     }
-    if (existing.state !== "claimed") return reply.code(409).send(errorEnvelope(request, "COMMAND_STATE_CONFLICT", "Command cannot fail in its current state."));
-    try {
-      await ensureAgentDeploymentLifecycle(state, existing, { status: "failed", level: "error", marker: "Agent reported deployment failure", message: `Agent reported deployment failure: ${safeReason}` });
-    } catch (error) {
-      await compensateAgentLifecycleFailure(state, existing);
-      throw error;
+    if (existing.state === "completed") {
+      await projectAuthoritativeTerminalCommand(state, existing);
+      return reply.code(409).send(terminalConflictResponse(request, existing, "failed"));
     }
+    if (existing.state !== "claimed") return reply.code(409).send(errorEnvelope(request, "COMMAND_STATE_CONFLICT", "Command cannot fail in its current state."));
     const failed = await state.deploymentCommandBus.fail(existing.id, safeReason);
+    if (!failed) return reply.code(404).send(errorEnvelope(request, "NOT_FOUND", "Command not found."));
+    await projectAuthoritativeTerminalCommand(state, failed, { marker: "Agent reported deployment failure", message: `Agent reported deployment failure: ${safeReason}` });
+    if (failed.state !== "failed") return reply.code(409).send(terminalConflictResponse(request, failed, "failed"));
     return reply.send(failed);
   });
   app.get(`${API_PREFIX}/bootstrap/status`, async (request) => ok(request, await getBootstrapStatus(adapters.users)));
@@ -1112,14 +1148,18 @@ function registerRoutes(app: FastifyInstance, state: PlatformRepositories, adapt
     await state.agents.save(agent);
     return ok(request, { agent, audit: auditMutation(request, "agent.register", "agent", agent.id) });
   });
-  app.post(`${API_PREFIX}/agents/:agentId/heartbeat`, { preHandler: [requireAuth, requireMutationRole] }, async (request) => {
+  app.post(`${API_PREFIX}/agents/:agentId/heartbeat`, { preHandler: [requireAuth, requireMutationRole] }, async (request, reply) => {
     const params = z.object({ agentId: z.string().min(1) }).parse(request.params);
     const body = z.object({ observedAt: z.string().datetime({ offset: true }), resourceSnapshot: resourceSnapshotSchema }).parse(request.body);
-    const agent = await state.agentStatus.recordHeartbeat({ agentId: params.agentId, observedAt: body.observedAt, resourceSnapshot: body.resourceSnapshot, ...request.correlationContext });
+    const receivedAt = state.now();
+    if (!hasAcceptableAgentClockSkew(body.observedAt, receivedAt)) {
+      return reply.code(400).send(errorEnvelope(request, "AGENT_CLOCK_SKEW", "Agent observedAt is outside the accepted clock-skew window."));
+    }
+    const agent = await state.agentStatus.recordHeartbeat({ agentId: params.agentId, observedAt: body.observedAt, resourceSnapshot: body.resourceSnapshot, ...request.correlationContext }, receivedAt);
     return ok(request, { agent, audit: auditMutation(request, "agent.heartbeat", "agent", agent.id) });
   });
   app.get(`${API_PREFIX}/agents`, { preHandler: requireAuth }, async (request) => {
-    const agents = (await state.agents.list()).map((agent) => state.agentStatus.markStale(agent));
+    const agents = (await state.agents.list()).map((agent) => state.agentStatus.markStale(agent, state.now()));
     return ok(request, { agents });
   });
   app.get(`${API_PREFIX}/projects`, { preHandler: requireAuth }, async (request) => ok(request, { projects: await state.projects.list() }));

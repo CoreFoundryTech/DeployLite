@@ -4,6 +4,7 @@ import { randomBytes } from "node:crypto";
 import { deploymentCommandSchema, type DeploymentCommand } from "@deploylite/contracts";
 import { z } from "zod";
 import type { CommandBusClient } from "./executor/index.js";
+import { AuthoritativeTerminalConflictError } from "./worker.js";
 
 const MAX_RECORDS = 256;
 const MAX_FILE_BYTES = 256 * 1024;
@@ -30,6 +31,14 @@ export type TerminalOutbox = {
   put(record: TerminalAckRecord): Promise<void>;
   remove(commandId: string): Promise<void>;
 };
+
+export type TerminalConflictRecorder = (event: {
+  commandId: string;
+  agentId: string;
+  attemptedState: "completed" | "failed";
+  authoritativeState: "completed" | "failed" | "cancelled";
+  message: string;
+}) => Promise<void> | void;
 
 function mergeCompatibleRecord(records: TerminalAckRecord[], record: TerminalAckRecord): TerminalAckRecord[] {
   const existing = records.find((item) => item.commandId === record.commandId);
@@ -128,7 +137,8 @@ export class DurableTerminalCommandBus implements CommandBusClient {
     private readonly agentId: string,
     private readonly transport: CommandBusClient,
     private readonly outbox: TerminalOutbox,
-    private readonly now: () => Date = () => new Date()
+    private readonly now: () => Date = () => new Date(),
+    private readonly recordConflict: TerminalConflictRecorder = () => undefined
   ) {}
 
   claim(commandId: string, agentId: string): Promise<DeploymentCommand | null> {
@@ -143,16 +153,24 @@ export class DurableTerminalCommandBus implements CommandBusClient {
 
   async complete(commandId: string, output?: Record<string, unknown>): Promise<DeploymentCommand | null> {
     await this.outbox.put(this.record(commandId, "complete"));
-    const acknowledged = await this.transport.complete(commandId, output);
-    await this.assertAndRemove(commandId, "completed", acknowledged);
-    return acknowledged;
+    try {
+      const acknowledged = await this.transport.complete(commandId, output);
+      await this.assertAndRemove(commandId, "completed", acknowledged);
+      return acknowledged;
+    } catch (error) {
+      return this.resolveAuthoritativeConflict(commandId, "completed", error);
+    }
   }
 
   async fail(commandId: string, reason: string): Promise<DeploymentCommand | null> {
     await this.outbox.put(this.record(commandId, "fail", SAFE_FAILURE_REASON));
-    const acknowledged = await this.transport.fail(commandId, reason);
-    await this.assertAndRemove(commandId, "failed", acknowledged);
-    return acknowledged;
+    try {
+      const acknowledged = await this.transport.fail(commandId, reason);
+      await this.assertAndRemove(commandId, "failed", acknowledged);
+      return acknowledged;
+    } catch (error) {
+      return this.resolveAuthoritativeConflict(commandId, "failed", error);
+    }
   }
 
   async replayPending(): Promise<boolean> {
@@ -164,8 +182,12 @@ export class DurableTerminalCommandBus implements CommandBusClient {
           ? await this.transport.complete(record.commandId)
           : await this.transport.fail(record.commandId, record.reason ?? SAFE_FAILURE_REASON);
         await this.assertReplayAndRemove(record.commandId, record.action === "complete" ? "completed" : "failed", acknowledged);
-      } catch {
-        return false;
+      } catch (error) {
+        try {
+          await this.resolveAuthoritativeConflict(record.commandId, record.action === "complete" ? "completed" : "failed", error);
+        } catch {
+          return false;
+        }
       }
     }
     return true;
@@ -189,5 +211,32 @@ export class DurableTerminalCommandBus implements CommandBusClient {
       throw new Error("Terminal acknowledgement replay did not confirm an authoritative terminal command state");
     }
     await this.outbox.remove(commandId);
+  }
+
+  private async resolveAuthoritativeConflict(
+    commandId: string,
+    attemptedState: "completed" | "failed",
+    error: unknown
+  ): Promise<DeploymentCommand> {
+    if (!(error instanceof AuthoritativeTerminalConflictError)) throw error;
+    const command = deploymentCommandSchema.parse(error.authoritativeCommand);
+    if (
+      command.id !== commandId ||
+      command.agentId !== this.agentId ||
+      error.attemptedState !== attemptedState ||
+      command.state === attemptedState ||
+      (command.state !== "completed" && command.state !== "failed" && command.state !== "cancelled")
+    ) {
+      throw new Error("Terminal conflict response did not prove an authoritative assignment-scoped outcome");
+    }
+    await this.recordConflict({
+      commandId,
+      agentId: this.agentId,
+      attemptedState,
+      authoritativeState: command.state,
+      message: "Terminal acknowledgement intent reconciled to the server's authoritative terminal outcome."
+    });
+    await this.outbox.remove(commandId);
+    return command;
   }
 }

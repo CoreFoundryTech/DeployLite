@@ -46,6 +46,7 @@ type AuthFixtureOptions = {
   env?: NodeJS.ProcessEnv;
   state?: NonNullable<Parameters<typeof buildApiApp>[0]>["state"];
   user?: Partial<AuthUser>;
+  now?: () => Date;
 };
 
 async function authFixture(options: AuthFixtureOptions = {}) {
@@ -75,7 +76,8 @@ async function authFixture(options: AuthFixtureOptions = {}) {
     env: options.env ?? (options.dbMode
       ? { ...testEnv, NODE_ENV: "test", DATABASE_URL: "postgres://user:pass@localhost:5432/deploylite" }
       : testEnv),
-    state
+    state,
+    now: options.now
   });
   return { app, audit, sessions, user };
 }
@@ -479,7 +481,7 @@ describe("DeployLite API scaffold", () => {
   });
 
   it("records heartbeat status with audit correlation metadata", async () => {
-    const { app } = await authFixture();
+    const { app } = await authFixture({ now: () => new Date("2026-01-01T00:01:00.000Z") });
     const cookie = await loginCookie(app);
     const response = await app.inject({
       method: "POST",
@@ -1820,6 +1822,9 @@ describe("Phase 5 slice 1 — DeploymentCommandBus control plane", () => {
         throw new Error("command store unavailable");
       },
       async renewLease() {
+        throw new Error("command store unavailable");
+      },
+      async transitionTerminal() {
         throw new Error("command store unavailable");
       },
       async findById() {
