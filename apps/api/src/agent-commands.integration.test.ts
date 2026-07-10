@@ -243,7 +243,7 @@ describe("agent command HTTP transport integration", () => {
     expect(JSON.stringify(logs)).not.toContain(plaintext);
   });
 
-  it("rejects stale agent failure at lease equality and projects only authoritative system expiry", async () => {
+  it("returns a lease conflict for stale agent failure without system-failing a still-claimed command", async () => {
     let now = new Date("2026-07-10T00:00:29.999Z");
     const leaseExpiresAt = "2026-07-10T00:00:30.000Z";
     const test = await fixture({ state: "claimed", claimedAt: "2026-07-10T00:00:00.000Z", leaseExpiresAt }, true, () => now);
@@ -256,12 +256,12 @@ describe("agent command HTTP transport integration", () => {
     });
     expect(response.statusCode).toBe(409);
     expect(response.json()).toMatchObject({
-      data: { authoritativeCommand: { id: commandId, state: "failed", failureReason: expect.stringContaining("lease expired") }, attemptedState: "failed", leaseConflict: true },
+      data: { authoritativeCommand: { id: commandId, state: "claimed", failureReason: null }, attemptedState: "failed", leaseConflict: true },
       error: { code: "AUTHORITATIVE_LEASE_CONFLICT" }
     });
-    expect(await test.deployments.findById(deploymentId)).toMatchObject({ status: "failed", finishedAt: now.toISOString() });
+    expect(await test.deployments.findById(deploymentId)).toMatchObject({ status: "queued", finishedAt: null });
     const logs = await test.deployments.listLogs(deploymentId);
-    expect(logs.filter((log) => log.message.startsWith("Agent command lease expired"))).toHaveLength(1);
+    expect(logs.filter((log) => log.message.startsWith("Agent command lease expired"))).toHaveLength(0);
     expect(logs.filter((log) => log.message.startsWith("Agent reported deployment failure"))).toHaveLength(0);
   });
 

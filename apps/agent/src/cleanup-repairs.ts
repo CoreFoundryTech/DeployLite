@@ -5,12 +5,20 @@ import { z } from "zod";
 import type { CleanupRepairRecord, CleanupRepairStore } from "./executor/index.js";
 
 const MAX_RECORDS = 256;
+const MAX_FILE_BYTES = 256 * 1024;
 const repairSchema = z.object({
   version: z.literal(1),
   commandId: z.string().regex(/^[a-z0-9][a-z0-9-]{0,62}$/),
   projectSlug: z.string().regex(/^[a-z0-9][a-z0-9-]{0,62}$/)
 }).strict();
 const fileSchema = z.object({ version: z.literal(1), records: z.array(repairSchema).max(MAX_RECORDS) }).strict();
+
+export class CorruptCleanupRepairStoreError extends Error {
+  constructor() {
+    super("Cleanup repair state is corrupt and could not be quarantined");
+    this.name = "CorruptCleanupRepairStoreError";
+  }
+}
 
 export class FileCleanupRepairStore implements CleanupRepairStore {
   readonly #path: string;
@@ -25,9 +33,21 @@ export class FileCleanupRepairStore implements CleanupRepairStore {
     if (this.#records) return structuredClone(this.#records);
     await mkdir(dirname(this.#path), { recursive: true, mode: 0o700 });
     try {
-      this.#records = fileSchema.parse(JSON.parse(await readFile(this.#path, "utf8"))).records;
+      const contents = await readFile(this.#path, "utf8");
+      if (Buffer.byteLength(contents, "utf8") > MAX_FILE_BYTES) throw new Error("cleanup repair state exceeds size limit");
+      this.#records = fileSchema.parse(JSON.parse(contents)).records;
     } catch (error) {
-      if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw new Error("Cleanup repair state is invalid");
+      if ((error as NodeJS.ErrnoException).code === "ENOENT") {
+        this.#records = [];
+        return [];
+      }
+      const quarantinePath = `${this.#path}.corrupt-${Date.now()}-${randomBytes(4).toString("hex")}`;
+      try {
+        await chmod(this.#path, 0o600);
+        await rename(this.#path, quarantinePath);
+      } catch {
+        throw new CorruptCleanupRepairStoreError();
+      }
       this.#records = [];
     }
     return structuredClone(this.#records);

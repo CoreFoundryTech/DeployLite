@@ -1153,10 +1153,7 @@ function registerRoutes(app: FastifyInstance, state: PlatformRepositories, adapt
     const failed = await state.deploymentCommandBus.fail(existing.id, safeReason);
     if (!failed) return reply.code(404).send(errorEnvelope(request, "NOT_FOUND", "Command not found."));
     if (failed.state === "claimed") {
-      let authoritative = await terminallyExpireAgentCommand(state, failed, "Agent command lease expired; failure was rejected.", "Agent command lease expired");
-      if (authoritative?.state === "claimed") {
-        authoritative = await terminallyFailAgentCommand(state, authoritative, "Agent command lease was unavailable; failure was rejected.", "Agent command lease unavailable");
-      }
+      const authoritative = await state.deploymentCommandBus.findById(existing.id);
       if (!authoritative) return reply.code(404).send(errorEnvelope(request, "NOT_FOUND", "Command not found."));
       return reply.code(409).send(leaseConflictResponse(request, authoritative, "failed"));
     }

@@ -64,6 +64,7 @@ export type AgentWorkerOptions = {
   retryDelayMs?: number;
   heartbeatIntervalMs?: number;
   maxHeartbeatBackoffMs?: number;
+  cleanupRepairIntervalMs?: number;
   leaseRenewalIntervalMs?: number;
   now?: () => Date;
   wait?: (milliseconds: number, signal: AbortSignal) => Promise<void>;
@@ -77,6 +78,7 @@ export class AgentWorker {
   readonly #maxHeartbeatBackoffMs: number;
   readonly #now: () => Date;
   readonly #leaseRenewalIntervalMs: number;
+  readonly #cleanupRepairIntervalMs: number;
 
   constructor(private readonly options: AgentWorkerOptions) {
     this.#logger = options.logger ?? { log: () => undefined };
@@ -86,6 +88,7 @@ export class AgentWorker {
     this.#maxHeartbeatBackoffMs = Math.min(60_000, Math.max(this.#retryDelayMs, options.maxHeartbeatBackoffMs ?? 30_000));
     this.#now = options.now ?? (() => new Date());
     this.#leaseRenewalIntervalMs = Math.max(1, options.leaseRenewalIntervalMs ?? DEPLOYMENT_COMMAND_LEASE_RENEWAL_MS);
+    this.#cleanupRepairIntervalMs = Math.min(60_000, Math.max(this.#retryDelayMs, options.cleanupRepairIntervalMs ?? 15_000));
   }
 
   async run(signal: AbortSignal): Promise<void> {
@@ -103,6 +106,8 @@ export class AgentWorker {
 
   private async pollLoop(signal: AbortSignal): Promise<void> {
     let terminalRetryMs = this.#retryDelayMs;
+    let cleanupRetryMs = this.#retryDelayMs;
+    let nextCleanupRepairAt = 0;
     let startupReconciled = false;
     while (!signal.aborted) {
       try {
@@ -113,13 +118,23 @@ export class AgentWorker {
           continue;
         }
         terminalRetryMs = this.#retryDelayMs;
-        if (!startupReconciled) {
-          if (this.options.executor.reconcilePending && !(await this.options.executor.reconcilePending())) {
-            await this.safeLog("error", "Managed resource cleanup remains incomplete; repair will retry");
-            await this.#wait(terminalRetryMs, signal);
-            terminalRetryMs = Math.min(this.#maxHeartbeatBackoffMs, Math.max(this.#retryDelayMs, terminalRetryMs * 2));
-            continue;
+        if (this.options.executor.reconcilePending && this.#now().getTime() >= nextCleanupRepairAt) {
+          try {
+            if (await this.options.executor.reconcilePending()) {
+              cleanupRetryMs = this.#cleanupRepairIntervalMs;
+              nextCleanupRepairAt = this.#now().getTime() + this.#cleanupRepairIntervalMs;
+            } else {
+              await this.safeLog("error", "Managed resource cleanup remains incomplete; repair will retry");
+              nextCleanupRepairAt = this.#now().getTime() + cleanupRetryMs;
+              cleanupRetryMs = Math.min(this.#maxHeartbeatBackoffMs, Math.max(this.#retryDelayMs, cleanupRetryMs * 2));
+            }
+          } catch {
+            await this.safeLog("error", "Managed resource cleanup repair reconciliation failed; repair will retry");
+            nextCleanupRepairAt = this.#now().getTime() + cleanupRetryMs;
+            cleanupRetryMs = Math.min(this.#maxHeartbeatBackoffMs, Math.max(this.#retryDelayMs, cleanupRetryMs * 2));
           }
+        }
+        if (!startupReconciled) {
           const claimed = await this.options.transport.recoverClaimed(this.options.agentId, signal);
           if (claimed) await this.options.executor.reconcile(claimed);
           startupReconciled = true;

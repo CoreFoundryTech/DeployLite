@@ -116,6 +116,56 @@ describe("AgentWorker", () => {
     expect(order).toEqual(["outbox", "repair", "recover", "poll"]);
   });
 
+  it("retries runtime cleanup repairs with bounded backoff while command polling continues", async () => {
+    const shutdown = new AbortController();
+    let now = 0;
+    let polls = 0;
+    let activeRepairs = 0;
+    let maxActiveRepairs = 0;
+    const repairs: string[] = [];
+    let recordedRepairAttempts = 0;
+    const reconcilePending = vi.fn(async () => {
+      activeRepairs += 1;
+      maxActiveRepairs = Math.max(maxActiveRepairs, activeRepairs);
+      await Promise.resolve();
+      activeRepairs -= 1;
+      if (repairs.length === 0) return true;
+      recordedRepairAttempts += 1;
+      if (recordedRepairAttempts === 1) return false;
+      repairs.pop();
+      return true;
+    });
+    const commandTransport = transport({ poll: vi.fn(async () => {
+      polls += 1;
+      if (polls === 1) repairs.push("repair-recorded-after-startup");
+      if (polls === 4) shutdown.abort();
+      return null;
+    }) });
+    await new AgentWorker({
+      agentId: "agent-1", agentName: "Agent", agentEndpoint: "http://agent.test", transport: commandTransport,
+      executor: { execute: vi.fn(), reconcile: vi.fn(), reconcilePending }, resourceCollector: { collect: async () => snapshot },
+      retryDelayMs: 10, cleanupRepairIntervalMs: 10, heartbeatIntervalMs: 60_000,
+      now: () => new Date(now), wait: async (milliseconds) => { now += milliseconds; }
+    }).run(shutdown.signal);
+    expect(reconcilePending.mock.calls.length).toBeGreaterThanOrEqual(3);
+    expect(commandTransport.poll).toHaveBeenCalledTimes(4);
+    expect(repairs).toEqual([]);
+    expect(maxActiveRepairs).toBe(1);
+  });
+
+  it("continues polling when cleanup repair reconciliation throws and stops safely on shutdown", async () => {
+    const shutdown = new AbortController();
+    const commandTransport = transport({ poll: vi.fn(async () => { shutdown.abort(); return null; }) });
+    const logger = { log: vi.fn() };
+    await new AgentWorker({
+      agentId: "agent-1", agentName: "Agent", agentEndpoint: "http://agent.test", transport: commandTransport,
+      executor: { execute: vi.fn(), reconcile: vi.fn(), reconcilePending: vi.fn(async () => { throw new Error("secret value"); }) },
+      resourceCollector: { collect: async () => snapshot }, logger
+    }).run(shutdown.signal);
+    expect(commandTransport.poll).toHaveBeenCalledOnce();
+    expect(logger.log).toHaveBeenCalledWith("error", "Managed resource cleanup repair reconciliation failed; repair will retry");
+  });
+
   it("aborts execution when lease renewal cannot be confirmed and does not execute twice", async () => {
     const shutdown = new AbortController();
     const commandTransport = transport({
