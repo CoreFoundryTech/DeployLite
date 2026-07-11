@@ -147,6 +147,54 @@ describe("AgentWorker", () => {
     expect(readiness.clear).toHaveBeenCalledTimes(2);
   });
 
+  it("keeps readiness absent when a stalled poll times out, retries safely, and shuts down without leaking transport details", async () => {
+    const shutdown = new AbortController();
+    const readiness = { clear: vi.fn(async () => undefined), markReady: vi.fn(async () => undefined) };
+    const logger = { log: vi.fn() };
+    const now = new Date("2026-01-01T00:00:15.000Z");
+    const timeoutDurations: number[] = [];
+    const fetchMock = vi.fn<typeof fetch>((request, init) => {
+      const url = new URL(String(request));
+      if (url.pathname === "/api/v1/agent/register") return Promise.resolve(new Response(JSON.stringify(agent), { status: 201, headers: { "content-type": "application/json" } }));
+      if (url.pathname === "/api/v1/agent/commands/claimed") return Promise.resolve(new Response(null, { status: 204 }));
+      if (url.pathname === "/api/v1/agent/commands/next") {
+        return new Promise<Response>((_resolve, reject) => {
+          init?.signal?.addEventListener("abort", () => reject(new DOMException("stalled poll aborted", "AbortError")), { once: true });
+        });
+      }
+      throw new Error(`Unexpected request: ${url.pathname}`);
+    });
+    const commandTransport = new HttpAgentCommandTransport({
+      apiUrl: "https://api.example.test",
+      token: "secret-agent-token",
+      fetch: fetchMock,
+      requestTimeoutMs: 1_000,
+      setTimeout: (callback, milliseconds) => { timeoutDurations.push(milliseconds); queueMicrotask(callback); return 0 as unknown as ReturnType<typeof setTimeout>; },
+      clearTimeout: () => undefined
+    });
+    const wait = vi.fn(async (milliseconds: number, signal: AbortSignal) => {
+      if (milliseconds === 1_000) shutdown.abort();
+      else await new Promise<void>((resolve) => signal.addEventListener("abort", () => resolve(), { once: true }));
+    });
+
+    await new AgentWorker({
+      agentId: "agent-1", agentName: "Agent", agentEndpoint: "http://agent.test", transport: commandTransport,
+      executor: { execute: vi.fn(), reconcile: vi.fn() }, resourceCollector: { collect: async () => snapshot }, readiness, logger,
+      now: () => now, wait, heartbeatIntervalMs: 60_000
+    }).run(shutdown.signal);
+
+    expect(fetchMock).toHaveBeenCalledTimes(3);
+    expect(JSON.parse(String(fetchMock.mock.calls[0]![1]?.body))).toMatchObject({ observedAt: now.toISOString() });
+    expect(timeoutDurations).toContain(1_000);
+    expect(fetchMock.mock.calls[2]![1]?.signal?.aborted).toBe(true);
+    expect(readiness.markReady).not.toHaveBeenCalled();
+    expect(readiness.clear).toHaveBeenCalledTimes(2);
+    expect(wait).toHaveBeenCalledWith(1_000, shutdown.signal);
+    expect(logger.log).toHaveBeenCalledWith("error", "Agent poll failed: Agent API request timed out");
+    expect(JSON.stringify(logger.log.mock.calls)).not.toContain("secret-agent-token");
+    expect(JSON.stringify(logger.log.mock.calls)).not.toContain("stalled poll aborted");
+  });
+
   it("reconciles an owned claimed command after the durable outbox and never executes it again", async () => {
     const shutdown = new AbortController();
     const order: string[] = [];
