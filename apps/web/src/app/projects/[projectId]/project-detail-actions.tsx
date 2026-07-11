@@ -8,6 +8,7 @@ import { Field, FieldDescription, FieldGroup, FieldLabel } from "@/components/ui
 import { Input } from "@/components/ui/input";
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select";
 import { Switch } from "@/components/ui/switch";
+import { DeploymentActions } from "@/components/deployment-actions";
 import type { EnvVariableMetadata, Project } from "@deploylite/contracts";
 
 type ProjectDetailActionsProps = {
@@ -15,6 +16,7 @@ type ProjectDetailActionsProps = {
   apiBaseUrl: string | null;
   cookieHeader: string;
   envVariables: EnvVariableMetadata[];
+  latestDeployment?: import("@deploylite/contracts").Deployment | null;
 };
 
 type TriggerState =
@@ -150,7 +152,7 @@ function extractDeploymentStatus(payload: unknown): string | null {
   return typeof deployment.status === "string" && deployment.status.length > 0 ? deployment.status : null;
 }
 
-export function ProjectDetailActions({ project, apiBaseUrl, cookieHeader, envVariables }: ProjectDetailActionsProps) {
+export function ProjectDetailActions({ project, apiBaseUrl, cookieHeader, envVariables, latestDeployment = null }: ProjectDetailActionsProps) {
   const router = useRouter();
   const [trigger, setTrigger] = useState<TriggerState>({ kind: "idle" });
   const [envState, setEnvState] = useState<EnvState>({ kind: "idle" });
@@ -238,6 +240,7 @@ export function ProjectDetailActions({ project, apiBaseUrl, cookieHeader, envVar
             </p>
           ) : null}
           {trigger.kind === "error" ? <p className="text-sm text-destructive" role="alert" data-testid="deploy-trigger-error">{trigger.message}</p> : null}
+          {latestDeployment ? <DeploymentActions deployment={latestDeployment} apiBaseUrl={apiBaseUrl} onComplete={() => router.refresh()} /> : null}
         </CardContent>
       </Card>
 
