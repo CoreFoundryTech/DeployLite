@@ -851,35 +851,46 @@ async function ensureAgentDeploymentLifecycle(
   if (!deployment || deployment.agentId !== command.agentId) throw new Error("Linked deployment is unavailable for agent lifecycle update");
   const terminal = lifecycle.status === "succeeded" || lifecycle.status === "failed" || lifecycle.status === "canceled";
   const startedAt = lifecycle.status === "running" ? deployment.startedAt ?? state.now().toISOString() : deployment.startedAt;
-  if (deployment.status !== lifecycle.status || deployment.startedAt !== startedAt || (terminal && !deployment.finishedAt)) {
-    await state.deployments.save({
-      ...deployment,
-      status: lifecycle.status,
-      startedAt,
-      finishedAt: terminal ? deployment.finishedAt ?? command.completedAt ?? state.now().toISOString() : null
-    });
-  }
+  const nextDeployment = {
+    ...deployment,
+    status: lifecycle.status,
+    startedAt,
+    finishedAt: terminal ? deployment.finishedAt ?? command.completedAt ?? state.now().toISOString() : null
+  };
+  const needsSave = deployment.status !== lifecycle.status || deployment.startedAt !== startedAt || (terminal && !deployment.finishedAt);
 
   const logs = await state.deployments.listLogs(deployment.id);
   const correlated = (message: string, requestId: string, correlationId: string) =>
     requestId === command.requestId && correlationId === command.correlationId && message.startsWith(lifecycle.marker);
-  if (logs.some((log) => correlated(log.message, log.requestId, log.correlationId))) return;
-  const event = {
-    id: createRequestId(),
-    deploymentId: deployment.id,
-    level: lifecycle.level,
-    message: lifecycle.message,
-    timestamp: command.completedAt ?? state.now().toISOString(),
-    redactionApplied: true,
-    requestId: command.requestId,
-    correlationId: command.correlationId
-  } as const;
-  try {
-    await state.deployments.appendAllocatedLog(event);
-  } catch (error) {
-    const current = await state.deployments.listLogs(deployment.id);
-    if (!current.some((log) => correlated(log.message, log.requestId, log.correlationId))) throw error;
+  const appendLifecycleLog = async () => {
+    if (logs.some((log) => correlated(log.message, log.requestId, log.correlationId))) return;
+    const event = {
+      id: createRequestId(),
+      deploymentId: deployment.id,
+      level: lifecycle.level,
+      message: lifecycle.message,
+      timestamp: command.completedAt ?? state.now().toISOString(),
+      redactionApplied: true,
+      requestId: command.requestId,
+      correlationId: command.correlationId
+    } as const;
+    try {
+      await state.deployments.appendAllocatedLog(event);
+    } catch (error) {
+      const current = await state.deployments.listLogs(deployment.id);
+      if (!current.some((log) => correlated(log.message, log.requestId, log.correlationId))) throw error;
+    }
+  };
+
+  // A terminal status makes SSE consumers eligible to close. Persist the
+  // correlated lifecycle log first so a terminal frame can never overtake it.
+  if (terminal) {
+    await appendLifecycleLog();
+    if (needsSave) await state.deployments.save(nextDeployment);
+    return;
   }
+  if (needsSave) await state.deployments.save(nextDeployment);
+  await appendLifecycleLog();
 }
 
 async function compensateAgentLifecycleFailure(state: PlatformRepositories, command: DeploymentCommand): Promise<void> {
@@ -914,6 +925,8 @@ async function appendDeploymentControlLog(
   message: string,
   request: FastifyRequest
 ): Promise<void> {
+  const existing = await state.deployments.listLogs(deploymentId);
+  if (existing.some((event) => event.message === redactLogMessage(message))) return;
   await state.deployments.appendAllocatedLog({
     id: createRequestId(),
     deploymentId,
@@ -930,6 +943,11 @@ function sseResumeCursor(request: FastifyRequest): number {
   if (!raw || !/^\d{1,15}$/.test(raw)) return -1;
   const cursor = Number.parseInt(raw, 10);
   return Number.isSafeInteger(cursor) ? cursor : -1;
+}
+
+async function reconcileCancelledDeployment(state: PlatformRepositories, command: DeploymentCommand, request: FastifyRequest): Promise<void> {
+  await appendDeploymentControlLog(state, command.deploymentId, "info", "Deployment cancellation requested by an authorized operator.", request);
+  await projectAuthoritativeTerminalCommand(state, command);
 }
 
 async function assignedCommand(state: PlatformRepositories, commandId: string, agentId: string): Promise<DeploymentCommand | null> {
@@ -1667,14 +1685,20 @@ function registerRoutes(app: FastifyInstance, state: PlatformRepositories, adapt
       emitting = true;
       try {
         const current = await state.deployments.findById(scoped.deployment.id);
-        const logs = (await state.deployments.listLogs(scoped.deployment.id, cursor)).slice(0, SSE_LOG_PAGE_LIMIT);
+        const persistedLogs = await state.deployments.listLogs(scoped.deployment.id);
+        if (cursor >= 0 && (persistedLogs.length === 0 || cursor < persistedLogs[0]!.sequence || cursor > persistedLogs.at(-1)!.sequence)) {
+          cursor = -1;
+        }
+        const logs = persistedLogs.filter((log) => log.sequence > cursor).slice(0, SSE_LOG_PAGE_LIMIT);
+        const hasMoreLogs = logs.length === SSE_LOG_PAGE_LIMIT;
         for (const log of logs) {
           cursor = log.sequence;
           write("deployment.log", { ...log, stream: request.correlationContext }, log.sequence);
         }
         raw.write(": keepalive\n\n");
-        if (current) write("deployment.status", { status: current.status });
-        if (!current || ["succeeded", "failed", "canceled"].includes(current.status)) {
+        const terminal = !current || ["succeeded", "failed", "canceled"].includes(current.status);
+        if (!terminal || !hasMoreLogs) write("deployment.status", { status: current?.status ?? "unavailable" });
+        if (terminal && !hasMoreLogs) {
           write("deployment.terminal", { status: current?.status ?? "unavailable" });
           cleanup();
           raw.end();
@@ -1716,9 +1740,8 @@ function registerRoutes(app: FastifyInstance, state: PlatformRepositories, adapt
       });
       return reply.code(409).send(errorEnvelope(request, "COMMAND_UNAVAILABLE", "This deployment has no command that can be cancelled."));
     }
-    if (active && command.state === "cancelled") {
-      await projectAuthoritativeTerminalCommand(state, command);
-      await appendDeploymentControlLog(state, scoped.deployment.id, "info", "Deployment cancellation requested by an authorized operator.", request);
+    if (command.state === "cancelled") {
+      await reconcileCancelledDeployment(state, command, request);
     }
     await appendAudit(adapters.audit, request, {
       actorUserId: request.auth?.user.id ?? null,
