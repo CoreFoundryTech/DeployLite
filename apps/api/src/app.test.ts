@@ -2092,6 +2092,7 @@ describe("Phase 5 slice 3 — Deployment log SSE lifecycle", () => {
 
     expect(response.ended).toBe(false);
     expect(response.writes.filter((chunk) => chunk.includes("event: deployment.log"))).toHaveLength(100);
+    expect(response.writes.filter((chunk) => chunk.includes("event: deployment.status"))).toHaveLength(0);
     expect(response.writes.some((chunk) => chunk.includes("event: deployment.terminal"))).toBe(false);
 
     const [poll] = timers.values();
@@ -2099,8 +2100,17 @@ describe("Phase 5 slice 3 — Deployment log SSE lifecycle", () => {
     await Promise.resolve();
     await Promise.resolve();
 
-    expect(response.writes.filter((chunk) => chunk.includes("event: deployment.log"))).toHaveLength(101);
-    expect(response.writes.filter((chunk) => chunk.includes("event: deployment.terminal"))).toHaveLength(1);
+    const logEvents = response.writes.filter((chunk) => chunk.includes("event: deployment.log"));
+    const terminalStatusEvents = response.writes.filter((chunk) => chunk.includes("event: deployment.status"));
+    const terminalFrames = response.writes.filter((chunk) => chunk.includes("event: deployment.terminal"));
+
+    expect(logEvents).toHaveLength(101);
+    expect(logEvents.slice(0, 100).map((chunk) => Number(chunk.match(/^id: (\d+)/m)?.[1]))).toEqual(Array.from({ length: 100 }, (_, index) => index + 1));
+    expect(logEvents[100]).toContain("safe log 101");
+    expect(terminalStatusEvents).toHaveLength(1);
+    expect(terminalFrames).toHaveLength(1);
+    expect(response.writes.indexOf(terminalStatusEvents[0]!)).toBeGreaterThan(response.writes.indexOf(logEvents[100]!));
+    expect(response.writes.indexOf(terminalFrames[0]!)).toBeGreaterThan(response.writes.indexOf(terminalStatusEvents[0]!));
     expect(response.ended).toBe(true);
   });
 });

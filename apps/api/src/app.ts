@@ -979,7 +979,13 @@ export function createDeploymentLogSseStream(options: DeploymentLogSseStreamOpti
         write("deployment.log", { ...log, stream: options.correlationContext }, log.sequence);
       }
       if (!closed) options.raw.write(": keepalive\n\n");
-      if (current) write("deployment.status", { status: current.status });
+      if (current && (![
+        "succeeded",
+        "failed",
+        "canceled"
+      ].includes(current.status) || availableLogs.length < SSE_LOG_PAGE_LIMIT)) {
+        write("deployment.status", { status: current.status });
+      }
       // A terminal deployment can still have a backlog. Keep the SSE response
       // open until the cursor has caught up, then emit the terminal frame.
       if ((!current || ["succeeded", "failed", "canceled"].includes(current.status)) && availableLogs.length < SSE_LOG_PAGE_LIMIT) {
