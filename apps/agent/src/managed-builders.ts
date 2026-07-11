@@ -6,6 +6,7 @@ import { z } from "zod";
 const MAX_ENTRIES = 256;
 const MAX_FILE_BYTES = 64 * 1024;
 const REGISTRY_VERSION = 3;
+const LEGACY_REGISTRY_VERSION = 2;
 const KEY_VERSION = 1;
 const MIN_INTEGRITY_KEY_BYTES = 32;
 const commandId = z.string().regex(/^[a-z0-9][a-z0-9-]{0,62}$/);
@@ -13,6 +14,9 @@ const timestamp = z.string().datetime({ offset: true });
 const entrySchema = z.object({ version: z.literal(1), commandId, builderName: z.string().regex(/^deploylite-[a-z0-9][a-z0-9-]{0,62}$/), registeredAt: timestamp, updatedAt: timestamp }).strict();
 const unsignedFileSchema = z.object({ version: z.literal(REGISTRY_VERSION), keyVersion: z.literal(KEY_VERSION), generation: z.number().int().nonnegative().max(Number.MAX_SAFE_INTEGER), entries: z.array(entrySchema).max(MAX_ENTRIES) }).strict();
 const fileSchema = unsignedFileSchema.extend({ mac: z.string().regex(/^[a-f0-9]{64}$/) }).strict();
+// This schema and canonical MAC input match the v2 format persisted by 4c784eb.
+const legacyUnsignedFileSchema = z.object({ version: z.literal(LEGACY_REGISTRY_VERSION), keyVersion: z.literal(KEY_VERSION), entries: z.array(entrySchema).max(MAX_ENTRIES) }).strict();
+const legacyFileSchema = legacyUnsignedFileSchema.extend({ mac: z.string().regex(/^[a-f0-9]{64}$/) }).strict();
 
 export type ManagedBuilderRecord = z.infer<typeof entrySchema>;
 export type ManagedBuilderRegistry = { load(): Promise<ManagedBuilderRecord[]>; put(record: Omit<ManagedBuilderRecord, "registeredAt" | "updatedAt">): Promise<void>; remove(commandId: string): Promise<void> };
@@ -23,6 +27,8 @@ export class ManagedBuilderRegistryRecoveryError extends Error {
 
 type VerifiedFile = { entries: ManagedBuilderRecord[]; generation: number; payload: string; signedBy: "current" | "previous" };
 type ReadResult = { state: "missing" } | { state: "valid"; file: VerifiedFile } | { state: "invalid" };
+type VerifiedLegacyFile = { entries: ManagedBuilderRecord[]; signedBy: "current" | "previous" };
+type LegacyReadResult = { state: "missing" } | { state: "valid"; file: VerifiedLegacyFile } | { state: "invalid" };
 type MarkerState = "missing" | "valid" | "invalid";
 type WriteObserver = (path: string) => void | Promise<void>;
 
@@ -61,6 +67,15 @@ export class FileManagedBuilderRegistry implements ManagedBuilderRegistry {
     if (primary.state === "missing" && backup.state === "missing") {
       if (marker === "valid") throw new ManagedBuilderRegistryRecoveryError();
       return this.#setEntries([], 0);
+    }
+    if (primary.state !== "valid" && backup.state !== "valid") {
+      const legacyPrimary = await this.#readLegacyVerified(this.#path);
+      const legacyBackup = await this.#readLegacyVerified(this.#backupPath);
+      const legacyAuthoritative = legacyPrimary.state === "valid" ? legacyPrimary.file : legacyBackup.state === "valid" ? legacyBackup.file : null;
+      if (legacyAuthoritative) {
+        await this.#migrateLegacy(legacyAuthoritative.entries);
+        return this.#setEntries(legacyAuthoritative.entries, 1);
+      }
     }
     if (primary.state !== "valid" && backup.state !== "valid") {
       if (primary.state === "invalid") await this.#quarantinePrimary();
@@ -123,6 +138,14 @@ export class FileManagedBuilderRegistry implements ManagedBuilderRegistry {
     if (force || primary.state !== "valid" || primary.file.payload !== payload) await this.#writeVerified(this.#path, payload);
   }
 
+  async #migrateLegacy(entries: ManagedBuilderRecord[]): Promise<void> {
+    const payload = this.#serialize(entries, 1);
+    // Write and verify both v3 copies before making the migration visible by clearing the marker.
+    await this.#writeVerified(this.#backupPath, payload);
+    await this.#writeVerified(this.#path, payload);
+    await rm(this.#recoveryMarkerPath, { force: true });
+  }
+
   async #readVerified(path: string): Promise<ReadResult> {
     try {
       const contents = await readFile(path, "utf8");
@@ -136,6 +159,24 @@ export class FileManagedBuilderRegistry implements ManagedBuilderRegistry {
         : this.#previousIntegrityKey && constantTimeEqual(mac, this.#mac(canonical, this.#previousIntegrityKey)) ? "previous" : null;
       if (!signedBy) return { state: "invalid" };
       return { state: "valid", file: { entries: parsed.data.entries, generation: parsed.data.generation, payload: canonicalize(parsed.data), signedBy } };
+    } catch (error) {
+      return (error as NodeJS.ErrnoException).code === "ENOENT" ? { state: "missing" } : { state: "invalid" };
+    }
+  }
+
+  async #readLegacyVerified(path: string): Promise<LegacyReadResult> {
+    try {
+      const contents = await readFile(path, "utf8");
+      if (Buffer.byteLength(contents, "utf8") > MAX_FILE_BYTES) return { state: "invalid" };
+      const parsed = legacyFileSchema.safeParse(JSON.parse(contents));
+      if (!parsed.success) return { state: "invalid" };
+      const { mac, ...unsigned } = parsed.data;
+      const canonical = canonicalize(unsigned);
+      const signedBy = constantTimeEqual(mac, this.#mac(canonical, this.#integrityKey))
+        ? "current"
+        : this.#previousIntegrityKey && constantTimeEqual(mac, this.#mac(canonical, this.#previousIntegrityKey)) ? "previous" : null;
+      if (!signedBy) return { state: "invalid" };
+      return { state: "valid", file: { entries: parsed.data.entries, signedBy } };
     } catch (error) {
       return (error as NodeJS.ErrnoException).code === "ENOENT" ? { state: "missing" } : { state: "invalid" };
     }
