@@ -33,12 +33,14 @@ run_test() {
 
 test_redaction_masks_database_url_and_secret_assignments() {
   local output
-  output="$(redact 'DATABASE_URL=postgres://deploylite:super-secret@postgres:5432/deploylite POSTGRES_PASSWORD=hunter2 TOKEN_VALUE=abc')"
+  output="$(redact 'DATABASE_URL=postgres://deploylite:super-secret@postgres:5432/deploylite POSTGRES_PASSWORD=hunter2 TOKEN_VALUE=abc DEPLOYLITE_AGENT_ID=00000000-0000-4000-8000-000000000001 DEPLOYLITE_AGENT_BUILDER_REGISTRY_INTEGRITY_KEY=registry-secret')"
   assert_contains "$output" 'DATABASE_URL=[REDACTED]' || return 1
   assert_contains "$output" 'POSTGRES_PASSWORD=[REDACTED]' || return 1
   assert_contains "$output" 'TOKEN_VALUE=[REDACTED]' || return 1
   assert_not_contains "$output" 'super-secret' || return 1
   assert_not_contains "$output" 'hunter2' || return 1
+  assert_not_contains "$output" '00000000-0000-4000-8000-000000000001' || return 1
+  assert_not_contains "$output" 'registry-secret' || return 1
 }
 
 test_unsupported_host_fails_without_mutation() {
@@ -95,6 +97,9 @@ test_prepare_install_dir_preserves_existing_secret() {
   printf 'POSTGRES_PASSWORD=existing-secret\nDEPLOYLITE_PUBLIC_HOST=old-host\n' >"$ENV_FILE"
   chmod 644 "$ENV_FILE"
   as_root() { "$@"; }
+  random_secret() { printf 'generated-secret'; }
+  # shellcheck disable=SC2329 # invoked dynamically by ensure_env_value
+  random_uuid_v4() { printf '123e4567-e89b-42d3-a456-426614174000'; }
   prepare_install_dir >/dev/null
   saved="$(cat "$ENV_FILE")"
   assert_contains "$saved" 'POSTGRES_PASSWORD=existing-secret'
@@ -132,7 +137,101 @@ test_installed_compose_uses_source_tree_build_context() {
   rendered="$(cat "$COMPOSE_FILE")"
   assert_contains "$rendered" "context: ${ROOT_DIR}" || return 1
   assert_not_contains "$rendered" 'context: ../..' || return 1
+  assert_contains "$rendered" 'process.kill(1, 0)' || return 1
   rm -rf "$tmp"
+}
+
+test_prepare_install_dir_generates_required_agent_values_before_compose_preflight() {
+  local tmp compose_values config_values
+  tmp="$(mktemp -d)"
+  INSTALL_DIR="${tmp}/install"
+  COMPOSE_FILE="${INSTALL_DIR}/compose.yml"
+  ENV_FILE="${INSTALL_DIR}/.env"
+  STATE_DIR="${INSTALL_DIR}/.state"
+  DEPLOYLITE_PUBLIC_HOST="198.51.100.10"
+  as_root() { "$@"; }
+  # shellcheck disable=SC2329 # invoked dynamically by ensure_env_value
+  random_uuid_v4() { printf '123e4567-e89b-42d3-a456-426614174000'; }
+  # Each generator call receives a unique test marker without using real entropy.
+  random_secret() { local marker; marker="$(mktemp)"; rm -f "$marker"; printf 'independent-secret-%s' "${marker##*/}"; }
+  prepare_install_dir >/dev/null
+  compose_values="$(cat "$ENV_FILE")"
+  assert_contains "$compose_values" 'DEPLOYLITE_AGENT_ID=123e4567-e89b-42d3-a456-426614174000' || { rm -rf "$tmp"; return 1; }
+  assert_contains "$compose_values" 'DEPLOYLITE_AGENT_TOKEN=independent-secret-' || { rm -rf "$tmp"; return 1; }
+  assert_contains "$compose_values" 'DEPLOYLITE_AGENT_BUILDER_REGISTRY_INTEGRITY_KEY=independent-secret-' || { rm -rf "$tmp"; return 1; }
+  [[ "$(env_get DEPLOYLITE_AGENT_TOKEN)" != "$(env_get DEPLOYLITE_AGENT_BUILDER_REGISTRY_INTEGRITY_KEY)" ]] || { rm -rf "$tmp"; return 1; }
+  compose() {
+    if [[ "$*" == "config" ]]; then
+      config_values="$(cat "$ENV_FILE")"
+      assert_contains "$config_values" 'DEPLOYLITE_AGENT_ID=123e4567-e89b-42d3-a456-426614174000' || return 1
+      assert_contains "$config_values" 'DEPLOYLITE_AGENT_TOKEN=independent-secret-' || return 1
+      assert_contains "$config_values" 'DEPLOYLITE_AGENT_BUILDER_REGISTRY_INTEGRITY_KEY=independent-secret-' || return 1
+    fi
+  }
+  start_runtime
+  rm -rf "$tmp"
+}
+
+test_prepare_install_dir_preserves_existing_agent_values_on_rerun() {
+  local tmp saved
+  tmp="$(mktemp -d)"
+  INSTALL_DIR="${tmp}/install"
+  COMPOSE_FILE="${INSTALL_DIR}/compose.yml"
+  ENV_FILE="${INSTALL_DIR}/.env"
+  STATE_DIR="${INSTALL_DIR}/.state"
+  mkdir -p "$INSTALL_DIR"
+  cat >"$ENV_FILE" <<'EOF'
+POSTGRES_PASSWORD=existing-postgres
+DEPLOYLITE_SECRET_KEY=existing-api-key
+DEPLOYLITE_AGENT_ID=123e4567-e89b-42d3-a456-426614174000
+DEPLOYLITE_AGENT_TOKEN=existing-agent-token
+DEPLOYLITE_AGENT_BUILDER_REGISTRY_INTEGRITY_KEY=existing-registry-key
+EOF
+  as_root() { "$@"; }
+  random_secret() { printf 'must-not-be-generated'; }
+  # shellcheck disable=SC2329 # invoked dynamically by ensure_env_value
+  random_uuid_v4() { printf 'must-not-be-generated'; }
+  prepare_install_dir >/dev/null
+  saved="$(cat "$ENV_FILE")"
+  assert_contains "$saved" 'DEPLOYLITE_AGENT_TOKEN=existing-agent-token' || { rm -rf "$tmp"; return 1; }
+  assert_contains "$saved" 'DEPLOYLITE_AGENT_BUILDER_REGISTRY_INTEGRITY_KEY=existing-registry-key' || { rm -rf "$tmp"; return 1; }
+  assert_not_contains "$saved" 'must-not-be-generated' || { rm -rf "$tmp"; return 1; }
+  rm -rf "$tmp"
+}
+
+test_runtime_starts_agent_after_config_preflight() {
+  local calls=() tmp_runtime
+  compose() {
+    calls+=("$*")
+    if [[ "$*" == "config" ]]; then
+      assert_contains "$(cat "$ENV_FILE")" 'DEPLOYLITE_AGENT_ID=123e4567-e89b-42d3-a456-426614174000' || return 1
+    fi
+  }
+  tmp_runtime="$(mktemp -d)"
+  ENV_FILE="${tmp_runtime}/.env"
+  printf 'DEPLOYLITE_AGENT_ID=123e4567-e89b-42d3-a456-426614174000\n' >"$ENV_FILE"
+  start_runtime
+  [[ "${calls[0]}" == "config" ]] || { rm -rf "$tmp_runtime"; return 1; }
+  [[ " ${calls[*]} " == *" up -d --build api web agent "* ]] || { rm -rf "$tmp_runtime"; return 1; }
+  rm -rf "$tmp_runtime"
+}
+
+test_agent_health_failure_is_nonzero_and_redacts_diagnostics() {
+  local output status
+  wait_for_url() { :; }
+  compose() {
+    if [[ "$*" == logs* ]]; then
+      printf 'DEPLOYLITE_AGENT_TOKEN=agent-token-value DEPLOYLITE_AGENT_BUILDER_REGISTRY_INTEGRITY_KEY=registry-key-value\n'
+      return 0
+    fi
+    return 1
+  }
+  output="$(wait_for_health 2>&1)" && status=0 || status=$?
+  [[ "$status" -ne 0 ]] || return 1
+  assert_contains "$output" 'Agent startup failed' || return 1
+  assert_contains "$output" '[REDACTED]' || return 1
+  assert_not_contains "$output" 'agent-token-value' || return 1
+  assert_not_contains "$output" 'registry-key-value' || return 1
 }
 
 test_failure_cleanup_preserves_config_and_uses_compose_down_only() {
@@ -279,6 +378,10 @@ run_test 'missing Docker triggers Docker apt repository install path' test_insta
 run_test 'rerun preserves existing secret' test_prepare_install_dir_preserves_existing_secret
 run_test 'env generation writes private config' test_write_env_generates_once_with_private_permissions
 run_test 'installed compose keeps valid build context' test_installed_compose_uses_source_tree_build_context
+run_test 'fresh install generates agent values before compose preflight' test_prepare_install_dir_generates_required_agent_values_before_compose_preflight
+run_test 'rerun preserves existing agent values' test_prepare_install_dir_preserves_existing_agent_values_on_rerun
+run_test 'runtime starts agent after config preflight' test_runtime_starts_agent_after_config_preflight
+run_test 'agent health failure is surfaced with redacted diagnostics' test_agent_health_failure_is_nonzero_and_redacts_diagnostics
 run_test 'failure cleanup preserves config' test_failure_cleanup_preserves_config_and_uses_compose_down_only
 run_test 'final URL guides first owner setup' test_final_url_output_points_to_first_owner_setup
 run_test 'prompt_value returns default in noninteractive mode' test_prompt_value_returns_default_in_noninteractive_mode

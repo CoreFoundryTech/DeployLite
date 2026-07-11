@@ -103,6 +103,12 @@ services:
     networks:
       - control-plane
       - runtime
+    healthcheck:
+      # The agent has no HTTP listener; PID 1 is its long-running Node worker.
+      test: ["CMD", "node", "-e", "process.kill(1, 0)"]
+      interval: 10s
+      timeout: 5s
+      retries: 12
 
   web:
     build:
