@@ -180,10 +180,29 @@ export class DbDeploymentRepository implements DeploymentRepository {
     return toLogEvent(row);
   }
 
+  async appendAllocatedLog(event: Omit<LogEvent, "sequence">): Promise<LogEvent> {
+    // The unique deployment/sequence index is the concurrency authority. A
+    // concurrent writer can win between the read and insert, so retry its
+    // newly allocated sequence rather than surfacing a lifecycle 500.
+    for (let attempt = 0; attempt < 8; attempt += 1) {
+      const logs = await this.listLogs(event.deploymentId);
+      try {
+        return await this.appendLog({ ...event, sequence: Math.max(0, ...logs.map((log) => log.sequence)) + 1 });
+      } catch (error) {
+        if (attempt === 7 || !isDeploymentLogSequenceConflict(error)) throw error;
+      }
+    }
+    throw new Error("Failed to allocate deployment log sequence");
+  }
+
   async listLogs(deploymentId: string, afterSequence = -1): Promise<LogEvent[]> {
     const rows = await this.db.select().from(deploymentLogs).where(eq(deploymentLogs.deploymentId, deploymentId)).orderBy(asc(deploymentLogs.sequence));
     return toOrderedLogEvents(rows.filter((row) => row.sequence > afterSequence));
   }
+}
+
+function isDeploymentLogSequenceConflict(error: unknown): boolean {
+  return typeof error === "object" && error !== null && "code" in error && (error as { code?: unknown }).code === "23505";
 }
 
 function toAgent(row: typeof agents.$inferSelect): Agent {

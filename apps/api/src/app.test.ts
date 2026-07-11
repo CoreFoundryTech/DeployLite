@@ -134,6 +134,10 @@ function metadataRepositories() {
       calls.push("deployments.appendLog");
       throw new Error("metadata read routes must not append logs");
     },
+    async appendAllocatedLog() {
+      calls.push("deployments.appendAllocatedLog");
+      throw new Error("metadata read routes must not append logs");
+    },
     async listLogs(deploymentId) {
       calls.push("deployments.listLogs");
       return deploymentId === "dep-1" ? [{ id: "log-1", deploymentId, sequence: 1, level: "info", message: "Started", timestamp: "2026-01-01T00:00:00.000Z", redactionApplied: true, requestId: "req-1", correlationId: "req-1" }] : [];
@@ -500,39 +504,34 @@ describe("DeployLite API scaffold", () => {
     expect(body.data.audit).toMatchObject({ action: "agent.heartbeat", requestId: "req_heartbeat_1", correlationId: "req_heartbeat_1" });
   });
 
-  it("resumes SSE deployment logs after Last-Event-ID and keeps output redacted", async () => {
+  it("returns resumed deployment logs after Last-Event-ID and keeps output redacted", async () => {
     const { app } = await authFixture();
     const cookie = await loginCookie(app);
     const response = await app.inject({
       method: "GET",
-      url: "/api/v1/deployments/dep_mock_1/logs/stream",
+      url: "/api/v1/deployments/dep_mock_1/logs",
       headers: { cookie, "last-event-id": "1", "x-request-id": "req_logs_1" }
     });
 
     expect(response.statusCode).toBe(200);
-    expect(response.headers["content-type"]).toContain("text/event-stream");
-    expect(response.body).not.toContain("id: 1");
-    expect(response.body).toContain("id: 2");
+    expect(response.json().data.events).toHaveLength(2);
     expect(response.body).toContain("[REDACTED]");
     expect(response.body).not.toContain("dl_1234567890abcdef");
-    expect(response.body).toContain("req_logs_1");
-    expect(response.body).toContain(": keepalive");
   });
 
-  it("scopes deployment logs before streaming and treats an invalid resume cursor as a fresh bounded snapshot", async () => {
+  it("scopes deployment logs before returning the bounded initial snapshot", async () => {
     const { app } = await authFixture();
     const cookie = await loginCookie(app);
-    const missing = await app.inject({ method: "GET", url: "/api/v1/deployments/not-visible/logs/stream", headers: { cookie } });
+    const missing = await app.inject({ method: "GET", url: "/api/v1/deployments/not-visible/logs", headers: { cookie } });
     const stream = await app.inject({
       method: "GET",
-      url: "/api/v1/deployments/dep_mock_1/logs/stream",
+      url: "/api/v1/deployments/dep_mock_1/logs",
       headers: { cookie, "last-event-id": "not-a-sequence" }
     });
 
     expect(missing.statusCode).toBe(404);
     expect(stream.statusCode).toBe(200);
-    expect(stream.body).toContain("id: 1");
-    expect(stream.body).toContain("id: 2");
+    expect(stream.json().data.events).toHaveLength(2);
   });
 
   it("returns authenticated metadata list/detail envelopes without infrastructure side effects", async () => {
@@ -1801,6 +1800,7 @@ describe("Phase 5 slice 1 — DeploymentCommandBus control plane", () => {
       findById: (id) => delegate.findById(id),
       list: () => delegate.list(),
       appendLog: (event) => delegate.appendLog(event),
+      appendAllocatedLog: (event) => delegate.appendAllocatedLog(event),
       listLogs: (deploymentId, afterSequence) => delegate.listLogs(deploymentId, afterSequence)
     };
     const { app } = await authFixture({

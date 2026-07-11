@@ -74,6 +74,8 @@ declare module "fastify" {
 }
 
 const API_PREFIX = "/api/v1";
+const SSE_LOG_PAGE_LIMIT = 100;
+const SSE_POLL_INTERVAL_MS = 1_000;
 const AUTH_HEADER = "x-scaffold-auth";
 const SCAFFOLD_ACTOR = "scaffold-user";
 const defaultSessionCookieName = "deploylite_session";
@@ -865,7 +867,6 @@ async function ensureAgentDeploymentLifecycle(
   const event = {
     id: createRequestId(),
     deploymentId: deployment.id,
-    sequence: Math.max(0, ...logs.map((log) => log.sequence)) + 1,
     level: lifecycle.level,
     message: lifecycle.message,
     timestamp: command.completedAt ?? state.now().toISOString(),
@@ -874,7 +875,7 @@ async function ensureAgentDeploymentLifecycle(
     correlationId: command.correlationId
   } as const;
   try {
-    await state.deployments.appendLog(event);
+    await state.deployments.appendAllocatedLog(event);
   } catch (error) {
     const current = await state.deployments.listLogs(deployment.id);
     if (!current.some((log) => correlated(log.message, log.requestId, log.correlationId))) throw error;
@@ -913,11 +914,9 @@ async function appendDeploymentControlLog(
   message: string,
   request: FastifyRequest
 ): Promise<void> {
-  const existing = await state.deployments.listLogs(deploymentId);
-  await state.deployments.appendLog({
+  await state.deployments.appendAllocatedLog({
     id: createRequestId(),
     deploymentId,
-    sequence: Math.max(0, ...existing.map((event) => event.sequence)) + 1,
     level,
     message: redactLogMessage(message),
     timestamp: state.now().toISOString(),
@@ -1573,12 +1572,9 @@ function registerRoutes(app: FastifyInstance, state: PlatformRepositories, adapt
     } catch (error) {
       const failed: Deployment = { ...deployment, status: "failed", finishedAt: new Date().toISOString() };
       await state.deployments.save(failed);
-      const existingLogs = await state.deployments.listLogs(deployment.id);
-      const sequence = Math.max(0, ...existingLogs.map((event) => event.sequence)) + 1;
-      await state.deployments.appendLog({
+      await state.deployments.appendAllocatedLog({
         id: createRequestId(),
         deploymentId: deployment.id,
-        sequence,
         level: "error",
         message: "Deployment command submission or dispatch failed.",
         timestamp: new Date().toISOString(),
@@ -1652,19 +1648,52 @@ function registerRoutes(app: FastifyInstance, state: PlatformRepositories, adapt
     const params = z.object({ deploymentId: z.string().min(1) }).parse(request.params);
     const scoped = await resolveDeploymentScope(state, params.deploymentId);
     if (!scoped) return reply.code(404).send(errorEnvelope(request, "NOT_FOUND", "Deployment not found."));
-    const logs = await state.deployments.listLogs(scoped.deployment.id, sseResumeCursor(request));
-    const body = logs
-      .map((log) => `id: ${log.sequence}\nevent: deployment.log\ndata: ${JSON.stringify({ ...log, stream: request.correlationContext })}\n`)
-      .join("\n");
-    // This is a bounded snapshot stream: every browser reconnect resumes from
-    // Last-Event-ID. A single keepalive frame prevents buffering/proxy idle
-    // timeouts without retaining timers or listeners after the reply closes.
-    return reply
-      .header("content-type", "text/event-stream; charset=utf-8")
-      .header("cache-control", "no-cache, no-transform")
-      .header("connection", "keep-alive")
-      .header("x-accel-buffering", "no")
-      .send(`${body}\n: keepalive\n\n`);
+    let cursor = sseResumeCursor(request);
+    let emitting = false;
+    let closed = false;
+    const raw = reply.raw;
+    const cleanup = () => {
+      if (closed) return;
+      closed = true;
+      clearInterval(timer);
+      request.raw.off("close", cleanup);
+      raw.off("close", cleanup);
+    };
+    const write = (event: string, data: Record<string, unknown>, id?: number) => {
+      if (!closed) raw.write(`${id === undefined ? "" : `id: ${id}\n`}event: ${event}\ndata: ${JSON.stringify(data)}\n\n`);
+    };
+    const emit = async () => {
+      if (closed || emitting) return;
+      emitting = true;
+      try {
+        const current = await state.deployments.findById(scoped.deployment.id);
+        const logs = (await state.deployments.listLogs(scoped.deployment.id, cursor)).slice(0, SSE_LOG_PAGE_LIMIT);
+        for (const log of logs) {
+          cursor = log.sequence;
+          write("deployment.log", { ...log, stream: request.correlationContext }, log.sequence);
+        }
+        raw.write(": keepalive\n\n");
+        if (current) write("deployment.status", { status: current.status });
+        if (!current || ["succeeded", "failed", "canceled"].includes(current.status)) {
+          write("deployment.terminal", { status: current?.status ?? "unavailable" });
+          cleanup();
+          raw.end();
+        }
+      } finally {
+        emitting = false;
+      }
+    };
+    reply.hijack();
+    raw.writeHead(200, {
+      "content-type": "text/event-stream; charset=utf-8",
+      "cache-control": "no-cache, no-transform",
+      connection: "keep-alive",
+      "x-accel-buffering": "no"
+    });
+    const timer = setInterval(() => void emit(), SSE_POLL_INTERVAL_MS);
+    request.raw.once("close", cleanup);
+    raw.once("close", cleanup);
+    await emit();
   });
   app.post(`${API_PREFIX}/deployments/:deploymentId/cancel`, { preHandler: [requireAuth, requireMutationRole] }, async (request, reply) => {
     const params = z.object({ deploymentId: z.string().min(1) }).parse(request.params);
