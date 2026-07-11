@@ -932,6 +932,75 @@ function sseResumeCursor(request: FastifyRequest): number {
   return Number.isSafeInteger(cursor) ? cursor : -1;
 }
 
+type SseCloseEmitter = {
+  once(event: "close", listener: () => void): unknown;
+  off(event: "close", listener: () => void): unknown;
+};
+
+type SseResponse = SseCloseEmitter & {
+  write(chunk: string): unknown;
+  end(): unknown;
+};
+
+export type DeploymentLogSseStreamOptions = {
+  deployments: DeploymentRepository;
+  deploymentId: string;
+  correlationContext: { requestId: string; correlationId: string };
+  requestRaw: SseCloseEmitter;
+  raw: SseResponse;
+  cursor?: number;
+  timers?: Pick<typeof globalThis, "setInterval" | "clearInterval">;
+};
+
+/** Owns the SSE lifecycle so close handling can be tested without a network socket. */
+export function createDeploymentLogSseStream(options: DeploymentLogSseStreamOptions) {
+  let cursor = options.cursor ?? -1;
+  let emitting = false;
+  let closed = false;
+  const timers = options.timers ?? globalThis;
+  let timer: ReturnType<typeof setInterval> | undefined;
+  const cleanup = () => {
+    if (closed) return;
+    closed = true;
+    if (timer !== undefined) timers.clearInterval(timer);
+    options.requestRaw.off("close", cleanup);
+    options.raw.off("close", cleanup);
+  };
+  const write = (event: string, data: Record<string, unknown>, id?: number) => {
+    if (!closed) options.raw.write(`${id === undefined ? "" : `id: ${id}\n`}event: ${event}\ndata: ${JSON.stringify(data)}\n\n`);
+  };
+  const emit = async () => {
+    if (closed || emitting) return;
+    emitting = true;
+    try {
+      const current = await options.deployments.findById(options.deploymentId);
+      const logs = (await options.deployments.listLogs(options.deploymentId, cursor)).slice(0, SSE_LOG_PAGE_LIMIT);
+      for (const log of logs) {
+        cursor = log.sequence;
+        write("deployment.log", { ...log, stream: options.correlationContext }, log.sequence);
+      }
+      if (!closed) options.raw.write(": keepalive\n\n");
+      if (current) write("deployment.status", { status: current.status });
+      if (!current || ["succeeded", "failed", "canceled"].includes(current.status)) {
+        write("deployment.terminal", { status: current?.status ?? "unavailable" });
+        cleanup();
+        options.raw.end();
+      }
+    } finally {
+      emitting = false;
+    }
+  };
+  return {
+    async start() {
+      timer = timers.setInterval(() => void emit(), SSE_POLL_INTERVAL_MS);
+      options.requestRaw.once("close", cleanup);
+      options.raw.once("close", cleanup);
+      await emit();
+    },
+    cleanup
+  };
+}
+
 async function assignedCommand(state: PlatformRepositories, commandId: string, agentId: string): Promise<DeploymentCommand | null> {
   const command = await state.deploymentCommandBus.findById(commandId);
   return command?.agentId === agentId ? command : null;
@@ -1648,41 +1717,15 @@ function registerRoutes(app: FastifyInstance, state: PlatformRepositories, adapt
     const params = z.object({ deploymentId: z.string().min(1) }).parse(request.params);
     const scoped = await resolveDeploymentScope(state, params.deploymentId);
     if (!scoped) return reply.code(404).send(errorEnvelope(request, "NOT_FOUND", "Deployment not found."));
-    let cursor = sseResumeCursor(request);
-    let emitting = false;
-    let closed = false;
     const raw = reply.raw;
-    const cleanup = () => {
-      if (closed) return;
-      closed = true;
-      clearInterval(timer);
-      request.raw.off("close", cleanup);
-      raw.off("close", cleanup);
-    };
-    const write = (event: string, data: Record<string, unknown>, id?: number) => {
-      if (!closed) raw.write(`${id === undefined ? "" : `id: ${id}\n`}event: ${event}\ndata: ${JSON.stringify(data)}\n\n`);
-    };
-    const emit = async () => {
-      if (closed || emitting) return;
-      emitting = true;
-      try {
-        const current = await state.deployments.findById(scoped.deployment.id);
-        const logs = (await state.deployments.listLogs(scoped.deployment.id, cursor)).slice(0, SSE_LOG_PAGE_LIMIT);
-        for (const log of logs) {
-          cursor = log.sequence;
-          write("deployment.log", { ...log, stream: request.correlationContext }, log.sequence);
-        }
-        raw.write(": keepalive\n\n");
-        if (current) write("deployment.status", { status: current.status });
-        if (!current || ["succeeded", "failed", "canceled"].includes(current.status)) {
-          write("deployment.terminal", { status: current?.status ?? "unavailable" });
-          cleanup();
-          raw.end();
-        }
-      } finally {
-        emitting = false;
-      }
-    };
+    const stream = createDeploymentLogSseStream({
+      deployments: state.deployments,
+      deploymentId: scoped.deployment.id,
+      correlationContext: request.correlationContext,
+      requestRaw: request.raw,
+      raw,
+      cursor: sseResumeCursor(request)
+    });
     reply.hijack();
     raw.writeHead(200, {
       "content-type": "text/event-stream; charset=utf-8",
@@ -1690,10 +1733,7 @@ function registerRoutes(app: FastifyInstance, state: PlatformRepositories, adapt
       connection: "keep-alive",
       "x-accel-buffering": "no"
     });
-    const timer = setInterval(() => void emit(), SSE_POLL_INTERVAL_MS);
-    request.raw.once("close", cleanup);
-    raw.once("close", cleanup);
-    await emit();
+    await stream.start();
   });
   app.post(`${API_PREFIX}/deployments/:deploymentId/cancel`, { preHandler: [requireAuth, requireMutationRole] }, async (request, reply) => {
     const params = z.object({ deploymentId: z.string().min(1) }).parse(request.params);

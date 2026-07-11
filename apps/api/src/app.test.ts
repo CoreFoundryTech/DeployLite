@@ -17,9 +17,10 @@ import {
   type ProjectRepository
 } from "@deploylite/domain";
 import { createEnvSecretCipher, loadEnvSecretKey } from "@deploylite/config";
+import { EventEmitter } from "node:events";
 import { readFile } from "node:fs/promises";
 import { describe, expect, it } from "vitest";
-import { buildApiApp, createRuntimeRepositories, InMemoryAuditRepository, InMemoryAuthUserRepository, InMemorySessionRepository } from "./app.js";
+import { buildApiApp, createDeploymentLogSseStream, createRuntimeRepositories, InMemoryAuditRepository, InMemoryAuthUserRepository, InMemorySessionRepository } from "./app.js";
 
 const contentHeaders = { "content-type": "application/json" };
 const password = "correct horse battery staple";
@@ -27,6 +28,42 @@ const testEnvSecretKey = "deploylite-test-env-secret-key-1234567890";
 const testEnvSecretCipher = createEnvSecretCipher(loadEnvSecretKey(testEnvSecretKey));
 const testEnv: NodeJS.ProcessEnv = { ...process.env, DEPLOYLITE_SECRET_KEY: testEnvSecretKey };
 const UUID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
+
+function sseStreamFixture(status: "running" | "succeeded") {
+  const request = new EventEmitter();
+  const response = Object.assign(new EventEmitter(), {
+    writes: [] as string[],
+    ended: false,
+    write(chunk: string) { this.writes.push(chunk); },
+    end() { this.ended = true; }
+  });
+  const timers = new Map<number, () => void>();
+  let nextTimer = 1;
+  const deployments: DeploymentRepository = {
+    save: async (deployment) => deployment,
+    findById: async () => ({ id: "deployment-1", projectId: "project-1", agentId: "agent-1", status, commitSha: "abcdef1", startedAt: "2026-01-01T00:00:00.000Z", finishedAt: status === "succeeded" ? "2026-01-01T00:00:00.000Z" : null }),
+    list: async () => [],
+    appendLog: async (event) => event,
+    appendAllocatedLog: async (event) => ({ ...event, sequence: 1 }),
+    listLogs: async () => []
+  };
+  return {
+    request,
+    response,
+    timers,
+    stream: createDeploymentLogSseStream({
+      deployments,
+      deploymentId: "deployment-1",
+      correlationContext: { requestId: "req-sse", correlationId: "req-sse" },
+      requestRaw: request,
+      raw: response,
+      timers: {
+        setInterval(callback: () => void) { const id = nextTimer++; timers.set(id, callback); return id as unknown as ReturnType<typeof setInterval>; },
+        clearInterval(id) { timers.delete(id as unknown as number); }
+      }
+    })
+  };
+}
 
 function projectFixture(id = "project-1") {
   return {
@@ -1946,5 +1983,44 @@ describe("Phase 5 slice 1 — DeploymentCommandBus control plane", () => {
     expect(audit.inputs.some((event) => event.action === "deployment.rollback.rejected")).toBe(true);
 
     await app.close();
+  });
+});
+
+describe("Phase 5 slice 3 — Deployment log SSE lifecycle", () => {
+  it("closes the persistent stream on client abort and leaves no polling or close listeners behind", async () => {
+    const { request, response, stream, timers } = sseStreamFixture("running");
+    await stream.start();
+    const [poll] = timers.values();
+    expect(poll).toBeTypeOf("function");
+    expect(timers.size).toBe(1);
+    expect(request.listenerCount("close")).toBe(1);
+    expect(response.listenerCount("close")).toBe(1);
+
+    request.emit("close");
+    const writesAtClose = response.writes.length;
+    poll?.();
+    await Promise.resolve();
+    await Promise.resolve();
+
+    expect(timers.size).toBe(0);
+    expect(request.listenerCount("close")).toBe(0);
+    expect(response.listenerCount("close")).toBe(0);
+    expect(response.writes).toHaveLength(writesAtClose);
+    expect(response.ended).toBe(false);
+  });
+
+  it("ends on a terminal status and clears the polling timer and close listeners", async () => {
+    const { request, response, stream, timers } = sseStreamFixture("succeeded");
+    await stream.start();
+    const writesAtClose = response.writes.length;
+    response.emit("close");
+    await Promise.resolve();
+
+    expect(response.ended).toBe(true);
+    expect(response.writes.join("\n")).toContain("event: deployment.terminal");
+    expect(timers.size).toBe(0);
+    expect(request.listenerCount("close")).toBe(0);
+    expect(response.listenerCount("close")).toBe(0);
+    expect(response.writes).toHaveLength(writesAtClose);
   });
 });
