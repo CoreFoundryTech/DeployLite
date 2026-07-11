@@ -174,6 +174,48 @@ describe("FileManagedBuilderRegistry", () => {
     await expect(readFile(`${path}.recovery-required`, "utf8")).resolves.toBe("version=1\n");
   });
 
+  it("rejects an authenticated v2 envelope with more than 256 records without migration or leaking its contents", async () => {
+    const path = await pathFor();
+    const entries = Array.from({ length: 257 }, (_, index) => legacyEntry(`bound-record-${index}`));
+    const valid = legacyFile(entries);
+    const { mac, ...unsigned } = JSON.parse(valid) as { mac: string; version: 2; keyVersion: 1; entries: unknown[] };
+    expect(mac).toBe(createHmac("sha256", integrityKey).update(JSON.stringify(unsigned), "utf8").digest("hex"));
+    await writeFile(path, valid);
+    await writeFile(`${path}.backup`, valid);
+    await writeFile(`${path}.recovery-required`, "version=1\n");
+
+    const error = await registry(path).load().catch((reason: unknown) => reason);
+
+    expect(error).toBeInstanceOf(ManagedBuilderRegistryRecoveryError);
+    expect((error as Error).message).not.toContain("bound-record-0");
+    expect((error as Error).message).not.toContain(integrityKey);
+    await expect(readFile(`${path}.backup`, "utf8")).resolves.toBe(valid);
+    await expect(readFile(`${path}.recovery-required`, "utf8")).resolves.toBe("version=1\n");
+  });
+
+  it("rejects an authenticated v2 envelope larger than 64 KiB without migration or leaking its contents", async () => {
+    const path = await pathFor();
+    const entries = Array.from({ length: 256 }, (_, index) => {
+      const prefix = `bound-${index.toString().padStart(3, "0")}-`;
+      return legacyEntry(`${prefix}${"x".repeat(63 - prefix.length)}`);
+    });
+    const valid = legacyFile(entries);
+    const { mac, ...unsigned } = JSON.parse(valid) as { mac: string; version: 2; keyVersion: 1; entries: unknown[] };
+    expect(Buffer.byteLength(valid, "utf8")).toBeGreaterThan(64 * 1024);
+    expect(mac).toBe(createHmac("sha256", integrityKey).update(JSON.stringify(unsigned), "utf8").digest("hex"));
+    await writeFile(path, valid);
+    await writeFile(`${path}.backup`, valid);
+    await writeFile(`${path}.recovery-required`, "version=1\n");
+
+    const error = await registry(path).load().catch((reason: unknown) => reason);
+
+    expect(error).toBeInstanceOf(ManagedBuilderRegistryRecoveryError);
+    expect((error as Error).message).not.toContain("bound-000-");
+    expect((error as Error).message).not.toContain(integrityKey);
+    await expect(readFile(`${path}.backup`, "utf8")).resolves.toBe(valid);
+    await expect(readFile(`${path}.recovery-required`, "utf8")).resolves.toBe("version=1\n");
+  });
+
   it("resumes v2 migration after interruption at either v3 copy", async () => {
     for (const interruptedWrite of [1, 2]) {
       const path = await pathFor();
