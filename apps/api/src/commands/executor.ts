@@ -49,7 +49,6 @@ export type DeploymentExecutorDeps = {
  * the executor run inside that process.
  */
 export class MockDeploymentExecutor implements DeploymentExecutor {
-  readonly #sequenceByDeployment = new Map<string, number>();
   readonly #timers = new Map<string, NodeJS.Timeout>();
   readonly #bus: DeploymentCommandBus;
   readonly #deployments: DeploymentRepository;
@@ -180,12 +179,9 @@ export class MockDeploymentExecutor implements DeploymentExecutor {
   }
 
   async #appendLog(deployment: Deployment, level: "debug" | "info" | "warn" | "error", message: string, requestId: string, correlationId: string): Promise<void> {
-    const next = (this.#sequenceByDeployment.get(deployment.id) ?? 0) + 1;
-    this.#sequenceByDeployment.set(deployment.id, next);
-    await this.#deployments.appendLog({
+    await this.#deployments.appendAllocatedLog({
       id: createRequestId(),
       deploymentId: deployment.id,
-      sequence: next,
       level,
       message,
       timestamp: new Date().toISOString(),
