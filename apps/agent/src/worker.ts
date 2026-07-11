@@ -72,6 +72,7 @@ export type AgentWorkerOptions = {
   retryDelayMs?: number;
   heartbeatIntervalMs?: number;
   maxHeartbeatBackoffMs?: number;
+  operationalFailureThreshold?: number;
   cleanupRepairIntervalMs?: number;
   leaseRenewalIntervalMs?: number;
   now?: () => Date;
@@ -88,6 +89,12 @@ export class AgentWorker {
   readonly #now: () => Date;
   readonly #leaseRenewalIntervalMs: number;
   readonly #cleanupRepairIntervalMs: number;
+  readonly #operationalFailureThreshold: number;
+  readonly #readinessBlockedBy = new Set<"registration" | "poll" | "heartbeat">();
+  #registrationValid = false;
+  #hasOperationalExchange = false;
+  #readinessMarked = false;
+  #readinessUpdate: Promise<void> = Promise.resolve();
 
   constructor(private readonly options: AgentWorkerOptions) {
     this.#logger = options.logger ?? { log: () => undefined };
@@ -95,6 +102,7 @@ export class AgentWorker {
     this.#wait = options.wait ?? abortableWait;
     this.#heartbeatIntervalMs = Math.min(60_000, Math.max(5_000, options.heartbeatIntervalMs ?? 15_000));
     this.#maxHeartbeatBackoffMs = Math.min(60_000, Math.max(this.#retryDelayMs, options.maxHeartbeatBackoffMs ?? 30_000));
+    this.#operationalFailureThreshold = Math.min(10, Math.max(2, options.operationalFailureThreshold ?? 3));
     this.#now = options.now ?? (() => new Date());
     this.#leaseRenewalIntervalMs = Math.max(1, options.leaseRenewalIntervalMs ?? DEPLOYMENT_COMMAND_LEASE_RENEWAL_MS);
     this.#cleanupRepairIntervalMs = Math.min(60_000, Math.max(this.#retryDelayMs, options.cleanupRepairIntervalMs ?? 15_000));
@@ -103,23 +111,49 @@ export class AgentWorker {
   async run(signal: AbortSignal): Promise<void> {
     await this.options.readiness?.clear();
     try {
-      const initialSnapshot = resourceSnapshotSchema.parse(await this.options.resourceCollector.collect());
-      const registered = await this.options.transport.register({
-        agentId: this.options.agentId,
-        name: this.options.agentName,
-        endpoint: this.options.agentEndpoint,
-        observedAt: this.#now().toISOString(),
-        resourceSnapshot: initialSnapshot
-      }, signal);
-      if (registered.id !== this.options.agentId) throw new Error("Agent registration identity mismatch");
+      await this.register(signal);
+      if (signal.aborted) return;
       await Promise.all([this.pollLoop(signal), this.heartbeatLoop(signal), this.cleanupRepairLoop(signal)]);
     } finally {
+      this.#registrationValid = false;
+      this.#hasOperationalExchange = false;
+      this.#readinessMarked = false;
       await this.options.readiness?.clear();
+    }
+  }
+
+  private async register(signal: AbortSignal): Promise<void> {
+    let failures = 0;
+    let retryMs = this.#retryDelayMs;
+    while (!signal.aborted) {
+      try {
+        const initialSnapshot = resourceSnapshotSchema.parse(await this.options.resourceCollector.collect());
+        const registered = await this.options.transport.register({
+          agentId: this.options.agentId,
+          name: this.options.agentName,
+          endpoint: this.options.agentEndpoint,
+          observedAt: this.#now().toISOString(),
+          resourceSnapshot: initialSnapshot
+        }, signal);
+        if (registered.id !== this.options.agentId) throw new Error("Agent registration identity mismatch");
+        this.#registrationValid = true;
+        await this.recordOperationalSuccess("registration");
+        return;
+      } catch (error) {
+        if (signal.aborted) return;
+        failures += 1;
+        await this.recordOperationalFailure("registration", failures);
+        await this.safeLog("error", `Agent registration failed: ${safeError(error)}`);
+        await this.#wait(retryMs, signal);
+        retryMs = Math.min(this.#maxHeartbeatBackoffMs, Math.max(this.#retryDelayMs, retryMs * 2));
+      }
     }
   }
 
   private async pollLoop(signal: AbortSignal): Promise<void> {
     let terminalRetryMs = this.#retryDelayMs;
+    let apiFailures = 0;
+    let apiRetryMs = this.#retryDelayMs;
     let startupReconciled = false;
     while (!signal.aborted) {
       try {
@@ -137,7 +171,10 @@ export class AgentWorker {
         }
         const input = await this.options.transport.poll(this.options.agentId, signal);
         if (signal.aborted) break;
-        await this.options.readiness?.markReady();
+        apiFailures = 0;
+        apiRetryMs = this.#retryDelayMs;
+        this.#hasOperationalExchange = true;
+        await this.recordOperationalSuccess("poll");
         if (!input) {
           await this.#wait(this.#retryDelayMs, signal);
           continue;
@@ -150,8 +187,11 @@ export class AgentWorker {
         await this.executeWithLease(input, signal);
       } catch (error) {
         if (signal.aborted) break;
+        apiFailures += 1;
+        await this.recordOperationalFailure("poll", apiFailures);
         await this.safeLog("error", `Agent poll failed: ${safeError(error)}`);
-        await this.#wait(this.#retryDelayMs, signal);
+        await this.#wait(apiRetryMs, signal);
+        apiRetryMs = Math.min(this.#maxHeartbeatBackoffMs, Math.max(this.#retryDelayMs, apiRetryMs * 2));
       }
     }
   }
@@ -213,6 +253,7 @@ export class AgentWorker {
 
   private async heartbeatLoop(signal: AbortSignal): Promise<void> {
     let retryMs = this.#retryDelayMs;
+    let failures = 0;
     while (!signal.aborted) {
       await this.#wait(this.#heartbeatIntervalMs, signal);
       if (signal.aborted) break;
@@ -220,14 +261,41 @@ export class AgentWorker {
         const snapshot = resourceSnapshotSchema.parse(await this.options.resourceCollector.collect());
         const agent = await this.options.transport.heartbeat(this.options.agentId, this.#now().toISOString(), snapshot, signal);
         if (agent.id !== this.options.agentId) throw new Error("Agent heartbeat identity mismatch");
+        failures = 0;
         retryMs = this.#retryDelayMs;
+        this.#hasOperationalExchange = true;
+        await this.recordOperationalSuccess("heartbeat");
       } catch (error) {
         if (signal.aborted) break;
+        failures += 1;
+        await this.recordOperationalFailure("heartbeat", failures);
         await this.safeLog("error", `Agent heartbeat failed: ${safeError(error)}`);
         await this.#wait(retryMs, signal);
         retryMs = Math.min(this.#maxHeartbeatBackoffMs, Math.max(this.#retryDelayMs, retryMs * 2));
       }
     }
+  }
+
+  private async recordOperationalSuccess(source: "registration" | "poll" | "heartbeat"): Promise<void> {
+    this.#readinessBlockedBy.delete(source);
+    await this.syncReadiness();
+  }
+
+  private async recordOperationalFailure(source: "registration" | "poll" | "heartbeat", failures: number): Promise<void> {
+    if (failures < this.#operationalFailureThreshold) return;
+    this.#readinessBlockedBy.add(source);
+    await this.syncReadiness();
+  }
+
+  private async syncReadiness(): Promise<void> {
+    const shouldBeReady = this.#registrationValid && this.#hasOperationalExchange && this.#readinessBlockedBy.size === 0;
+    if (shouldBeReady === this.#readinessMarked) return;
+    this.#readinessMarked = shouldBeReady;
+    this.#readinessUpdate = this.#readinessUpdate.then(async () => {
+      if (shouldBeReady) await this.options.readiness?.markReady();
+      else await this.options.readiness?.clear();
+    });
+    await this.#readinessUpdate;
   }
 
   private async safeLog(level: "info" | "error", message: string): Promise<void> {

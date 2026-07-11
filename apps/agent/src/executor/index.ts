@@ -43,6 +43,7 @@ export type CommandBusClient = {
 export type HealthProbe = { probe(url: string, timeoutMs: number, signal?: AbortSignal): Promise<boolean> };
 export type RepositoryResolver = (hostname: string) => Promise<string[]>;
 export type RepositoryOriginPolicy = { allowedHosts: string[]; resolve?: RepositoryResolver };
+type GitNetworkPin = { hostname: string; address: string };
 export type BuildContextInspector = (workspace: string) => Promise<void>;
 export type HealthPolicy = {
   startupGraceMs?: number;
@@ -240,12 +241,12 @@ export class AgentDeploymentExecutor {
     let envFileWritten = false;
     let failure: unknown;
     try {
-      await this.assertRepositoryOrigin(input.repoUrl);
       await this.filesystem.create(workspace!);
-      // Resolve immediately before git starts as well as before workspace work,
-      // reducing the DNS-rebinding window without claiming to eliminate TOCTOU.
-      await this.assertRepositoryOrigin(input.repoUrl);
-      for (const plan of plans.slice(0, 3)) await this.run(plan, signal);
+      plans[0] = withGitNetworkPins(plans[0]!, await this.resolveRepositoryPins(input.repoUrl));
+      await this.run(plans[0]!, signal);
+      plans[1] = withGitNetworkPins(plans[1]!, await this.resolveRepositoryPins(input.repoUrl));
+      await this.run(plans[1]!, signal);
+      await this.run(plans[2]!, signal);
       await this.inspectBuildContext(workspace!);
       await this.managedBuilders.put({ version: 1, commandId: claimed.id, builderName: builderName(claimed.id) });
       managedResourcesAttempted = true;
@@ -368,15 +369,20 @@ export class AgentDeploymentExecutor {
     throw new Error("Health probe timed out");
   }
 
-  private async assertRepositoryOrigin(repoUrl: string): Promise<void> {
+  private async resolveRepositoryPins(repoUrl: string): Promise<GitNetworkPin[]> {
     const origin = parseRepositoryOrigin(repoUrl, this.repositoryPolicy.allowedHosts);
     const resolveHostname = this.repositoryPolicy.resolve ?? defaultRepositoryResolver;
-    let addresses: string[];
-    try { addresses = await resolveHostname(origin.hostname); }
+    let first: string[];
+    let second: string[];
+    try {
+      first = await resolveHostname(origin.hostname);
+      second = await resolveHostname(origin.hostname);
+    }
     catch { throw new Error("Repository origin resolution failed"); }
-    if (addresses.length === 0 || addresses.some((address) => isForbiddenRepositoryAddress(address))) {
+    if (!areApprovedRepositoryAddresses(first) || !areApprovedRepositoryAddresses(second) || !sameRepositoryAddresses(first, second)) {
       throw new Error("Repository origin is not permitted");
     }
+    return second.map((address) => ({ hostname: origin.hostname, address }));
   }
 
   /** Retire only exact, label-backed DeployLite runtimes after the replacement is healthy. */
@@ -828,6 +834,22 @@ function parseRepositoryOrigin(value: string, allowedHosts: string[]): URL {
   if (["api", "agent", "migrate", "postgres", "web"].includes(hostname) || !approved.has(hostname)) throw new Error("Repository origin is not permitted");
   url.hostname = hostname;
   return url;
+}
+function areApprovedRepositoryAddresses(addresses: string[]): boolean {
+  return addresses.length > 0 && addresses.every((address) => !isForbiddenRepositoryAddress(address));
+}
+function sameRepositoryAddresses(left: string[], right: string[]): boolean {
+  return left.length === right.length && [...left].sort().every((address, index) => address === [...right].sort()[index]);
+}
+function withGitNetworkPins(plan: CommandPlan, pins: GitNetworkPin[]): CommandPlan {
+  if (plan.command !== "git" || !["clone", "fetch"].includes(plan.args.find((argument) => argument === "clone" || argument === "fetch") ?? "")) {
+    throw new Error("Expected a Git network operation");
+  }
+  const configs = ["-c", "http.followRedirects=false", ...pins.flatMap((pin) => ["-c", `http.curloptResolve=${pin.hostname}:443:${formatGitResolveAddress(pin.address)}`])];
+  return { ...plan, args: [...configs, ...plan.args] };
+}
+function formatGitResolveAddress(address: string): string {
+  return address.includes(":") ? `[${address}]` : address;
 }
 async function defaultRepositoryResolver(hostname: string): Promise<string[]> {
   return (await lookup(hostname, { all: true })).map((record) => record.address);

@@ -234,9 +234,11 @@ test_missing_or_empty_repository_allowlist_fails_during_compose_preflight() {
 }
 
 test_agent_health_failure_is_nonzero_and_redacts_diagnostics() {
-  local output status
+  local output status calls_file
+  calls_file="$(mktemp)"
   wait_for_url() { :; }
   compose() {
+    printf '%s\n' "$*" >>"$calls_file"
     if [[ "$*" == logs* ]]; then
       printf 'DEPLOYLITE_AGENT_TOKEN=agent-token-value DEPLOYLITE_AGENT_BUILDER_REGISTRY_INTEGRITY_KEY=registry-key-value\n'
       return 0
@@ -249,6 +251,8 @@ test_agent_health_failure_is_nonzero_and_redacts_diagnostics() {
   assert_contains "$output" '[REDACTED]' || return 1
   assert_not_contains "$output" 'agent-token-value' || return 1
   assert_not_contains "$output" 'registry-key-value' || return 1
+  grep -Fqx 'up -d --wait --wait-timeout 150 agent' "$calls_file" || { rm -f "$calls_file"; return 1; }
+  rm -f "$calls_file"
 }
 
 test_failure_cleanup_preserves_config_and_uses_compose_down_only() {

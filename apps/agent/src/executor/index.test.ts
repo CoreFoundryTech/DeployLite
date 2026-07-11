@@ -56,6 +56,28 @@ describe("AgentDeploymentExecutor", () => {
     expect(vi.mocked(test.runner.run).mock.invocationCallOrder[3]).toBeLessThan(vi.mocked(test.filesystem.writeSecretFile).mock.invocationCallOrder[0]!);
   });
 
+  it("pins independently validated public DNS answers and disables redirects for clone and fetch", async () => {
+    const test = setup();
+    const resolve = vi.fn(async () => ["8.8.8.8", "2606:4700:4700::1111"]);
+    const executor = new AgentDeploymentExecutor(test.runner, test.bus, test.health, test.logger, async () => undefined, test.filesystem, executorConfig, test.cleanupRepairs, undefined, {}, { allowedHosts: ["github.com"], resolve }, async () => undefined);
+
+    const result = await executor.execute(input);
+    const gitPlans = result.commands.filter((plan) => plan.command === "git" && (plan.args.includes("clone") || plan.args.includes("fetch")));
+
+    expect(result.ok).toBe(true);
+    expect(resolve).toHaveBeenCalledTimes(4);
+    expect(gitPlans).toHaveLength(2);
+    for (const plan of gitPlans) {
+      expect(plan.args).toEqual(expect.arrayContaining([
+        "-c", "http.followRedirects=false",
+        "http.curloptResolve=github.com:443:8.8.8.8",
+        "http.curloptResolve=github.com:443:[2606:4700:4700::1111]"
+      ]));
+      expect(plan.args.join(" ")).not.toContain("sslVerify=false");
+      expect(plan.args.join(" ")).not.toContain("super-secret");
+    }
+  });
+
   it("does not fail or clean a healthy runtime when completion acknowledgement delivery fails", async () => {
     const test = setup();
     test.bus.complete = vi.fn(async () => { throw new Error("completion ACK lost"); });

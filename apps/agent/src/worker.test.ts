@@ -136,15 +136,72 @@ describe("AgentWorker", () => {
     expect(logger.log).toHaveBeenCalledWith("error", "Agent poll failed: transient network failure");
   });
 
-  it("clears readiness when registration fails before operational exchange", async () => {
+  it("keeps readiness absent and retries bounded registration failures without logging secrets", async () => {
+    const shutdown = new AbortController();
     const readiness = { clear: vi.fn(async () => undefined), markReady: vi.fn(async () => undefined) };
-    await expect(new AgentWorker({
+    const logger = { log: vi.fn() };
+    let waits = 0;
+    await new AgentWorker({
       agentId: "agent-1", agentName: "Agent", agentEndpoint: "http://agent.test",
-      transport: transport({ register: vi.fn(async () => { throw new Error("registration failed"); }) }),
-      executor: { execute: vi.fn(), reconcile: vi.fn() }, resourceCollector: { collect: async () => snapshot }, readiness
-    }).run(new AbortController().signal)).rejects.toThrow("registration failed");
+      transport: transport({ register: vi.fn(async () => { throw new Error("registration token=super-secret"); }) }),
+      executor: { execute: vi.fn(), reconcile: vi.fn() }, resourceCollector: { collect: async () => snapshot }, readiness, logger,
+      retryDelayMs: 1, operationalFailureThreshold: 2,
+      wait: async () => { waits += 1; if (waits === 2) shutdown.abort(); }
+    }).run(shutdown.signal);
     expect(readiness.markReady).not.toHaveBeenCalled();
     expect(readiness.clear).toHaveBeenCalledTimes(2);
+    expect(JSON.stringify(logger.log.mock.calls)).not.toContain("super-secret");
+  });
+
+  it("degrades established readiness only after consecutive poll failures and restores it after a later success", async () => {
+    const shutdown = new AbortController();
+    const events: string[] = [];
+    const readiness = { clear: vi.fn(async () => { events.push("clear"); }), markReady: vi.fn(async () => { events.push("ready"); }) };
+    let polls = 0;
+    let waits = 0;
+    await new AgentWorker({
+      agentId: "agent-1", agentName: "Agent", agentEndpoint: "http://agent.test",
+      transport: transport({ poll: vi.fn(async () => {
+        polls += 1;
+        if (polls >= 2 && polls <= 4) throw new Error("poll unavailable");
+        return null;
+      }) }), executor: { execute: vi.fn(), reconcile: vi.fn() }, resourceCollector: { collect: async () => snapshot }, readiness,
+      retryDelayMs: 1, maxHeartbeatBackoffMs: 4, operationalFailureThreshold: 3, heartbeatIntervalMs: 60_000,
+      wait: async (milliseconds) => { if (milliseconds === 1 || milliseconds === 2 || milliseconds === 4) { waits += 1; if (waits === 5) shutdown.abort(); } }
+    }).run(shutdown.signal);
+    expect(events).toEqual(["clear", "ready", "clear", "ready", "clear"]);
+  });
+
+  it("degrades readiness after consecutive heartbeat failures and restores it on the next successful heartbeat", async () => {
+    const shutdown = new AbortController();
+    const events: string[] = [];
+    const readiness = { clear: vi.fn(async () => { events.push("clear"); }), markReady: vi.fn(async () => { events.push("ready"); }) };
+    let heartbeats = 0;
+    let polls = 0;
+    await new AgentWorker({
+      agentId: "agent-1", agentName: "Agent", agentEndpoint: "http://agent.test",
+      transport: transport({
+        poll: vi.fn(async (_agentId, signal) => {
+          polls += 1;
+          if (polls === 1) return null;
+          await new Promise<void>((resolve) => signal.addEventListener("abort", () => resolve(), { once: true }));
+          return null;
+        }),
+        heartbeat: vi.fn(async () => {
+          heartbeats += 1;
+          if (heartbeats <= 3) throw new Error("heartbeat unavailable");
+          shutdown.abort();
+          return agent;
+        })
+      }), executor: { execute: vi.fn(), reconcile: vi.fn() }, resourceCollector: { collect: async () => snapshot }, readiness,
+      retryDelayMs: 1, maxHeartbeatBackoffMs: 4, operationalFailureThreshold: 3, heartbeatIntervalMs: 1,
+      wait: async (milliseconds, signal) => {
+        if (milliseconds === 5_000 || milliseconds === 1 || milliseconds === 2 || milliseconds === 4) return;
+        await new Promise<void>((resolve) => signal.addEventListener("abort", () => resolve(), { once: true }));
+      }
+    }).run(shutdown.signal);
+    expect(heartbeats).toBe(4);
+    expect(events).toEqual(expect.arrayContaining(["clear", "ready", "clear", "ready", "clear"]));
   });
 
   it("keeps readiness absent when a stalled poll times out, retries safely, and shuts down without leaking transport details", async () => {
