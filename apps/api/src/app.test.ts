@@ -43,6 +43,7 @@ function projectFixture(id = "project-1") {
 }
 
 type AuthFixtureOptions = {
+  audit?: InMemoryAuditRepository;
   dbMode?: boolean;
   env?: NodeJS.ProcessEnv;
   state?: NonNullable<Parameters<typeof buildApiApp>[0]>["state"];
@@ -64,7 +65,7 @@ async function authFixture(options: AuthFixtureOptions = {}) {
     updatedAt: now,
     ...options.user
   };
-  const audit = new InMemoryAuditRepository();
+  const audit = options.audit ?? new InMemoryAuditRepository();
   const sessions = new InMemorySessionRepository();
   const users = new InMemoryAuthUserRepository([user]);
   const state = options.state
@@ -1944,6 +1945,99 @@ describe("Phase 5 slice 1 — DeploymentCommandBus control plane", () => {
     expect(audit.inputs.some((event) => event.action === "deployment.cancel" && event.metadata?.["projectId"] === project.id)).toBe(true);
     expect(audit.inputs.some((event) => event.action === "deployment.restart.rejected")).toBe(true);
     expect(audit.inputs.some((event) => event.action === "deployment.rollback.rejected")).toBe(true);
+
+    await Promise.all(Array.from({ length: 101 }, (_, index) => deployments.appendAllocatedLog({
+      id: `terminal-log-${index}`,
+      deploymentId,
+      level: "info",
+      message: index === 100 ? "final token dl_1234567890abcdef must be redacted" : `terminal log ${index}`,
+      timestamp: now.toISOString(),
+      redactionApplied: true,
+      requestId: "req_terminal_logs",
+      correlationId: "req_terminal_logs"
+    })));
+    const stream = await app.inject({
+      method: "GET",
+      url: `/api/v1/deployments/${deploymentId}/logs/stream`,
+      headers: { cookie, "last-event-id": "999999" }
+    });
+    const terminalLog = stream.body.lastIndexOf("event: deployment.log");
+    const terminalStatus = stream.body.lastIndexOf("event: deployment.status");
+
+    expect(stream.statusCode).toBe(200);
+    expect(stream.headers["content-type"]).toContain("text/event-stream");
+    expect(stream.headers["cache-control"]).toContain("no-cache");
+    expect(stream.body).toContain("id: 1");
+    expect(stream.body).toContain(": keepalive");
+    expect(stream.body).toContain("event: deployment.terminal");
+    expect(stream.body).not.toContain("dl_1234567890abcdef");
+    expect(terminalLog).toBeGreaterThan(-1);
+    expect(terminalStatus).toBeGreaterThan(terminalLog);
+
+    await app.close();
+  });
+
+  it("repairs a cancelled command after projection and audit failures without duplicating control effects", async () => {
+    const agentId = "22222222-2222-4222-8222-222222222222";
+    const now = new Date("2026-07-11T10:30:00.000Z");
+    const agents = new InMemoryAgentRepository();
+    const deployments = new InMemoryDeploymentRepository();
+    const deploymentCommands = new InMemoryDeploymentCommandRepository();
+    const audit = new InMemoryAuditRepository();
+    await agents.save({ id: agentId, name: "External agent", endpoint: "https://agent.example.test", status: "online", lastHeartbeatAt: now.toISOString(), resourceSnapshot: null });
+
+    let remainingCancelledProjectionFailures = 2;
+    const saveDeployment = deployments.save.bind(deployments);
+    deployments.save = async (deployment) => {
+      if (deployment.status === "canceled" && remainingCancelledProjectionFailures > 0) {
+        remainingCancelledProjectionFailures -= 1;
+        throw new Error("transient projection failure");
+      }
+      return saveDeployment(deployment);
+    };
+    let rejectCancelAudit = true;
+    const appendAuditEvent = audit.append.bind(audit);
+    audit.append = async (input) => {
+      if (input.action === "deployment.cancel" && rejectCancelAudit) {
+        rejectCancelAudit = false;
+        throw new Error("transient audit failure");
+      }
+      return appendAuditEvent(input);
+    };
+
+    const { app } = await authFixture({
+      audit,
+      now: () => now,
+      env: { ...testEnv, NODE_ENV: "test", DEPLOYLITE_AGENT_ID: agentId, DEPLOYLITE_AGENT_TOKEN: "external-agent-token-for-tests-1234567890" },
+      state: { agents, deployments, deploymentCommands }
+    });
+    const cookie = await loginCookie(app);
+    const project = (await app.inject({
+      method: "POST",
+      url: "/api/v1/projects",
+      headers: { ...contentHeaders, cookie },
+      payload: { name: "Repair target", repoUrl: "https://github.com/example/repair-target", defaultBranch: "main", runCommand: "node server.js", port: 3000 }
+    })).json().data.project;
+    const trigger = await app.inject({
+      method: "POST",
+      url: `/api/v1/projects/${project.id}/deployments`,
+      headers: { ...contentHeaders, cookie },
+      payload: { agentId, commitSha: "abcdef1" }
+    });
+    const deploymentId = trigger.json().data.deployment.id as string;
+
+    const projectionFailure = await app.inject({ method: "POST", url: `/api/v1/deployments/${deploymentId}/cancel`, headers: { cookie } });
+    const auditFailure = await app.inject({ method: "POST", url: `/api/v1/deployments/${deploymentId}/cancel`, headers: { cookie } });
+    const repaired = await app.inject({ method: "POST", url: `/api/v1/deployments/${deploymentId}/cancel`, headers: { cookie } });
+    const repairedLogs = await deployments.listLogs(deploymentId);
+
+    expect(projectionFailure.statusCode).toBe(500);
+    expect(auditFailure.statusCode).toBe(500);
+    expect(repaired.statusCode).toBe(200);
+    expect(repaired.json().data.deployment).toMatchObject({ status: "canceled" });
+    expect(repairedLogs.filter((event) => event.message.includes("cancellation requested"))).toHaveLength(1);
+    expect(repairedLogs.filter((event) => event.message.includes("Deployment command cancelled"))).toHaveLength(1);
+    expect(audit.inputs.filter((event) => event.action === "deployment.cancel")).toHaveLength(1);
 
     await app.close();
   });
