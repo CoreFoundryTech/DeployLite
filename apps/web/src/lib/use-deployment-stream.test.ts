@@ -6,7 +6,7 @@ const frame = (sequence: number, message = "safe") => `id: ${sequence}\nevent: d
 describe("DeploymentStreamController", () => {
   it("resumes with Last-Event-ID, deduplicates events, and stops after a terminal status", async () => {
     const snapshots: unknown[] = [];
-    const fetchImpl = vi.fn(async (_url: unknown, init?: RequestInit) => new Response(frame(2) + frame(2) + "event: deployment.status\ndata: {\"status\":\"succeeded\"}\n\n", { status: 200 }));
+    const fetchImpl = vi.fn(async (_url: unknown, init?: RequestInit) => new Response(frame(2) + frame(2) + "event: deployment.terminal\ndata: {\"status\":\"succeeded\"}\n\n", { status: 200 }));
     const stream = new DeploymentStreamController({ deploymentId: "dep-1", apiBaseUrl: "https://api.example.test", initialEvents: [JSON.parse(frame(1).match(/data: (.+)/)?.[1] ?? "{}")], fetchImpl: fetchImpl as unknown as typeof fetch }, (snapshot) => snapshots.push(snapshot));
     stream.start();
     await vi.waitFor(() => expect(snapshots.at(-1)).toMatchObject({ state: "stopped", events: [{ sequence: 1 }, { sequence: 2 }] }));
@@ -57,5 +57,46 @@ describe("DeploymentStreamController", () => {
     const stream = new DeploymentStreamController({ deploymentId: "dep-1", apiBaseUrl: "https://api.example.test", fetchImpl: vi.fn(async () => new Response(unsafe, { status: 200 })) as unknown as typeof fetch }, (snapshot) => snapshots.push(snapshot), 0);
     stream.start();
     await vi.waitFor(() => expect(snapshots.at(-1)).toMatchObject({ state: "unavailable", events: [] }));
+  });
+
+  it("renders a live log chunk before a persistent stream closes", async () => {
+    const snapshots: Array<{ events: Array<{ sequence: number }>; state: string }> = [];
+    let writer!: ReadableStreamDefaultController<Uint8Array>;
+    const body = new ReadableStream<Uint8Array>({ start(controller) { writer = controller; } });
+    const stream = new DeploymentStreamController({
+      deploymentId: "dep-1",
+      apiBaseUrl: "https://api.example.test",
+      fetchImpl: vi.fn(async () => new Response(body, { status: 200 })) as unknown as typeof fetch
+    }, (snapshot) => snapshots.push(snapshot));
+
+    stream.start();
+    await vi.waitFor(() => expect(snapshots.at(-1)?.state).toBe("connected"));
+    writer.enqueue(new TextEncoder().encode(frame(1)));
+    await vi.waitFor(() => expect(snapshots.at(-1)).toMatchObject({ state: "connected", events: [{ sequence: 1 }] }));
+    writer.enqueue(new TextEncoder().encode("event: deployment.terminal\ndata: {\"status\":\"succeeded\"}\n\n"));
+    writer.close();
+    await vi.waitFor(() => expect(snapshots.at(-1)?.state).toBe("stopped"));
+  });
+
+  it("continues terminal pagination until the explicit terminal frame arrives", async () => {
+    const snapshots: Array<{ events: Array<{ sequence: number }>; state: string }> = [];
+    let writer!: ReadableStreamDefaultController<Uint8Array>;
+    const body = new ReadableStream<Uint8Array>({ start(controller) { writer = controller; } });
+    const stream = new DeploymentStreamController({
+      deploymentId: "dep-1",
+      apiBaseUrl: "https://api.example.test",
+      fetchImpl: vi.fn(async () => new Response(body, { status: 200 })) as unknown as typeof fetch
+    }, (snapshot) => snapshots.push(snapshot));
+
+    stream.start();
+    await vi.waitFor(() => expect(snapshots.at(-1)?.state).toBe("connected"));
+    writer.enqueue(new TextEncoder().encode("event: deployment.status\ndata: {\"status\":\"succeeded\"}\n\n" + Array.from({ length: 100 }, (_, index) => frame(index + 1)).join("")));
+    await vi.waitFor(() => expect(snapshots.at(-1)).toMatchObject({ state: "connected", events: Array.from({ length: 100 }, (_, index) => ({ sequence: index + 1 })) }));
+    writer.enqueue(new TextEncoder().encode(frame(101) + "event: deployment.terminal\ndata: {\"status\":\"succeeded\"}\n\n"));
+    writer.close();
+    await vi.waitFor(() => {
+      expect(snapshots.at(-1)?.state).toBe("stopped");
+      expect(snapshots.at(-1)?.events.some((event) => event.sequence === 101)).toBe(true);
+    });
   });
 });

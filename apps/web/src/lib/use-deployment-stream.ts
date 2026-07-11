@@ -37,6 +37,7 @@ export class DeploymentStreamController {
   #timer: ReturnType<typeof setTimeout> | null = null;
   #attempt = 0;
   #stopped = false;
+  #buffer = "";
 
   constructor(
     private readonly options: DeploymentStreamOptions,
@@ -77,8 +78,7 @@ export class DeploymentStreamController {
       if (response.status === 401 || response.status === 403) return this.update("unauthorized");
       if (!response.ok || !response.body) throw new Error("stream unavailable");
       this.update("connected");
-      const text = await response.text();
-      const terminal = this.consume(text);
+      const terminal = await this.consumeResponse(response);
       if (terminal === "unavailable") return this.update("unavailable");
       if (terminal) return this.update("stopped");
       this.reconnect();
@@ -99,17 +99,33 @@ export class DeploymentStreamController {
     return event ? String(event.sequence) : null;
   }
 
+  private async consumeResponse(response: Response): Promise<boolean | "unavailable"> {
+    const reader = response.body?.getReader();
+    if (!reader) throw new Error("stream unavailable");
+    const decoder = new TextDecoder();
+    let terminal: boolean | "unavailable" = false;
+    while (!this.#stopped) {
+      const { done, value } = await reader.read();
+      if (value) terminal ||= this.consume(decoder.decode(value, { stream: !done }));
+      if (terminal || done) break;
+    }
+    return terminal;
+  }
+
   private consume(text: string): boolean | "unavailable" {
     let terminal: boolean | "unavailable" = false;
-    for (const frame of text.split("\n\n")) {
+    this.#buffer += text;
+    const frames = this.#buffer.split("\n\n");
+    this.#buffer = frames.pop() ?? "";
+    for (const frame of frames) {
       const id = /^id:\s*(\d+)$/m.exec(frame)?.[1];
       const type = /^event:\s*(.+)$/m.exec(frame)?.[1];
       const data = /^data:\s*(.+)$/m.exec(frame)?.[1];
       if (!data) continue;
       try {
         const parsed = JSON.parse(data) as Record<string, unknown>;
-        if ((type === "deployment.status" || type === "deployment.terminal") && parsed.status === "unavailable") terminal = "unavailable";
-        if ((type === "deployment.status" || type === "deployment.terminal") && typeof parsed.status === "string" && terminalStatuses.has(parsed.status)) terminal = true;
+        if (type === "deployment.terminal" && parsed.status === "unavailable") terminal = "unavailable";
+        if (type === "deployment.terminal" && typeof parsed.status === "string" && terminalStatuses.has(parsed.status)) terminal = true;
         if (type === "deployment.log" && parsed.redactionApplied === true && typeof parsed.sequence === "number" && !this.#events.some((item) => item.sequence === parsed.sequence)) {
           this.#events = [...this.#events, { ...parsed, sequence: parsed.sequence, id: typeof parsed.id === "string" ? parsed.id : id ?? String(parsed.sequence) } as LogEvent]
             .sort((left, right) => left.sequence - right.sequence);
