@@ -4,6 +4,7 @@ import { dirname, relative, resolve } from "node:path";
 import { redactSecrets } from "@deploylite/config";
 import type { DeploymentCommand } from "@deploylite/contracts";
 import { redactEnvFileForLog } from "../redaction.js";
+import { InMemoryManagedBuilderRegistry, type ManagedBuilderRegistry } from "../managed-builders.js";
 
 const MAX_OUTPUT_BYTES = 64 * 1024;
 const MAX_TIMEOUT_MS = 10 * 60 * 1000;
@@ -50,6 +51,8 @@ export type CleanupRepairStore = {
   remove(commandId: string): Promise<void>;
   recoveryRequired?(): Promise<boolean>;
   completeRecovery?(records: CleanupRepairRecord[]): Promise<void>;
+  recoveryProgress?(): Promise<{ cursor: number; overflowReason?: string }>;
+  persistRecoveryPage?(records: CleanupRepairRecord[], cursor: number, overflowReason?: string): Promise<void>;
 };
 
 export type ExecutorConfig = { workspaceRoot: string; secretRoot: string };
@@ -180,7 +183,8 @@ export class AgentDeploymentExecutor {
     private readonly wait: (milliseconds: number) => Promise<void> = (milliseconds) => new Promise((resolveWait) => setTimeout(resolveWait, milliseconds)),
     private readonly filesystem: WorkspaceFilesystem = nodeWorkspaceFilesystem,
     private readonly config: ExecutorConfig = { workspaceRoot: `${AGENT_WORK_BASE}/workspaces`, secretRoot: AGENT_SECRET_BASE },
-    private readonly cleanupRepairs: CleanupRepairStore = { load: async () => [], put: async () => undefined, remove: async () => undefined }
+    private readonly cleanupRepairs: CleanupRepairStore = { load: async () => [], put: async () => undefined, remove: async () => undefined },
+    private readonly managedBuilders: ManagedBuilderRegistry = new InMemoryManagedBuilderRegistry()
   ) {}
 
   async execute(input: DeploymentExecutionInput, signal?: AbortSignal): Promise<DeploymentExecutionResult> {
@@ -214,6 +218,7 @@ export class AgentDeploymentExecutor {
     try {
       await this.filesystem.create(workspace!);
       for (const plan of plans.slice(0, 3)) await this.run(plan, signal);
+      await this.managedBuilders.put({ version: 1, commandId: claimed.id, builderName: builderName(claimed.id) });
       managedResourcesAttempted = true;
       for (const plan of plans.slice(3, -1)) await this.run(plan, signal);
       await this.filesystem.createSecretDirectory(secretDirectory);
@@ -269,7 +274,21 @@ export class AgentDeploymentExecutor {
         await this.safeLog("error", "Managed cleanup repair recovery discovery failed; recovery will retry.");
         return false;
       }
-      try { await this.cleanupRepairs.completeRecovery(reconstructed); }
+      const progress = this.cleanupRepairs.recoveryProgress && await this.cleanupRepairs.recoveryProgress();
+      if (progress?.overflowReason) return false;
+      if (reconstructed.length > 256) {
+        try { await this.cleanupRepairs.persistRecoveryPage?.([], progress?.cursor ?? 0, "Managed cleanup recovery exceeds the 256-record limit"); }
+        catch { await this.safeLog("error", "Managed cleanup repair recovery overflow marker could not be persisted; recovery will retry."); }
+        return false;
+      }
+      const cursor = progress?.cursor ?? 0;
+      const page = reconstructed.slice(cursor, cursor + REPAIR_RECORDS_PER_PASS);
+      try {
+        if (this.cleanupRepairs.persistRecoveryPage) await this.cleanupRepairs.persistRecoveryPage(page, cursor + page.length);
+        else if (cursor === 0) { await this.cleanupRepairs.completeRecovery(reconstructed); return this.reconcilePending(signal); }
+      } catch { await this.safeLog("error", "Managed cleanup repair recovery state could not be persisted; recovery will retry."); return false; }
+      if (cursor + page.length < reconstructed.length) return false;
+      try { await this.cleanupRepairs.completeRecovery(await this.cleanupRepairs.load()); }
       catch { await this.safeLog("error", "Managed cleanup repair recovery state could not be persisted; recovery will retry."); return false; }
     }
     let complete = true;
@@ -327,6 +346,7 @@ export class AgentDeploymentExecutor {
         consecutiveAbsent += 1;
         if (attempt === CLEANUP_ATTEMPTS - 1 && consecutiveAbsent >= 2) {
           await this.cleanupRepairs.remove(input.command.id);
+          await this.managedBuilders.remove(input.command.id);
           return true;
         }
       } else {
@@ -353,7 +373,8 @@ export class AgentDeploymentExecutor {
       const values = result.stdout.split(/\s+/).filter(Boolean);
       if (query.args[0] === "buildx") {
         const builder = builderName(input.command.id);
-        if (values.includes(builder)) removals.push({ command: "docker", args: ["buildx", "rm", "--force", builder] });
+        const registered = await this.managedBuilders.load();
+        if (registered.some((entry) => entry.commandId === input.command.id && entry.builderName === builder) && values.includes(builder)) removals.push({ command: "docker", args: ["buildx", "rm", "--force", builder] });
       } else {
         if (values.some((value) => !/^[a-f0-9]{12,64}$/i.test(value))) return null;
         for (const value of values) removals.push({ command: "docker", args: removalArgs(query, value) });
@@ -381,7 +402,10 @@ export class AgentDeploymentExecutor {
         if (record) records.set(record.commandId, record);
       }
     }
-    return [...records.values()].slice(0, REPAIR_RECORDS_PER_PASS);
+    for (const entry of await this.managedBuilders.load()) {
+      if (!records.has(entry.commandId)) records.set(entry.commandId, { version: 1, commandId: entry.commandId, projectSlug: "recovery" });
+    }
+    return [...records.values()].sort((a, b) => a.commandId.localeCompare(b.commandId));
   }
 
   private async runCleanupPlan(plan: CommandPlan, signal?: AbortSignal): Promise<ProcessResult> {

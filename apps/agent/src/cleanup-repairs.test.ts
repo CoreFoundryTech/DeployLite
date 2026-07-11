@@ -66,4 +66,16 @@ describe("FileCleanupRepairStore", () => {
       await chmod(directory, 0o700);
     }
   });
+
+  it("durably resumes recovery pages and retains an overflow marker", async () => {
+    const path = await pathFor("repairs.json");
+    await writeFile(path, JSON.stringify({ version: 1, records: [], recoveryPending: true }));
+    const first = new FileCleanupRepairStore(path);
+    await first.persistRecoveryPage!([repair], 1);
+    const restarted = new FileCleanupRepairStore(path);
+    await expect(restarted.recoveryProgress!()).resolves.toEqual({ cursor: 1, overflowReason: undefined });
+    await restarted.persistRecoveryPage!([], 1, "Managed cleanup recovery exceeds the 256-record limit");
+    await expect(new FileCleanupRepairStore(path).recoveryRequired()).resolves.toBe(true);
+    expect((await readFile(path, "utf8"))).toContain("exceeds the 256-record limit");
+  });
 });

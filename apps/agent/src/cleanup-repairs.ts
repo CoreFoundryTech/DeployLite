@@ -11,7 +11,7 @@ const repairSchema = z.object({
   commandId: z.string().regex(/^[a-z0-9][a-z0-9-]{0,62}$/),
   projectSlug: z.string().regex(/^[a-z0-9][a-z0-9-]{0,62}$/)
 }).strict();
-const fileSchema = z.object({ version: z.literal(1), records: z.array(repairSchema).max(MAX_RECORDS), recoveryPending: z.boolean().optional() }).strict();
+const fileSchema = z.object({ version: z.literal(1), records: z.array(repairSchema).max(MAX_RECORDS), recoveryPending: z.boolean().optional(), recoveryCursor: z.number().int().min(0).optional(), recoveryOverflowReason: z.string().max(256).optional() }).strict();
 
 export class CorruptCleanupRepairStoreError extends Error {
   constructor() {
@@ -24,6 +24,8 @@ export class FileCleanupRepairStore implements CleanupRepairStore {
   readonly #path: string;
   #records: CleanupRepairRecord[] | null = null;
   #recoveryPending = false;
+  #recoveryCursor = 0;
+  #recoveryOverflowReason: string | undefined;
 
   constructor(path: string) {
     if (!path.startsWith("/")) throw new Error("Cleanup repair path must be absolute");
@@ -39,6 +41,8 @@ export class FileCleanupRepairStore implements CleanupRepairStore {
       const parsed = fileSchema.parse(JSON.parse(contents));
       this.#records = parsed.records;
       this.#recoveryPending = parsed.recoveryPending === true;
+      this.#recoveryCursor = parsed.recoveryCursor ?? 0;
+      this.#recoveryOverflowReason = parsed.recoveryOverflowReason;
     } catch (error) {
       if ((error as NodeJS.ErrnoException).code === "ENOENT") {
         this.#records = [];
@@ -78,6 +82,25 @@ export class FileCleanupRepairStore implements CleanupRepairStore {
     return this.#recoveryPending;
   }
 
+  async recoveryProgress(): Promise<{ cursor: number; overflowReason?: string }> {
+    await this.load();
+    return { cursor: this.#recoveryCursor, overflowReason: this.#recoveryOverflowReason };
+  }
+
+  async persistRecoveryPage(records: CleanupRepairRecord[], cursor: number, overflowReason?: string): Promise<void> {
+    await this.load();
+    if (!this.#recoveryPending) throw new Error("Cleanup recovery is not pending");
+    const next = new Map(this.#records!.map((record) => [record.commandId, record]));
+    for (const record of records) next.set(record.commandId, repairSchema.parse(record));
+    if (next.size > MAX_RECORDS) throw new Error("Cleanup repair state is full");
+    const previousCursor = this.#recoveryCursor;
+    const previousOverflow = this.#recoveryOverflowReason;
+    this.#recoveryCursor = cursor;
+    this.#recoveryOverflowReason = overflowReason;
+    try { await this.#persist([...next.values()]); }
+    catch (error) { this.#recoveryCursor = previousCursor; this.#recoveryOverflowReason = previousOverflow; throw error; }
+  }
+
   async completeRecovery(records: CleanupRepairRecord[]): Promise<void> {
     await this.load();
     const deduped = [...new Map(records.map((record) => {
@@ -86,14 +109,18 @@ export class FileCleanupRepairStore implements CleanupRepairStore {
     })).values()];
     if (deduped.length > MAX_RECORDS) throw new Error("Cleanup repair state is full");
     const pending = this.#recoveryPending;
+    const cursor = this.#recoveryCursor;
+    const overflowReason = this.#recoveryOverflowReason;
     this.#recoveryPending = false;
+    this.#recoveryCursor = 0;
+    this.#recoveryOverflowReason = undefined;
     try { await this.#persist(deduped); }
-    catch (error) { this.#recoveryPending = pending; throw error; }
+    catch (error) { this.#recoveryPending = pending; this.#recoveryCursor = cursor; this.#recoveryOverflowReason = overflowReason; throw error; }
   }
 
   async #persist(records: CleanupRepairRecord[]): Promise<void> {
     const temporary = `${this.#path}.tmp-${process.pid}-${randomBytes(4).toString("hex")}`;
-    await writeFile(temporary, JSON.stringify(fileSchema.parse({ version: 1, records, recoveryPending: this.#recoveryPending || undefined })), { encoding: "utf8", mode: 0o600, flag: "wx" });
+    await writeFile(temporary, JSON.stringify(fileSchema.parse({ version: 1, records, recoveryPending: this.#recoveryPending || undefined, recoveryCursor: this.#recoveryCursor || undefined, recoveryOverflowReason: this.#recoveryOverflowReason })), { encoding: "utf8", mode: 0o600, flag: "wx" });
     await rename(temporary, this.#path);
     await chmod(this.#path, 0o600);
     this.#records = structuredClone(records);
@@ -107,5 +134,7 @@ export class InMemoryCleanupRepairStore implements CleanupRepairStore {
   async put(record: CleanupRepairRecord): Promise<void> { const parsed = repairSchema.parse(record); this.#records.set(parsed.commandId, parsed); }
   async remove(commandId: string): Promise<void> { this.#records.delete(commandId); }
   async recoveryRequired(): Promise<boolean> { return false; }
+  async recoveryProgress(): Promise<{ cursor: number; overflowReason?: string }> { return { cursor: 0 }; }
+  async persistRecoveryPage(records: CleanupRepairRecord[]): Promise<void> { for (const record of records) await this.put(record); }
   async completeRecovery(records: CleanupRepairRecord[]): Promise<void> { for (const record of records) await this.put(record); }
 }

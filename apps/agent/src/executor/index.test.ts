@@ -6,6 +6,7 @@ import { describe, expect, it, vi } from "vitest";
 import type { DeploymentCommand } from "@deploylite/contracts";
 import { AgentDeploymentExecutor, assertSafeRuntimePlan, createDeploymentPlan, createSpawnProcessRunner, type CleanupRepairStore, type CommandBusClient, type HealthProbe, type ProcessRunner, type SpawnedProcess, type WorkspaceFilesystem } from "./index.js";
 import { InMemoryCleanupRepairStore } from "../cleanup-repairs.js";
+import { InMemoryManagedBuilderRegistry } from "../managed-builders.js";
 
 const command: DeploymentCommand = {
   id: "command-1", deploymentId: "deployment-1", agentId: "agent-1", kind: "start", state: "pending", payload: {}, requestedBy: null,
@@ -428,6 +429,66 @@ describe("agent-only Docker socket compose boundary", () => {
 
     await expect(executor.reconcilePending()).resolves.toBe(false);
     expect(completeRecovery).not.toHaveBeenCalled();
+  });
+
+  it.each([0, 1, 16, 17, 255, 256])("persists all %i discovered repair records in bounded durable pages", async (count) => {
+    const records = new Map<string, { version: 1; commandId: string; projectSlug: string }>();
+    let pending = true;
+    let cursor = 0;
+    const store: CleanupRepairStore = {
+      load: vi.fn(async () => [...records.values()]), put: vi.fn(async (record) => { records.set(record.commandId, record); }), remove: vi.fn(async () => undefined),
+      recoveryRequired: vi.fn(async () => pending), recoveryProgress: vi.fn(async () => ({ cursor })),
+      persistRecoveryPage: vi.fn(async (page, next) => { for (const record of page) records.set(record.commandId, record); cursor = next; }),
+      completeRecovery: vi.fn(async () => { pending = false; })
+    };
+    const test = setup();
+    const lines = Array.from({ length: count }, (_, index) => `deploylite-command-${index}\ttrue\tcommand-${index}\tservice`).join("\n");
+    const runner: ProcessRunner = { run: vi.fn(async (plan) => ({ code: 0, stdout: plan.args[0] === "ps" ? lines : "", stderr: "", timedOut: false })) };
+    const executor = new AgentDeploymentExecutor(runner, test.bus, test.health, test.logger, async () => undefined, test.filesystem, executorConfig, store);
+    for (let attempt = 0; attempt < 20 && pending; attempt += 1) await executor.reconcilePending();
+    expect(pending).toBe(false);
+    expect(records.size).toBe(count);
+    expect(cursor).toBe(count);
+  });
+
+  it("fails closed at 257 discoveries and never clears the recovery marker", async () => {
+    let pending = true; let overflowReason: string | undefined;
+    const store: CleanupRepairStore = {
+      load: vi.fn(async () => []), put: vi.fn(async () => undefined), remove: vi.fn(async () => undefined), recoveryRequired: vi.fn(async () => pending),
+      recoveryProgress: vi.fn(async () => ({ cursor: 0, overflowReason })),
+      persistRecoveryPage: vi.fn(async (_page, _cursor, reason) => { overflowReason = reason; }), completeRecovery: vi.fn(async () => { pending = false; })
+    };
+    const test = setup();
+    const lines = Array.from({ length: 257 }, (_, index) => `deploylite-command-${index}\ttrue\tcommand-${index}\tservice`).join("\n");
+    const runner: ProcessRunner = { run: vi.fn(async (plan) => ({ code: 0, stdout: plan.args[0] === "ps" ? lines : "", stderr: "", timedOut: false })) };
+    const executor = new AgentDeploymentExecutor(runner, test.bus, test.health, test.logger, async () => undefined, test.filesystem, executorConfig, store);
+    await expect(executor.reconcilePending()).resolves.toBe(false);
+    expect(pending).toBe(true); expect(overflowReason).toContain("256-record");
+  });
+
+  it("ignores a similarly named builder unless it is in the durable managed registry", async () => {
+    const test = setup();
+    const registry = new InMemoryManagedBuilderRegistry();
+    const runner: ProcessRunner = { run: vi.fn(async (plan) => ({ code: 0, stdout: plan.args[0] === "buildx" ? "deploylite-command-1" : "", stderr: "", timedOut: false })) };
+    const executor = new AgentDeploymentExecutor(runner, test.bus, test.health, test.logger, async () => undefined, test.filesystem, executorConfig, test.cleanupRepairs, registry);
+    await executor.reconcile({ ...input, command: { ...command, state: "claimed" } });
+    expect(vi.mocked(runner.run).mock.calls.some(([plan]) => plan.args.includes("buildx") && plan.args.includes("rm"))).toBe(false);
+  });
+
+  it("recovers a builder-only orphan only from the managed registry", async () => {
+    const test = setup();
+    const registry = new InMemoryManagedBuilderRegistry();
+    await registry.put({ version: 1, commandId: "command-1", builderName: "deploylite-command-1" });
+    let listed = true;
+    const runner: ProcessRunner = { run: vi.fn(async (plan) => {
+      if (plan.args[0] === "buildx" && plan.args[1] === "ls") return { code: 0, stdout: listed ? "deploylite-command-1" : "", stderr: "", timedOut: false };
+      if (plan.args[0] === "buildx" && plan.args[1] === "rm") { listed = false; return { code: 0, stdout: "", stderr: "", timedOut: false }; }
+      return { code: 0, stdout: "", stderr: "", timedOut: false };
+    }) };
+    const executor = new AgentDeploymentExecutor(runner, test.bus, test.health, test.logger, async () => undefined, test.filesystem, executorConfig, test.cleanupRepairs, registry);
+    await executor.reconcile({ ...input, command: { ...command, state: "claimed" } });
+    expect(vi.mocked(runner.run)).toHaveBeenCalledWith(expect.objectContaining({ args: ["buildx", "rm", "--force", "deploylite-command-1"] }), expect.any(Number));
+    expect(await registry.load()).toEqual([]);
   });
 });
 
