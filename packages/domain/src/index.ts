@@ -121,6 +121,7 @@ export type DeploymentRepository = {
   findById(id: string): Promise<Deployment | null>;
   list(): Promise<Deployment[]>;
   appendLog(event: LogEvent): Promise<LogEvent>;
+  appendAllocatedLog(event: Omit<LogEvent, "sequence">): Promise<LogEvent>;
   listLogs(deploymentId: string, afterSequence?: number): Promise<LogEvent[]>;
 };
 
@@ -472,6 +473,7 @@ export function deploymentContainerName(projectSlug: string, commandId: string):
 export class InMemoryDeploymentRepository implements DeploymentRepository {
   readonly #deployments = new Map<string, Deployment>();
   readonly #logs = new Map<string, LogEvent[]>();
+  readonly #nextLogSequence = new Map<string, number>();
 
   async save(deployment: Deployment): Promise<Deployment> {
     this.#deployments.set(deployment.id, structuredClone(deployment));
@@ -493,7 +495,14 @@ export class InMemoryDeploymentRepository implements DeploymentRepository {
       throw new Error("Log sequences are immutable and unique per deployment");
     }
     this.#logs.set(event.deploymentId, [...events, safeEvent]);
+    this.#nextLogSequence.set(event.deploymentId, Math.max(this.#nextLogSequence.get(event.deploymentId) ?? 1, event.sequence + 1));
     return safeEvent;
+  }
+
+  async appendAllocatedLog(event: Omit<LogEvent, "sequence">): Promise<LogEvent> {
+    const sequence = this.#nextLogSequence.get(event.deploymentId) ?? 1;
+    this.#nextLogSequence.set(event.deploymentId, sequence + 1);
+    return this.appendLog({ ...event, sequence });
   }
 
   async listLogs(deploymentId: string, afterSequence = -1): Promise<LogEvent[]> {

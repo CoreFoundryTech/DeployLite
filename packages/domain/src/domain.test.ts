@@ -136,4 +136,20 @@ describe("domain foundation", () => {
     await commands.save({ ...baseCommand, state: "completed", completedAt: now.toISOString() });
     expect(await commands.findActiveForDeployment("dep_1")).toBeNull();
   });
+
+  it("allocates unique contiguous log sequences under concurrent writes", async () => {
+    const deployments = new InMemoryDeploymentRepository();
+    const events = await Promise.all(Array.from({ length: 128 }, (_, index) => deployments.appendAllocatedLog({
+      id: `log_${index}`,
+      deploymentId: "dep_1",
+      level: "info",
+      message: `concurrent log ${index}`,
+      timestamp: now.toISOString(),
+      redactionApplied: false,
+      requestId: "req_1",
+      correlationId: "req_1"
+    })));
+
+    expect(events.map((event) => event.sequence).sort((left, right) => left - right)).toEqual(Array.from({ length: 128 }, (_, index) => index + 1));
+  });
 });
