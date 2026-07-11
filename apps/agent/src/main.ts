@@ -5,6 +5,7 @@ import { AgentWorker, HttpAgentCommandTransport } from "./worker.js";
 import { DurableTerminalCommandBus, FileTerminalOutbox } from "./terminal-outbox.js";
 import { FileCleanupRepairStore } from "./cleanup-repairs.js";
 import { FileManagedBuilderRegistry } from "./managed-builders.js";
+import { FileAgentReadiness } from "./readiness.js";
 import { cpus, freemem, loadavg, totalmem } from "node:os";
 import { statfs } from "node:fs/promises";
 
@@ -75,7 +76,8 @@ export async function runAgentEntrypoint(env: NodeJS.ProcessEnv = process.env): 
         };
       }
     },
-    logger
+    logger,
+    readiness: new FileAgentReadiness(env.DEPLOYLITE_AGENT_READINESS_PATH ?? "/var/lib/deploylite/state/agent-ready")
   });
   const shutdown = new AbortController();
   const stop = () => shutdown.abort();

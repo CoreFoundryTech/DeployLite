@@ -3,6 +3,7 @@ import { z } from "zod";
 import { DEPLOYMENT_COMMAND_LEASE_RENEWAL_MS } from "@deploylite/domain";
 import type { CommandBusClient, DeploymentExecutionInput, DeploymentExecutionResult, ExecutorLogger } from "./executor/index.js";
 import { redactEnvFileForLog } from "./redaction.js";
+import type { AgentReadiness } from "./readiness.js";
 
 const executionInputSchema = z.object({
   command: deploymentCommandSchema,
@@ -31,6 +32,13 @@ export class AuthoritativeTerminalConflictError extends Error {
   ) {
     super("Agent command has a different authoritative terminal outcome");
     this.name = "AuthoritativeTerminalConflictError";
+  }
+}
+
+export class AgentRequestTimeoutError extends Error {
+  constructor() {
+    super("Agent API request timed out");
+    this.name = "AgentRequestTimeoutError";
   }
 }
 
@@ -68,6 +76,7 @@ export type AgentWorkerOptions = {
   leaseRenewalIntervalMs?: number;
   now?: () => Date;
   wait?: (milliseconds: number, signal: AbortSignal) => Promise<void>;
+  readiness?: AgentReadiness;
 };
 
 export class AgentWorker {
@@ -92,16 +101,21 @@ export class AgentWorker {
   }
 
   async run(signal: AbortSignal): Promise<void> {
-    const initialSnapshot = resourceSnapshotSchema.parse(await this.options.resourceCollector.collect());
-    const registered = await this.options.transport.register({
-      agentId: this.options.agentId,
-      name: this.options.agentName,
-      endpoint: this.options.agentEndpoint,
-      observedAt: this.#now().toISOString(),
-      resourceSnapshot: initialSnapshot
-    }, signal);
-    if (registered.id !== this.options.agentId) throw new Error("Agent registration identity mismatch");
-    await Promise.all([this.pollLoop(signal), this.heartbeatLoop(signal), this.cleanupRepairLoop(signal)]);
+    await this.options.readiness?.clear();
+    try {
+      const initialSnapshot = resourceSnapshotSchema.parse(await this.options.resourceCollector.collect());
+      const registered = await this.options.transport.register({
+        agentId: this.options.agentId,
+        name: this.options.agentName,
+        endpoint: this.options.agentEndpoint,
+        observedAt: this.#now().toISOString(),
+        resourceSnapshot: initialSnapshot
+      }, signal);
+      if (registered.id !== this.options.agentId) throw new Error("Agent registration identity mismatch");
+      await Promise.all([this.pollLoop(signal), this.heartbeatLoop(signal), this.cleanupRepairLoop(signal)]);
+    } finally {
+      await this.options.readiness?.clear();
+    }
   }
 
   private async pollLoop(signal: AbortSignal): Promise<void> {
@@ -123,6 +137,7 @@ export class AgentWorker {
         }
         const input = await this.options.transport.poll(this.options.agentId, signal);
         if (signal.aborted) break;
+        await this.options.readiness?.markReady();
         if (!input) {
           await this.#wait(this.#retryDelayMs, signal);
           continue;
@@ -224,18 +239,27 @@ export type HttpAgentTransportOptions = {
   apiUrl: string;
   token: string;
   fetch?: typeof fetch;
+  requestTimeoutMs?: number;
+  setTimeout?: (callback: () => void, milliseconds: number) => ReturnType<typeof setTimeout>;
+  clearTimeout?: (timeout: ReturnType<typeof setTimeout>) => void;
 };
 
 /** HTTP-only adapter. It uses fixed same-origin paths and never evaluates API output. */
 export class HttpAgentCommandTransport implements AgentCommandTransport {
   readonly #baseUrl: URL;
   readonly #fetch: typeof fetch;
+  readonly #requestTimeoutMs: number;
+  readonly #setTimeout: (callback: () => void, milliseconds: number) => ReturnType<typeof setTimeout>;
+  readonly #clearTimeout: (timeout: ReturnType<typeof setTimeout>) => void;
 
   constructor(private readonly options: HttpAgentTransportOptions) {
     this.#baseUrl = new URL(options.apiUrl);
     if (!/^https?:$/.test(this.#baseUrl.protocol)) throw new Error("Agent API URL must use HTTP or HTTPS");
     if (!options.token) throw new Error("Agent API token is required");
     this.#fetch = options.fetch ?? fetch;
+    this.#requestTimeoutMs = Math.min(60_000, Math.max(1_000, options.requestTimeoutMs ?? 10_000));
+    this.#setTimeout = options.setTimeout ?? setTimeout;
+    this.#clearTimeout = options.clearTimeout ?? clearTimeout;
   }
 
   async register(input: AgentRegistrationInput, signal: AbortSignal): Promise<Agent> {
@@ -293,18 +317,33 @@ export class HttpAgentCommandTransport implements AgentCommandTransport {
   private async request(path: string, init: RequestInit): Promise<unknown | null> {
     const url = new URL(path, this.#baseUrl);
     if (url.origin !== this.#baseUrl.origin) throw new Error("Agent transport refused a cross-origin request");
-    const response = await this.#fetch(url, {
-      ...init,
-      headers: { ...init.headers, authorization: `Bearer ${this.options.token}` }
-    });
-    if (response.status === 204) return null;
-    if (response.status === 409) {
-      const parsed = terminalConflictResponseSchema.safeParse(await response.json());
-      if (parsed.success) throw new AuthoritativeTerminalConflictError(parsed.data.data.authoritativeCommand, parsed.data.data.attemptedState, parsed.data.data.leaseConflict === true);
-      throw new Error("Agent API returned an invalid terminal conflict response");
+    const controller = new AbortController();
+    let timedOut = false;
+    const abort = () => controller.abort();
+    init.signal?.addEventListener("abort", abort, { once: true });
+    if (init.signal?.aborted) abort();
+    const timeout = this.#setTimeout(() => { timedOut = true; controller.abort(); }, this.#requestTimeoutMs);
+    try {
+      const response = await this.#fetch(url, {
+        ...init,
+        signal: controller.signal,
+        headers: { ...init.headers, authorization: `Bearer ${this.options.token}` }
+      });
+      if (response.status === 204) return null;
+      if (response.status === 409) {
+        const parsed = terminalConflictResponseSchema.safeParse(await response.json());
+        if (parsed.success) throw new AuthoritativeTerminalConflictError(parsed.data.data.authoritativeCommand, parsed.data.data.attemptedState, parsed.data.data.leaseConflict === true);
+        throw new Error("Agent API returned an invalid terminal conflict response");
+      }
+      if (!response.ok) throw new Error(`Agent API request failed with status ${response.status}`);
+      return await response.json();
+    } catch (error) {
+      if (timedOut) throw new AgentRequestTimeoutError();
+      throw error;
+    } finally {
+      this.#clearTimeout(timeout);
+      init.signal?.removeEventListener("abort", abort);
     }
-    if (!response.ok) throw new Error(`Agent API request failed with status ${response.status}`);
-    return response.json();
   }
 }
 

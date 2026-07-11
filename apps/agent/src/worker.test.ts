@@ -1,6 +1,6 @@
 import { describe, expect, it, vi } from "vitest";
 import type { Agent, DeploymentCommand } from "@deploylite/contracts";
-import { AgentWorker, AuthoritativeTerminalConflictError, HttpAgentCommandTransport, type AgentCommandTransport } from "./worker.js";
+import { AgentRequestTimeoutError, AgentWorker, AuthoritativeTerminalConflictError, HttpAgentCommandTransport, type AgentCommandTransport } from "./worker.js";
 
 const command: DeploymentCommand = {
   id: "command-1", deploymentId: "deployment-1", agentId: "agent-1", kind: "start", state: "pending", payload: {}, requestedBy: null,
@@ -74,6 +74,77 @@ describe("AgentWorker", () => {
       executor: { execute: vi.fn(), reconcile: vi.fn() }, resourceCollector: { collect: async () => snapshot }, terminalAcks
     }).run(shutdown.signal);
     expect(order).toEqual(["register", "replay", "poll"]);
+  });
+
+  it("writes readiness only after registration and a successful initial poll exchange", async () => {
+    const shutdown = new AbortController();
+    const readiness = { clear: vi.fn(async () => undefined), markReady: vi.fn(async () => undefined) };
+    await new AgentWorker({
+      agentId: "agent-1", agentName: "Agent", agentEndpoint: "http://agent.test", transport: transport(),
+      executor: { execute: vi.fn(), reconcile: vi.fn() }, resourceCollector: { collect: async () => snapshot }, readiness,
+      heartbeatIntervalMs: 60_000,
+      wait: async (_milliseconds, signal) => {
+        if (readiness.markReady.mock.calls.length > 0) shutdown.abort();
+        else await new Promise<void>((resolve) => signal.addEventListener("abort", () => resolve(), { once: true }));
+      }
+    }).run(shutdown.signal);
+    expect(readiness.markReady).toHaveBeenCalledOnce();
+    expect(readiness.clear).toHaveBeenCalledTimes(2);
+  });
+
+  it("keeps readiness absent until a transient initial poll failure recovers", async () => {
+    const shutdown = new AbortController();
+    const readiness = { clear: vi.fn(async () => undefined), markReady: vi.fn(async () => undefined) };
+    let waits = 0;
+    const commandTransport = transport({ poll: vi.fn(async () => {
+      if (readiness.markReady.mock.calls.length === 0 && waits === 0) throw new Error("network unavailable");
+      return null;
+    }) });
+    await new AgentWorker({
+      agentId: "agent-1", agentName: "Agent", agentEndpoint: "http://agent.test", transport: commandTransport,
+      executor: { execute: vi.fn(), reconcile: vi.fn() }, resourceCollector: { collect: async () => snapshot }, readiness,
+      heartbeatIntervalMs: 60_000,
+      wait: async (milliseconds, signal) => {
+        if (milliseconds !== 1_000) await new Promise<void>((resolve) => signal.addEventListener("abort", () => resolve(), { once: true }));
+        else { waits += 1; if (waits === 2) shutdown.abort(); }
+      }
+    }).run(shutdown.signal);
+    expect(commandTransport.poll).toHaveBeenCalledTimes(2);
+    expect(readiness.markReady).toHaveBeenCalledOnce();
+  });
+
+  it("keeps established readiness through a later transient poll failure", async () => {
+    const shutdown = new AbortController();
+    const events: string[] = [];
+    const readiness = { clear: vi.fn(async () => { events.push("clear"); }), markReady: vi.fn(async () => { events.push("ready"); }) };
+    let polls = 0;
+    let waits = 0;
+    const logger = { log: vi.fn() };
+    await new AgentWorker({
+      agentId: "agent-1", agentName: "Agent", agentEndpoint: "http://agent.test", transport: transport({ poll: vi.fn(async () => {
+        polls += 1;
+        if (polls === 2) throw new Error("transient network failure");
+        return null;
+      }) }), executor: { execute: vi.fn(), reconcile: vi.fn() }, resourceCollector: { collect: async () => snapshot }, readiness, logger,
+      heartbeatIntervalMs: 60_000,
+      wait: async (milliseconds, signal) => {
+        if (milliseconds !== 1_000) await new Promise<void>((resolve) => signal.addEventListener("abort", () => resolve(), { once: true }));
+        else { waits += 1; if (waits === 2) shutdown.abort(); }
+      }
+    }).run(shutdown.signal);
+    expect(events).toEqual(["clear", "ready", "clear"]);
+    expect(logger.log).toHaveBeenCalledWith("error", "Agent poll failed: transient network failure");
+  });
+
+  it("clears readiness when registration fails before operational exchange", async () => {
+    const readiness = { clear: vi.fn(async () => undefined), markReady: vi.fn(async () => undefined) };
+    await expect(new AgentWorker({
+      agentId: "agent-1", agentName: "Agent", agentEndpoint: "http://agent.test",
+      transport: transport({ register: vi.fn(async () => { throw new Error("registration failed"); }) }),
+      executor: { execute: vi.fn(), reconcile: vi.fn() }, resourceCollector: { collect: async () => snapshot }, readiness
+    }).run(new AbortController().signal)).rejects.toThrow("registration failed");
+    expect(readiness.markReady).not.toHaveBeenCalled();
+    expect(readiness.clear).toHaveBeenCalledTimes(2);
   });
 
   it("reconciles an owned claimed command after the durable outbox and never executes it again", async () => {
@@ -282,6 +353,7 @@ describe("AgentWorker", () => {
     });
     const wait = async (milliseconds: number, signal: AbortSignal) => {
       if (milliseconds === 5_000) return;
+      if (signal.aborted) return;
       await new Promise<void>((resolve) => signal.addEventListener("abort", () => resolve(), { once: true }));
     };
     await new AgentWorker({
@@ -313,6 +385,18 @@ describe("HttpAgentCommandTransport", () => {
     const commandTransport = new HttpAgentCommandTransport({ apiUrl: "https://api.example.test", token: "secret-agent-token", fetch: fetchMock });
     await expect(commandTransport.register({ agentId: "agent-1", name: "Agent", endpoint: "http://agent.test", observedAt: "2026-01-01T00:00:00.000Z", resourceSnapshot: snapshot }, new AbortController().signal)).resolves.toEqual(agent);
     expect(String(fetchMock.mock.calls[0]![0])).toBe("https://api.example.test/api/v1/agent/register");
+  });
+
+  it("aborts a stalled request and reports a safe timeout error", async () => {
+    const fetchMock = vi.fn<typeof fetch>((_input, init) => new Promise<Response>((_resolve, reject) => {
+      init?.signal?.addEventListener("abort", () => reject(new DOMException("aborted", "AbortError")), { once: true });
+    }));
+    const commandTransport = new HttpAgentCommandTransport({
+      apiUrl: "https://api.example.test", token: "secret-agent-token", fetch: fetchMock, requestTimeoutMs: 1_000,
+      setTimeout: (callback) => { queueMicrotask(callback); return 0 as unknown as ReturnType<typeof setTimeout>; }, clearTimeout: () => undefined
+    });
+    await expect(commandTransport.register({ agentId: "agent-1", name: "Agent", endpoint: "http://agent.test", observedAt: "2026-01-01T00:00:00.000Z", resourceSnapshot: snapshot }, new AbortController().signal)).rejects.toBeInstanceOf(AgentRequestTimeoutError);
+    expect(fetchMock.mock.calls[0]![1]?.signal?.aborted).toBe(true);
   });
 
   it("parses an authoritative lease conflict so a stale fail outbox can drain", async () => {

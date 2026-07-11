@@ -126,7 +126,7 @@ test_write_env_generates_once_with_private_permissions() {
 }
 
 test_installed_compose_uses_source_tree_build_context() {
-  local tmp rendered
+  local tmp rendered agent_block
   tmp="$(mktemp -d)"
   INSTALL_DIR="${tmp}/install"
   COMPOSE_FILE="${INSTALL_DIR}/compose.yml"
@@ -137,7 +137,11 @@ test_installed_compose_uses_source_tree_build_context() {
   rendered="$(cat "$COMPOSE_FILE")"
   assert_contains "$rendered" "context: ${ROOT_DIR}" || return 1
   assert_not_contains "$rendered" 'context: ../..' || return 1
-  assert_contains "$rendered" 'process.kill(1, 0)' || return 1
+  agent_block="${rendered#*  agent:}"
+  agent_block="${agent_block%%$'\n  web:'*}"
+  assert_contains "$rendered" 'test -f /var/lib/deploylite/state/agent-ready' || return 1
+  assert_not_contains "$rendered" 'process.kill(1, 0)' || return 1
+  assert_not_contains "$agent_block" 'ports:' || return 1
   rm -rf "$tmp"
 }
 
