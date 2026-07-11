@@ -15,4 +15,13 @@ describe("agent transport environment", () => {
     expect(() => parseDeployLiteEnv({ DEPLOYLITE_AGENT_ID: "agent-1", DEPLOYLITE_AGENT_TOKEN: "short" })).toThrow();
     expect(() => parseDeployLiteEnv({ DEPLOYLITE_AGENT_TOKEN: "agent-token-with-at-least-32-characters" })).toThrow();
   });
+
+  it("validates registry integrity keys while allowing an empty optional previous key", () => {
+    expect(() => parseDeployLiteEnv({ DEPLOYLITE_AGENT_BUILDER_REGISTRY_INTEGRITY_KEY: "short" })).toThrow();
+    const parsed = parseDeployLiteEnv({
+      DEPLOYLITE_AGENT_BUILDER_REGISTRY_INTEGRITY_KEY: "registry-integrity-key-with-at-least-32-chars",
+      DEPLOYLITE_AGENT_BUILDER_REGISTRY_PREVIOUS_INTEGRITY_KEY: ""
+    });
+    expect(parsed.DEPLOYLITE_AGENT_BUILDER_REGISTRY_PREVIOUS_INTEGRITY_KEY).toBeUndefined();
+  });
 });

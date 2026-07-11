@@ -86,11 +86,14 @@ services:
       DEPLOYLITE_API_URL: http://api:3001
       DEPLOYLITE_AGENT_ID: ${DEPLOYLITE_AGENT_ID:?DEPLOYLITE_AGENT_ID is required}
       DEPLOYLITE_AGENT_TOKEN: ${DEPLOYLITE_AGENT_TOKEN:?DEPLOYLITE_AGENT_TOKEN is required}
+      DEPLOYLITE_AGENT_BUILDER_REGISTRY_INTEGRITY_KEY: ${DEPLOYLITE_AGENT_BUILDER_REGISTRY_INTEGRITY_KEY:?DEPLOYLITE_AGENT_BUILDER_REGISTRY_INTEGRITY_KEY is required}
+      DEPLOYLITE_AGENT_BUILDER_REGISTRY_PREVIOUS_INTEGRITY_KEY: ${DEPLOYLITE_AGENT_BUILDER_REGISTRY_PREVIOUS_INTEGRITY_KEY:-}
       DEPLOYLITE_AGENT_NAME: ${DEPLOYLITE_AGENT_NAME:-DeployLite VPS Agent}
       DEPLOYLITE_AGENT_ENDPOINT: ${DEPLOYLITE_AGENT_ENDPOINT:-http://agent:3002}
       DEPLOYLITE_AGENT_WORKSPACE_ROOT: /var/lib/deploylite/workspaces
       DEPLOYLITE_AGENT_OUTBOX_PATH: /var/lib/deploylite/state/terminal-acks.json
       DEPLOYLITE_AGENT_CLEANUP_REPAIR_PATH: /var/lib/deploylite/state/cleanup-repairs.json
+      DEPLOYLITE_AGENT_BUILDER_REGISTRY_PATH: /var/lib/deploylite/state/managed-builders.json
     volumes:
       - /var/run/docker.sock:/var/run/docker.sock
       - agent-workspaces:/var/lib/deploylite/workspaces
