@@ -121,6 +121,7 @@ export type DeploymentRepository = {
   findById(id: string): Promise<Deployment | null>;
   list(): Promise<Deployment[]>;
   appendLog(event: LogEvent): Promise<LogEvent>;
+  appendAllocatedLog(event: Omit<LogEvent, "sequence">): Promise<LogEvent>;
   listLogs(deploymentId: string, afterSequence?: number): Promise<LogEvent[]>;
 };
 
@@ -494,6 +495,11 @@ export class InMemoryDeploymentRepository implements DeploymentRepository {
     }
     this.#logs.set(event.deploymentId, [...events, safeEvent]);
     return safeEvent;
+  }
+
+  async appendAllocatedLog(event: Omit<LogEvent, "sequence">): Promise<LogEvent> {
+    const events = this.#logs.get(event.deploymentId) ?? [];
+    return this.appendLog({ ...event, sequence: Math.max(0, ...events.map((item) => item.sequence)) + 1 });
   }
 
   async listLogs(deploymentId: string, afterSequence = -1): Promise<LogEvent[]> {

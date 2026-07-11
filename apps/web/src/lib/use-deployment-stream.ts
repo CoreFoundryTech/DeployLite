@@ -76,10 +76,10 @@ export class DeploymentStreamController {
       if (this.#stopped) return;
       if (response.status === 401 || response.status === 403) return this.update("unauthorized");
       if (!response.ok || !response.body) throw new Error("stream unavailable");
-      this.#attempt = 0;
       this.update("connected");
       const text = await response.text();
       const terminal = this.consume(text);
+      if (terminal === "unavailable") return this.update("unavailable");
       if (terminal) return this.update("stopped");
       this.reconnect();
     } catch (error) {
@@ -99,8 +99,8 @@ export class DeploymentStreamController {
     return event ? String(event.sequence) : null;
   }
 
-  private consume(text: string): boolean {
-    let terminal = false;
+  private consume(text: string): boolean | "unavailable" {
+    let terminal: boolean | "unavailable" = false;
     for (const frame of text.split("\n\n")) {
       const id = /^id:\s*(\d+)$/m.exec(frame)?.[1];
       const type = /^event:\s*(.+)$/m.exec(frame)?.[1];
@@ -108,10 +108,12 @@ export class DeploymentStreamController {
       if (!data) continue;
       try {
         const parsed = JSON.parse(data) as Record<string, unknown>;
-        if (type === "deployment.status" && typeof parsed.status === "string" && terminalStatuses.has(parsed.status)) terminal = true;
+        if ((type === "deployment.status" || type === "deployment.terminal") && parsed.status === "unavailable") terminal = "unavailable";
+        if ((type === "deployment.status" || type === "deployment.terminal") && typeof parsed.status === "string" && terminalStatuses.has(parsed.status)) terminal = true;
         if (type === "deployment.log" && parsed.redactionApplied === true && typeof parsed.sequence === "number" && !this.#events.some((item) => item.sequence === parsed.sequence)) {
           this.#events = [...this.#events, { ...parsed, sequence: parsed.sequence, id: typeof parsed.id === "string" ? parsed.id : id ?? String(parsed.sequence) } as LogEvent]
             .sort((left, right) => left.sequence - right.sequence);
+          this.#attempt = 0;
           this.publish({ events: this.#events, state: this.#state });
         }
       } catch {
