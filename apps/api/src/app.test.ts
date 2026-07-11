@@ -1,6 +1,7 @@
 import { BcryptPasswordHasher, createOpaqueSessionToken, hashSessionToken } from "@deploylite/db";
 import {
   InitialAdminAlreadyExistsError,
+  InMemoryAgentRepository,
   InMemoryDeploymentCommandRepository,
   InMemoryDeploymentRepository,
   InMemoryEnvSecretValueRepository,
@@ -523,6 +524,23 @@ describe("DeployLite API scaffold", () => {
     expect(response.body).toContain("[REDACTED]");
     expect(response.body).not.toContain("dl_1234567890abcdef");
     expect(response.body).toContain("req_logs_1");
+    expect(response.body).toContain(": keepalive");
+  });
+
+  it("scopes deployment logs before streaming and treats an invalid resume cursor as a fresh bounded snapshot", async () => {
+    const { app } = await authFixture();
+    const cookie = await loginCookie(app);
+    const missing = await app.inject({ method: "GET", url: "/api/v1/deployments/not-visible/logs/stream", headers: { cookie } });
+    const stream = await app.inject({
+      method: "GET",
+      url: "/api/v1/deployments/dep_mock_1/logs/stream",
+      headers: { cookie, "last-event-id": "not-a-sequence" }
+    });
+
+    expect(missing.statusCode).toBe(404);
+    expect(stream.statusCode).toBe(200);
+    expect(stream.body).toContain("id: 1");
+    expect(stream.body).toContain("id: 2");
   });
 
   it("returns authenticated metadata list/detail envelopes without infrastructure side effects", async () => {
@@ -546,7 +564,18 @@ describe("DeployLite API scaffold", () => {
     expect(deployment.json().data.deployment).toMatchObject({ id: "dep-1" });
     expect(logs.statusCode).toBe(200);
     expect(logs.json().data.events).toEqual([expect.objectContaining({ sequence: 1 })]);
-    expect(calls).toEqual(["projects.list", "agents.list", "deployments.list", "deployments.findById", "deployments.listLogs"]);
+    expect(calls).toEqual([
+      "projects.list",
+      "agents.list",
+      "deployments.list",
+      "deployments.findById",
+      "projects.findById",
+      "agents.findById",
+      "deployments.findById",
+      "projects.findById",
+      "agents.findById",
+      "deployments.listLogs"
+    ]);
     expect(calls).not.toEqual(expect.arrayContaining(["projects.save", "agents.save", "deployments.save", "deployments.appendLog"]));
   });
 
@@ -569,7 +598,7 @@ describe("DeployLite API scaffold", () => {
     expect(projects.json().data).toEqual({ projects: [] });
     expect(agents.json().data).toEqual({ agents: [] });
     expect(deployments.json().data).toEqual({ deployments: [] });
-    expect(logs.json().data).toEqual({ events: [] });
+    expect(logs.statusCode).toBe(404);
   });
 
   it("rejects unsafe heartbeat payloads without leaking validation details", async () => {
@@ -1878,6 +1907,59 @@ describe("Phase 5 slice 1 — DeploymentCommandBus control plane", () => {
       requestId: "req_failing_bus_1",
       correlationId: "req_failing_bus_1"
     }));
+
+    await app.close();
+  });
+
+  it("cancels an external-agent command idempotently and rejects unsupported restart and rollback without leaking deployment data", async () => {
+    const agentId = "11111111-1111-4111-8111-111111111111";
+    const now = new Date("2026-07-11T10:30:00.000Z");
+    const agents = new InMemoryAgentRepository();
+    const deployments = new InMemoryDeploymentRepository();
+    const deploymentCommands = new InMemoryDeploymentCommandRepository();
+    await agents.save({ id: agentId, name: "External agent", endpoint: "https://agent.example.test", status: "online", lastHeartbeatAt: now.toISOString(), resourceSnapshot: null });
+    const { app, audit } = await authFixture({
+      now: () => now,
+      env: {
+        ...testEnv,
+        NODE_ENV: "test",
+        DEPLOYLITE_AGENT_ID: agentId,
+        DEPLOYLITE_AGENT_TOKEN: "external-agent-token-for-tests-1234567890"
+      },
+      state: { agents, deployments, deploymentCommands }
+    });
+    const cookie = await loginCookie(app);
+    const project = (await app.inject({
+      method: "POST",
+      url: "/api/v1/projects",
+      headers: { ...contentHeaders, cookie },
+      payload: { name: "Control target", repoUrl: "https://github.com/example/control-target", defaultBranch: "main", runCommand: "node server.js", port: 3000 }
+    })).json().data.project;
+    const trigger = await app.inject({
+      method: "POST",
+      url: `/api/v1/projects/${project.id}/deployments`,
+      headers: { ...contentHeaders, cookie, "x-request-id": "req_control_trigger" },
+      payload: { agentId, commitSha: "abcdef1" }
+    });
+    const deploymentId = trigger.json().data.deployment.id as string;
+
+    const cancel = await app.inject({ method: "POST", url: `/api/v1/deployments/${deploymentId}/cancel`, headers: { cookie, "x-request-id": "req_control_cancel" } });
+    const repeatedCancel = await app.inject({ method: "POST", url: `/api/v1/deployments/${deploymentId}/cancel`, headers: { cookie } });
+    const restart = await app.inject({ method: "POST", url: `/api/v1/deployments/${deploymentId}/restart`, headers: { cookie } });
+    const rollback = await app.inject({ method: "POST", url: `/api/v1/deployments/${deploymentId}/rollback`, headers: { cookie } });
+    const logs = await app.inject({ method: "GET", url: `/api/v1/deployments/${deploymentId}/logs`, headers: { cookie } });
+
+    expect(cancel.statusCode).toBe(200);
+    expect(cancel.json().data.command).toMatchObject({ kind: "start", state: "cancelled" });
+    expect(repeatedCancel.statusCode).toBe(200);
+    expect(repeatedCancel.json().data.idempotent).toBe(true);
+    expect(restart.json().error).toMatchObject({ code: "EXECUTOR_CAPABILITY_UNAVAILABLE" });
+    expect(rollback.json().error).toMatchObject({ code: "ROLLBACK_UNAVAILABLE" });
+    expect(logs.json().data.events.some((event: { message: string }) => event.message.includes("cancellation requested"))).toBe(true);
+    expect(JSON.stringify(logs.json())).not.toContain("external-agent-token-for-tests-1234567890");
+    expect(audit.inputs.some((event) => event.action === "deployment.cancel" && event.metadata?.["projectId"] === project.id)).toBe(true);
+    expect(audit.inputs.some((event) => event.action === "deployment.restart.rejected")).toBe(true);
+    expect(audit.inputs.some((event) => event.action === "deployment.rollback.rejected")).toBe(true);
 
     await app.close();
   });
