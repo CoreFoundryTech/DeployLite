@@ -650,6 +650,32 @@ describe("DeployLite API scaffold", () => {
     await app.close();
   });
 
+  it("delivers a terminal failure log appended during stream polling before it closes", async () => {
+    const { app, deploymentId, deployments } = await streamFixture("running");
+    const cookie = await loginCookie(app);
+    const listLogs = deployments.listLogs.bind(deployments);
+    let release!: () => void;
+    const blocked = new Promise<void>((resolve) => { release = resolve; });
+    let firstRead = true;
+    deployments.listLogs = async (id) => {
+      if (firstRead) {
+        firstRead = false;
+        await blocked;
+      }
+      return listLogs(id);
+    };
+
+    const stream = app.inject({ method: "GET", url: `/api/v1/deployments/${deploymentId}/logs/stream`, headers: { cookie } });
+    await new Promise<void>((resolve) => setImmediate(resolve));
+    await appendStreamLog(deployments, deploymentId, 1, "terminal failure [REDACTED] log");
+    await deployments.save({ id: deploymentId, projectId: "project_mock_1", agentId: "agent_mock_1", status: "failed", commitSha: "abcdef1", startedAt: "2026-01-01T00:00:00.000Z", finishedAt: "2026-01-01T00:01:00.000Z" });
+    release();
+    const response = await stream;
+
+    expect(response.body.indexOf("terminal failure [REDACTED] log")).toBeLessThan(response.body.indexOf("event: deployment.terminal"));
+    await app.close();
+  });
+
   it("cleans stream timers and close listeners without writing after terminal close", async () => {
     try {
       const { app, deploymentId, deployments } = await streamFixture();
@@ -2045,6 +2071,18 @@ describe("Phase 5 slice 1 — DeploymentCommandBus control plane", () => {
     const agents = new InMemoryAgentRepository();
     const deployments = new InMemoryDeploymentRepository();
     const deploymentCommands = new InMemoryDeploymentCommandRepository();
+    const appendDeploymentLog = deployments.appendAllocatedLog.bind(deployments);
+    let cancellationLogArrivals = 0;
+    let releaseCancellationLogs!: () => void;
+    const cancellationLogBarrier = new Promise<void>((resolve) => { releaseCancellationLogs = resolve; });
+    deployments.appendAllocatedLog = async (event) => {
+      if (event.message.includes("cancellation requested")) {
+        cancellationLogArrivals += 1;
+        if (cancellationLogArrivals === 2) releaseCancellationLogs();
+        await cancellationLogBarrier;
+      }
+      return appendDeploymentLog(event);
+    };
     await agents.save({ id: agentId, name: "External agent", endpoint: "https://agent.example.test", status: "online", lastHeartbeatAt: now.toISOString(), resourceSnapshot: null });
     const { app, audit } = await authFixture({
       now: () => now,
@@ -2071,8 +2109,10 @@ describe("Phase 5 slice 1 — DeploymentCommandBus control plane", () => {
     });
     const deploymentId = trigger.json().data.deployment.id as string;
 
-    const cancel = await app.inject({ method: "POST", url: `/api/v1/deployments/${deploymentId}/cancel`, headers: { cookie, "x-request-id": "req_control_cancel" } });
-    const repeatedCancel = await app.inject({ method: "POST", url: `/api/v1/deployments/${deploymentId}/cancel`, headers: { cookie } });
+    const [cancel, repeatedCancel] = await Promise.all([
+      app.inject({ method: "POST", url: `/api/v1/deployments/${deploymentId}/cancel`, headers: { cookie, "x-request-id": "req_control_cancel" } }),
+      app.inject({ method: "POST", url: `/api/v1/deployments/${deploymentId}/cancel`, headers: { cookie } })
+    ]);
     const restart = await app.inject({ method: "POST", url: `/api/v1/deployments/${deploymentId}/restart`, headers: { cookie } });
     const rollback = await app.inject({ method: "POST", url: `/api/v1/deployments/${deploymentId}/rollback`, headers: { cookie } });
     const logs = await app.inject({ method: "GET", url: `/api/v1/deployments/${deploymentId}/logs`, headers: { cookie } });
@@ -2080,12 +2120,12 @@ describe("Phase 5 slice 1 — DeploymentCommandBus control plane", () => {
     expect(cancel.statusCode).toBe(200);
     expect(cancel.json().data.command).toMatchObject({ kind: "start", state: "cancelled" });
     expect(repeatedCancel.statusCode).toBe(200);
-    expect(repeatedCancel.json().data.idempotent).toBe(true);
     expect(restart.json().error).toMatchObject({ code: "EXECUTOR_CAPABILITY_UNAVAILABLE" });
     expect(rollback.json().error).toMatchObject({ code: "ROLLBACK_UNAVAILABLE" });
     expect(logs.json().data.events.some((event: { message: string }) => event.message.includes("cancellation requested"))).toBe(true);
     expect(JSON.stringify(logs.json())).not.toContain("external-agent-token-for-tests-1234567890");
     expect(audit.inputs.some((event) => event.action === "deployment.cancel" && event.metadata?.["projectId"] === project.id)).toBe(true);
+    expect(audit.inputs.filter((event) => event.action === "deployment.cancel")).toHaveLength(1);
     expect(audit.inputs.some((event) => event.action === "deployment.restart.rejected")).toBe(true);
     expect(audit.inputs.some((event) => event.action === "deployment.rollback.rejected")).toBe(true);
 
@@ -2139,13 +2179,13 @@ describe("Phase 5 slice 1 — DeploymentCommandBus control plane", () => {
       return saveDeployment(deployment);
     };
     let rejectCancelAudit = true;
-    const appendAuditEvent = audit.append.bind(audit);
-    audit.append = async (input) => {
+    const appendAuditEvent = audit.appendOnce.bind(audit);
+    audit.appendOnce = async (input, id) => {
       if (input.action === "deployment.cancel" && rejectCancelAudit) {
         rejectCancelAudit = false;
         throw new Error("transient audit failure");
       }
-      return appendAuditEvent(input);
+      return appendAuditEvent(input, id);
     };
 
     const { app } = await authFixture({

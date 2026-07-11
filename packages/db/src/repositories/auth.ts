@@ -146,9 +146,18 @@ export class DbAuditRepository implements AuditRepository {
   constructor(private readonly db: DeployLiteDb) {}
 
   async append(input: AuditEventInput): Promise<AuditEvent> {
+    return this.#append(input);
+  }
+
+  async appendOnce(input: AuditEventInput, id: string): Promise<AuditEvent> {
+    return this.#append(input, id);
+  }
+
+  async #append(input: AuditEventInput, id?: string): Promise<AuditEvent> {
     const [created] = await this.db
       .insert(auditEvents)
       .values({
+        ...(id ? { id } : {}),
         actorUserId: input.actorUserId ?? null,
         action: input.action,
         targetType: input.targetType,
@@ -157,13 +166,16 @@ export class DbAuditRepository implements AuditRepository {
         correlationId: input.correlationId,
         metadata: redactAuditMetadata(input.metadata ?? {})
       })
+      .onConflictDoNothing()
       .returning();
 
-    if (!created) {
-      throw new Error("Failed to append audit event");
+    if (created) return toAuditEvent(created);
+    if (id) {
+      const [existing] = await this.db.select().from(auditEvents).where(eq(auditEvents.id, id)).limit(1);
+      if (existing) return toAuditEvent(existing);
     }
 
-    return toAuditEvent(created);
+    throw new Error("Failed to append audit event");
   }
 
   async list(filter: AuditEventListFilter = {}): Promise<AuditEventListPage> {
