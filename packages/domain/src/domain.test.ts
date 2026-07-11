@@ -86,6 +86,14 @@ describe("domain foundation", () => {
     await expect(deployments.appendLog({ ...logs[0]!, id: "log_2" })).rejects.toThrow("unique");
   });
 
+  it("allocates unique ordered log sequences for concurrent writers", async () => {
+    const deployments = new InMemoryDeploymentRepository();
+    const events = await Promise.all(Array.from({ length: 4 }, (_, index) => deployments.appendAllocatedLog({
+      id: `log-${index}`, deploymentId: "dep_1", level: "info", message: "safe", timestamp: now.toISOString(), redactionApplied: true, requestId: "req", correlationId: "req"
+    })));
+    expect(events.map((event) => event.sequence).sort()).toEqual([1, 2, 3, 4]);
+  });
+
   it("enforces the deployment command state machine: pending -> claimed -> completed only", () => {
     expect(isDeploymentCommandTransitionAllowed("pending", "claimed")).toBe(true);
     expect(isDeploymentCommandTransitionAllowed("claimed", "completed")).toBe(true);
