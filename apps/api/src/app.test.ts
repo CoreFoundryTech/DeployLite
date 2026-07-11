@@ -17,8 +17,9 @@ import {
   type ProjectRepository
 } from "@deploylite/domain";
 import { createEnvSecretCipher, loadEnvSecretKey } from "@deploylite/config";
+import { EventEmitter } from "node:events";
 import { readFile } from "node:fs/promises";
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 import { buildApiApp, createRuntimeRepositories, InMemoryAuditRepository, InMemoryAuthUserRepository, InMemorySessionRepository } from "./app.js";
 
 const contentHeaders = { "content-type": "application/json" };
@@ -155,6 +156,35 @@ function metadataRepositories() {
 async function loginCookie(app: Awaited<ReturnType<typeof buildApiApp>>, email = "admin@example.test") {
   const response = await app.inject({ method: "POST", url: "/api/v1/auth/login", headers: contentHeaders, payload: { email, password } });
   return response.headers["set-cookie"] as string;
+}
+
+async function streamFixture(status: "running" | "succeeded" = "succeeded") {
+  const deployments = new InMemoryDeploymentRepository();
+  const deploymentId = "dep_stream_1";
+  await deployments.save({
+    id: deploymentId,
+    projectId: "project_mock_1",
+    agentId: "agent_mock_1",
+    status,
+    commitSha: "abcdef1",
+    startedAt: "2026-01-01T00:00:00.000Z",
+    finishedAt: status === "succeeded" ? "2026-01-01T00:01:00.000Z" : null
+  });
+  const { app } = await authFixture({ state: { deployments } });
+  return { app, deploymentId, deployments };
+}
+
+async function appendStreamLog(deployments: InMemoryDeploymentRepository, deploymentId: string, sequence: number, message: string) {
+  await deployments.appendAllocatedLog({
+    id: `stream-log-${sequence}`,
+    deploymentId,
+    level: "info",
+    message,
+    timestamp: "2026-01-01T00:00:00.000Z",
+    redactionApplied: true,
+    requestId: "req_stream_1",
+    correlationId: "req_stream_1"
+  });
 }
 
 describe("DeployLite API scaffold", () => {
@@ -537,6 +567,119 @@ describe("DeployLite API scaffold", () => {
     expect(missing.statusCode).toBe(404);
     expect(stream.statusCode).toBe(200);
     expect(stream.json().data.events).toHaveLength(2);
+  });
+
+  it("enforces stream authentication and deployment scope before opening an SSE response", async () => {
+    const { app, deploymentId } = await streamFixture();
+    const cookie = await loginCookie(app);
+    const unauthenticated = await app.inject({ method: "GET", url: `/api/v1/deployments/${deploymentId}/logs/stream` });
+    const unauthorized = await app.inject({
+      method: "GET",
+      url: `/api/v1/deployments/${deploymentId}/logs/stream`,
+      headers: { cookie: "dl_test_session=not-a-valid-session" }
+    });
+    const outOfScope = await app.inject({
+      method: "GET",
+      url: "/api/v1/deployments/not-visible/logs/stream",
+      headers: { cookie }
+    });
+
+    expect(unauthenticated.statusCode).toBe(401);
+    expect(unauthorized.statusCode).toBe(401);
+    expect(outOfScope.statusCode).toBe(404);
+    await app.close();
+  });
+
+  it("resumes stream cursors and resets malformed or out-of-range cursors without exposing secrets", async () => {
+    const { app, deploymentId, deployments } = await streamFixture();
+    await appendStreamLog(deployments, deploymentId, 1, "first [REDACTED] log");
+    await appendStreamLog(deployments, deploymentId, 2, "second [REDACTED] log");
+    await appendStreamLog(deployments, deploymentId, 3, "third [REDACTED] log");
+    const cookie = await loginCookie(app);
+    const [resumed, malformed, outOfRange] = await Promise.all([
+      app.inject({ method: "GET", url: `/api/v1/deployments/${deploymentId}/logs/stream`, headers: { cookie, "last-event-id": "1" } }),
+      app.inject({ method: "GET", url: `/api/v1/deployments/${deploymentId}/logs/stream`, headers: { cookie, "last-event-id": "invalid" } }),
+      app.inject({ method: "GET", url: `/api/v1/deployments/${deploymentId}/logs/stream`, headers: { cookie, "last-event-id": "999999" } })
+    ]);
+
+    expect(resumed.body).not.toContain("id: 1");
+    expect(resumed.body).toContain("id: 2");
+    expect(resumed.body).toContain("id: 3");
+    expect(malformed.body).toContain("id: 1");
+    expect(outOfRange.body).toContain("id: 1");
+    for (const stream of [resumed, malformed, outOfRange]) {
+      expect(stream.statusCode).toBe(200);
+      expect(stream.body).toContain("[REDACTED]");
+      expect(stream.body).not.toContain("dl_1234567890abcdef");
+    }
+    await app.close();
+  });
+
+  it("delivers a log appended after the stream connects before closing its terminal response", async () => {
+    const { app, deploymentId, deployments } = await streamFixture("running");
+    const cookie = await loginCookie(app);
+    const listLogs = deployments.listLogs.bind(deployments);
+    let releaseInitialRead!: () => void;
+    let signalInitialRead!: () => void;
+    const initialRead = new Promise<void>((resolve) => { signalInitialRead = resolve; });
+    const release = new Promise<void>((resolve) => { releaseInitialRead = resolve; });
+    let waitForInitialRead = true;
+    deployments.listLogs = async (id) => {
+      if (waitForInitialRead) {
+        waitForInitialRead = false;
+        signalInitialRead();
+        await release;
+      }
+      return listLogs(id);
+    };
+
+    const stream = app.inject({ method: "GET", url: `/api/v1/deployments/${deploymentId}/logs/stream`, headers: { cookie } });
+    await new Promise<void>((resolve) => setImmediate(resolve));
+    await initialRead;
+    await appendStreamLog(deployments, deploymentId, 1, "live [REDACTED] log");
+    await deployments.save({
+      id: deploymentId,
+      projectId: "project_mock_1",
+      agentId: "agent_mock_1",
+      status: "succeeded",
+      commitSha: "abcdef1",
+      startedAt: "2026-01-01T00:00:00.000Z",
+      finishedAt: "2026-01-01T00:01:00.000Z"
+    });
+    releaseInitialRead();
+    const response = await stream;
+
+    expect(response.body).toContain("live [REDACTED] log");
+    expect(response.body).toContain("event: deployment.terminal");
+    await app.close();
+  });
+
+  it("cleans stream timers and close listeners without writing after terminal close", async () => {
+    try {
+      const { app, deploymentId, deployments } = await streamFixture();
+      await appendStreamLog(deployments, deploymentId, 1, "terminal [REDACTED] log");
+      const onResponse = vi.fn();
+      app.addHook("onResponse", async () => { onResponse(); });
+      const cookie = await loginCookie(app);
+      onResponse.mockClear();
+      vi.useFakeTimers();
+      const off = vi.spyOn(EventEmitter.prototype, "off");
+      const listLogs = vi.spyOn(deployments, "listLogs");
+
+      const response = await app.inject({ method: "GET", url: `/api/v1/deployments/${deploymentId}/logs/stream`, headers: { cookie } });
+      const writesBeforeClose = listLogs.mock.calls.length;
+      await vi.advanceTimersByTimeAsync(3_000);
+
+      expect(response.body).toContain(": keepalive");
+      expect(onResponse).toHaveBeenCalledTimes(1);
+      expect(vi.getTimerCount()).toBe(0);
+      expect(off).toHaveBeenCalledWith("close", expect.any(Function));
+      expect(listLogs).toHaveBeenCalledTimes(writesBeforeClose);
+      await app.close();
+    } finally {
+      vi.restoreAllMocks();
+      vi.useRealTimers();
+    }
   });
 
   it("returns authenticated metadata list/detail envelopes without infrastructure side effects", async () => {
