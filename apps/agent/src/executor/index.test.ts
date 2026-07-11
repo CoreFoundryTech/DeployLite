@@ -4,7 +4,7 @@ import { createRequire } from "node:module";
 import { resolve } from "node:path";
 import { describe, expect, it, vi } from "vitest";
 import type { DeploymentCommand } from "@deploylite/contracts";
-import { AgentDeploymentExecutor, assertSafeRuntimePlan, createDeploymentPlan, createSpawnProcessRunner, type CleanupRepairStore, type CommandBusClient, type HealthProbe, type ProcessRunner, type SpawnedProcess, type WorkspaceFilesystem } from "./index.js";
+import { AgentDeploymentExecutor, assertSafeRuntimePlan, createDeploymentPlan, createSpawnProcessRunner, type CleanupRepairStore, type CommandBusClient, type HealthPolicy, type HealthProbe, type ProcessRunner, type SpawnedProcess, type WorkspaceFilesystem } from "./index.js";
 import { InMemoryCleanupRepairStore } from "../cleanup-repairs.js";
 import { InMemoryManagedBuilderRegistry } from "../managed-builders.js";
 
@@ -103,10 +103,37 @@ describe("AgentDeploymentExecutor", () => {
   it("fails a bounded health probe and cleans up without running shell interpolation", async () => {
     const test = setup();
     test.health.probe = vi.fn(async () => false);
-    const result = await test.executor.execute(input);
+    let elapsed = 0;
+    const policy: HealthPolicy = { startupGraceMs: 0, deadlineMs: 8_000, probeTimeoutMs: 1_000, retryIntervalMs: 2_000, now: () => elapsed };
+    const executor = new AgentDeploymentExecutor(test.runner, test.bus, test.health, test.logger, async (milliseconds) => { elapsed += milliseconds; }, test.filesystem, executorConfig, test.cleanupRepairs, undefined, policy);
+    const result = await executor.execute(input);
     expect(result.reason).toBe("Health probe timed out");
-    expect(test.health.probe).toHaveBeenCalledTimes(5);
+    expect(test.health.probe).toHaveBeenCalledTimes(4);
     expect(test.bus.fail).toHaveBeenCalledWith("command-1", "Health probe timed out");
+  });
+
+  it("accepts a slow runtime beyond the former short probe window within the bounded health deadline", async () => {
+    const test = setup();
+    let elapsed = 0;
+    const probeTimes: number[] = [];
+    test.health.probe = vi.fn(async () => { probeTimes.push(elapsed); return elapsed >= 8_000; });
+    const policy: HealthPolicy = { startupGraceMs: 0, deadlineMs: 12_000, probeTimeoutMs: 1_000, retryIntervalMs: 2_000, now: () => elapsed };
+    const executor = new AgentDeploymentExecutor(test.runner, test.bus, test.health, test.logger, async (milliseconds) => { elapsed += milliseconds; }, test.filesystem, executorConfig, test.cleanupRepairs, undefined, policy);
+
+    await expect(executor.execute(input)).resolves.toMatchObject({ ok: true });
+    expect(test.health.probe).toHaveBeenCalledTimes(5);
+    expect(probeTimes.at(-1)).toBe(8_000);
+  });
+
+  it("stops health waiting on lease loss and cleans managed resources", async () => {
+    const test = setup();
+    const controller = new AbortController();
+    test.health.probe = vi.fn(async () => { controller.abort(); return false; });
+    const executor = new AgentDeploymentExecutor(test.runner, test.bus, test.health, test.logger, async () => undefined, test.filesystem, executorConfig, test.cleanupRepairs, undefined, { startupGraceMs: 0, deadlineMs: 12_000 });
+
+    const result = await executor.execute({ ...input, command: { ...input.command, state: "claimed", leaseExpiresAt: "2026-01-01T00:00:30.000Z" } }, controller.signal);
+    expect(result).toMatchObject({ ok: false, reason: "Deployment execution lease was lost" });
+    expect(test.bus.fail).toHaveBeenCalledWith("command-1", "Deployment execution lease was lost");
   });
 
   it("fails an expired process timeout without attempting a shell command", async () => {
@@ -201,13 +228,14 @@ describe("AgentDeploymentExecutor", () => {
     expect(assertSafeRuntimePlan(plan)).toBe(true);
     expect(plan.cwd).toBeUndefined();
     expect(plan.args).toContain("/run/deploylite/secrets/command-1/runtime.env");
-    expect(plan.args).toEqual(expect.arrayContaining(["--network", "deploylite-runtime", "--name", "deploylite-command-1"]));
+    expect(plan.args).toEqual(expect.arrayContaining(["--network", "deploylite-runtime", "--name", "deploylite-command-1", "--restart", "unless-stopped"]));
     expect(input.healthUrl).toBe("http://deploylite-command-1:3000/health");
     expect(plan.args.join(" ")).not.toMatch(/compose|--privileged|docker\.sock|--volume|-v |--publish|-p |--network=host|--pid |--ipc |--device |--cap-add/);
     for (const unsafeOption of ["--privileged", "--network=host", "--pid=host", "--ipc=host", "--device=/dev/sda", "--cap-add=SYS_ADMIN", "--volume=/host:/data", "--mount=type=bind,src=/,dst=/host"]) {
       expect(() => assertSafeRuntimePlan({ ...plan, args: [...plan.args.slice(0, -1), unsafeOption, plan.args.at(-1)!] })).toThrow(unsafeOption.startsWith("--network") ? "trusted DeployLite network" : "Unsafe Docker runtime option rejected");
     }
     expect(() => assertSafeRuntimePlan({ ...plan, args: [...plan.args.slice(0, -1), "--network", "attacker-network", plan.args.at(-1)!] })).toThrow("trusted DeployLite network");
+    expect(() => assertSafeRuntimePlan({ ...plan, args: plan.args.map((arg) => arg === "unless-stopped" ? "always" : arg) })).toThrow("trusted restart policy");
     expect(() => assertSafeRuntimePlan({ ...plan, args: plan.args.map((arg) => arg === "no-new-privileges" ? "seccomp=unconfined" : arg) })).toThrow("weakens container isolation");
   });
 

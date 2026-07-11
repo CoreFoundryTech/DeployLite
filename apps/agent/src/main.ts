@@ -8,8 +8,13 @@ import { FileManagedBuilderRegistry } from "./managed-builders.js";
 import { FileAgentReadiness } from "./readiness.js";
 import { cpus, freemem, loadavg, totalmem } from "node:os";
 import { statfs } from "node:fs/promises";
+import { pathToFileURL } from "node:url";
 
 export async function runAgentEntrypoint(env: NodeJS.ProcessEnv = process.env): Promise<void> {
+  // Remove a previous process's opaque marker before any fallible startup work.
+  // A failure here must leave the healthcheck closed rather than reporting stale readiness.
+  const readiness = new FileAgentReadiness(env.DEPLOYLITE_AGENT_READINESS_PATH ?? "/var/lib/deploylite/state/agent-ready");
+  await readiness.clear();
   const config = parseDeployLiteEnv(env);
   const agentId = required(config, "DEPLOYLITE_AGENT_ID");
   const agentName = required(config, "DEPLOYLITE_AGENT_NAME");
@@ -77,7 +82,7 @@ export async function runAgentEntrypoint(env: NodeJS.ProcessEnv = process.env): 
       }
     },
     logger,
-    readiness: new FileAgentReadiness(env.DEPLOYLITE_AGENT_READINESS_PATH ?? "/var/lib/deploylite/state/agent-ready")
+    readiness
   });
   const shutdown = new AbortController();
   const stop = () => shutdown.abort();
@@ -98,7 +103,9 @@ function required(env: Record<string, unknown>, key: string): string {
   return value;
 }
 
-void runAgentEntrypoint().catch((error: unknown) => {
-  console.error(redactEnvFileForLog(error instanceof Error ? error.message : "Agent startup failed"));
-  process.exitCode = 1;
-});
+if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) {
+  void runAgentEntrypoint().catch((error: unknown) => {
+    console.error(redactEnvFileForLog(error instanceof Error ? error.message : "Agent startup failed"));
+    process.exitCode = 1;
+  });
+}

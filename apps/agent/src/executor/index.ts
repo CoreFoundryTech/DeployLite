@@ -14,6 +14,10 @@ const AGENT_SECRET_BASE = "/run/deploylite/secrets";
 const BUILDKIT_CONFIG_PATH = "/etc/deploylite/buildkitd.toml";
 const CLEANUP_ATTEMPTS = 4;
 const CLEANUP_BACKOFF_MS = [250, 500, 1_000] as const;
+const DEFAULT_HEALTH_STARTUP_GRACE_MS = 5_000;
+const DEFAULT_HEALTH_DEADLINE_MS = 90_000;
+const DEFAULT_HEALTH_PROBE_TIMEOUT_MS = 5_000;
+const DEFAULT_HEALTH_RETRY_INTERVAL_MS = 2_000;
 const REPAIR_RECORDS_PER_PASS = 16;
 const MANAGED_LABEL = "com.deploylite.managed=true";
 const MANAGED_PROJECT_LABEL = "com.deploylite.project-slug";
@@ -34,7 +38,14 @@ export type CommandBusClient = {
   fail(commandId: string, reason: string): Promise<DeploymentCommand | null>;
   renewLease(commandId: string, agentId: string): Promise<DeploymentCommand | null>;
 };
-export type HealthProbe = { probe(url: string, timeoutMs: number): Promise<boolean> };
+export type HealthProbe = { probe(url: string, timeoutMs: number, signal?: AbortSignal): Promise<boolean> };
+export type HealthPolicy = {
+  startupGraceMs?: number;
+  deadlineMs?: number;
+  probeTimeoutMs?: number;
+  retryIntervalMs?: number;
+  now?: () => number;
+};
 export type ExecutorLogger = { log(level: "info" | "error", message: string): Promise<void> | void };
 export type WorkspaceFilesystem = {
   create(path: string): Promise<void>;
@@ -180,11 +191,17 @@ export class AgentDeploymentExecutor {
     private readonly commandBus: CommandBusClient,
     private readonly health: HealthProbe,
     private readonly logger: ExecutorLogger = { log: () => undefined },
-    private readonly wait: (milliseconds: number) => Promise<void> = (milliseconds) => new Promise((resolveWait) => setTimeout(resolveWait, milliseconds)),
+    private readonly wait: (milliseconds: number, signal?: AbortSignal) => Promise<void> = (milliseconds, signal) => new Promise((resolveWait) => {
+      if (signal?.aborted) return resolveWait();
+      const timer = setTimeout(() => { signal?.removeEventListener("abort", finish); resolveWait(); }, milliseconds);
+      const finish = () => { clearTimeout(timer); resolveWait(); };
+      signal?.addEventListener("abort", finish, { once: true });
+    }),
     private readonly filesystem: WorkspaceFilesystem = nodeWorkspaceFilesystem,
     private readonly config: ExecutorConfig = { workspaceRoot: `${AGENT_WORK_BASE}/workspaces`, secretRoot: AGENT_SECRET_BASE },
     private readonly cleanupRepairs: CleanupRepairStore = { load: async () => [], put: async () => undefined, remove: async () => undefined },
-    private readonly managedBuilders: ManagedBuilderRegistry = new InMemoryManagedBuilderRegistry()
+    private readonly managedBuilders: ManagedBuilderRegistry = new InMemoryManagedBuilderRegistry(),
+    private readonly healthPolicy: HealthPolicy = {}
   ) {}
 
   async execute(input: DeploymentExecutionInput, signal?: AbortSignal): Promise<DeploymentExecutionResult> {
@@ -310,10 +327,20 @@ export class AgentDeploymentExecutor {
   }
 
   private async waitForHealth(url: string, signal?: AbortSignal): Promise<void> {
-    for (const delay of [100, 200, 400, 800, 1_000]) {
+    const startupGraceMs = boundedHealthDuration(this.healthPolicy.startupGraceMs, DEFAULT_HEALTH_STARTUP_GRACE_MS, 0);
+    const deadlineMs = boundedHealthDuration(this.healthPolicy.deadlineMs, DEFAULT_HEALTH_DEADLINE_MS);
+    const probeTimeoutMs = boundedHealthDuration(this.healthPolicy.probeTimeoutMs, DEFAULT_HEALTH_PROBE_TIMEOUT_MS);
+    const retryIntervalMs = boundedHealthDuration(this.healthPolicy.retryIntervalMs, DEFAULT_HEALTH_RETRY_INTERVAL_MS);
+    const now = this.healthPolicy.now ?? Date.now;
+    const deadline = now() + deadlineMs;
+    if (startupGraceMs > 0) await this.wait(Math.min(startupGraceMs, deadlineMs), signal);
+    while (now() < deadline) {
       if (signal?.aborted) throw new Error("Deployment execution lease was lost");
-      if (await this.health.probe(url, 1_000)) return;
-      await this.wait(delay);
+      const remaining = deadline - now();
+      if (await this.health.probe(url, Math.min(probeTimeoutMs, remaining), signal)) return;
+      if (signal?.aborted) throw new Error("Deployment execution lease was lost");
+      const delay = Math.min(retryIntervalMs, deadline - now());
+      if (delay > 0) await this.wait(delay, signal);
     }
     throw new Error("Health probe timed out");
   }
@@ -440,6 +467,7 @@ export function createDeploymentPlan(input: DeploymentExecutionInput, config: Ex
     command: "docker",
     args: [
       "run", "--detach", "--name", container,
+      "--restart", "unless-stopped",
       "--network", DEPLOYLITE_RUNTIME_NETWORK,
       "--label", MANAGED_LABEL,
       "--label", `com.deploylite.command-id=${input.command.id}`,
@@ -509,11 +537,14 @@ export function assertSafeRuntimePlan(plan: CommandPlan, trustedNetwork = DEPLOY
   if (!SAFE_NETWORK.test(trustedNetwork) || plan.args.filter((arg) => arg === "--network").length !== 1 || valueAfter(plan.args, "--network") !== trustedNetwork || plan.args.some((arg) => arg.startsWith("--network="))) {
     throw new Error("Runtime plan must use the trusted DeployLite network");
   }
-  for (const required of ["--network", "--read-only", "--cap-drop", "--security-opt", "--pids-limit", "--memory", "--cpus", "--env-file"]) {
+  for (const required of ["--network", "--restart", "--read-only", "--cap-drop", "--security-opt", "--pids-limit", "--memory", "--cpus", "--env-file"]) {
     if (!plan.args.includes(required)) throw new Error(`Runtime plan is missing ${required}`);
   }
   if (valueAfter(plan.args, "--cap-drop") !== "ALL" || valueAfter(plan.args, "--security-opt") !== "no-new-privileges") {
     throw new Error("Runtime plan weakens container isolation");
+  }
+  if (valueAfter(plan.args, "--restart") !== "unless-stopped" || plan.args.some((arg) => arg.startsWith("--restart="))) {
+    throw new Error("Runtime plan must use the trusted restart policy");
   }
   return true;
 }
@@ -651,6 +682,11 @@ function hasCredentialedUrl(value: string): boolean {
 function valueAfter(args: string[], option: string): string | undefined {
   const index = args.indexOf(option);
   return index === -1 ? undefined : args[index + 1];
+}
+function boundedHealthDuration(value: number | undefined, fallback: number, minimum = 1): number {
+  if (value === undefined) return fallback;
+  if (!Number.isFinite(value) || value < minimum || value > 120_000) throw new Error("Invalid bounded health policy duration");
+  return Math.floor(value);
 }
 function publicPlan(plan: CommandPlan): Record<string, unknown> { return { command: plan.command, args: plan.args.map(redact), cwd: plan.cwd ? "[REDACTED]" : undefined }; }
 function render(plan: CommandPlan): string { return `${plan.command} ${plan.args.map(redact).join(" ")}`; }
