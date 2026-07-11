@@ -1841,15 +1841,23 @@ describe("Phase 5 slice 1 — DeploymentCommandBus control plane", () => {
   it("preserves the queued -> running -> succeeded deployment lifecycle and log correlation", async () => {
     const delegate = new InMemoryDeploymentRepository();
     const transitions: Array<{ deploymentId: string; status: string }> = [];
+    const writes: string[] = [];
     const deployments: DeploymentRepository = {
       async save(deployment) {
         transitions.push({ deploymentId: deployment.id, status: deployment.status });
+        writes.push(`status:${deployment.status}`);
         return delegate.save(deployment);
       },
       findById: (id) => delegate.findById(id),
       list: () => delegate.list(),
-      appendLog: (event) => delegate.appendLog(event),
-      appendAllocatedLog: (event) => delegate.appendAllocatedLog(event),
+      async appendLog(event) {
+        writes.push(`log:${event.message}`);
+        return delegate.appendLog(event);
+      },
+      async appendAllocatedLog(event) {
+        writes.push(`log:${event.message}`);
+        return delegate.appendAllocatedLog(event);
+      },
       listLogs: (deploymentId, afterSequence) => delegate.listLogs(deploymentId, afterSequence)
     };
     const { app } = await authFixture({
@@ -1886,6 +1894,10 @@ describe("Phase 5 slice 1 — DeploymentCommandBus control plane", () => {
     const logs = await deployments.listLogs(deploymentId);
     expect(logs.length).toBeGreaterThan(0);
     expect(logs.every((event) => event.requestId === "req_bus_trace_1" && event.correlationId === "req_bus_trace_1")).toBe(true);
+    const lifecycleLog = logs.find((event) => event.message.startsWith("Simulated agent marked the deployment succeeded"));
+    const terminalLog = writes.indexOf(`log:${lifecycleLog?.message}`);
+    expect(terminalLog).toBeGreaterThan(-1);
+    expect(writes.findIndex((entry) => entry === "status:succeeded")).toBeGreaterThan(terminalLog);
 
     await app.close();
   });
@@ -1975,6 +1987,26 @@ describe("Phase 5 slice 1 — DeploymentCommandBus control plane", () => {
       payload: { agentId, commitSha: "abcdef1" }
     });
     const deploymentId = trigger.json().data.deployment.id as string;
+    const streamRequest = new EventEmitter();
+    const streamResponse = Object.assign(new EventEmitter(), {
+      writes: [] as string[],
+      ended: false,
+      write(chunk: string) { this.writes.push(chunk); },
+      end() { this.ended = true; }
+    });
+    const timers = new Map<number, () => void>();
+    const stream = createDeploymentLogSseStream({
+      deployments,
+      deploymentId,
+      correlationContext: { requestId: "req_control_stream", correlationId: "req_control_stream" },
+      requestRaw: streamRequest,
+      raw: streamResponse,
+      timers: {
+        setInterval(callback: () => void) { timers.set(1, callback); return 1 as unknown as ReturnType<typeof setInterval>; },
+        clearInterval() { timers.clear(); }
+      }
+    });
+    await stream.start();
 
     const [cancel, repeatedCancel] = await Promise.all([
       app.inject({ method: "POST", url: `/api/v1/deployments/${deploymentId}/cancel`, headers: { cookie, "x-request-id": "req_control_cancel" } }),
@@ -1995,6 +2027,21 @@ describe("Phase 5 slice 1 — DeploymentCommandBus control plane", () => {
     expect(audit.inputs.filter((event) => event.action === "deployment.cancel" && event.metadata?.["projectId"] === project.id)).toHaveLength(1);
     expect(audit.inputs.some((event) => event.action === "deployment.restart.rejected")).toBe(true);
     expect(audit.inputs.some((event) => event.action === "deployment.rollback.rejected")).toBe(true);
+    const poll = timers.get(1);
+    poll?.();
+    await Promise.resolve();
+    await Promise.resolve();
+    const streamWrites = streamResponse.writes.join("");
+    const finalLifecycleLog = streamWrites.indexOf("Deployment command cancelled; deployment was canceled.");
+    const controlLog = streamWrites.indexOf("Deployment cancellation requested by an authorized operator.");
+    const terminalEvent = streamWrites.indexOf("event: deployment.terminal");
+    expect(controlLog).toBeGreaterThan(-1);
+    expect(finalLifecycleLog).toBeGreaterThan(controlLog);
+    expect(terminalEvent).toBeGreaterThan(finalLifecycleLog);
+    expect(streamWrites.match(/Deployment cancellation requested by an authorized operator\./g)).toHaveLength(1);
+    expect(streamWrites.match(/Deployment command cancelled; deployment was canceled\./g)).toHaveLength(1);
+    expect(streamWrites.match(/event: deployment\.terminal/g)).toHaveLength(1);
+    expect(streamResponse.ended).toBe(true);
 
     await app.close();
   });

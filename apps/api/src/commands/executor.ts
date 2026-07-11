@@ -138,9 +138,8 @@ export class MockDeploymentExecutor implements DeploymentExecutor {
   }
 
   async #failStart(command: DeploymentCommandRecord, deployment: Deployment, reason: string): Promise<void> {
-    const failed: Deployment = { ...deployment, status: "failed", finishedAt: new Date().toISOString() };
-    await this.#deployments.save(failed);
     await this.#appendLog(deployment, "error", reason, command.requestId, command.correlationId);
+    await this.#deployments.save({ ...deployment, status: "failed", finishedAt: new Date().toISOString() });
     await this.#bus.fail(command.id, reason);
   }
 
@@ -208,18 +207,18 @@ export class MockDeploymentExecutor implements DeploymentExecutor {
       const existing = await this.#deployments.findById(deploymentId);
       if (!existing) return;
       if (existing.status === "failed" || existing.status === "succeeded" || existing.status === "canceled") return;
-      const finishedAt = status === "running" ? null : new Date().toISOString();
-      const next: Deployment = { ...existing, status, finishedAt };
-      await this.#deployments.save(next);
       const message =
         status === "running"
           ? "Simulated agent picked up the deployment. Real Docker execution is intentionally deferred."
           : status === "succeeded"
             ? "Simulated agent marked the deployment succeeded. Real container execution is intentionally deferred."
             : "Simulated agent marked the deployment failed.";
-      await this.#appendLog(next, status === "succeeded" ? "info" : status === "failed" ? "error" : "info", message, requestId, correlationId);
+      await this.#appendLog(existing, status === "succeeded" ? "info" : status === "failed" ? "error" : "info", message, requestId, correlationId);
       if (status === "running") {
+        await this.#deployments.save({ ...existing, status, finishedAt: null });
         this.#scheduleAdvance(commandId, deploymentId, "succeeded", 200, requestId, correlationId);
+      } else {
+        await this.#deployments.save({ ...existing, status, finishedAt: new Date().toISOString() });
       }
       if (status === "succeeded") {
         await this.#bus.complete(commandId, { deploymentId });

@@ -529,9 +529,6 @@ function createApiState(env: EnvSecretKeySource, overrides: Partial<PlatformRepo
     externalAgentIdentity: agentId && agentToken ? { agentId, token: agentToken } : null,
     now
   };
-  deploymentCommandBus.onEvent(async (event) => {
-    if (event.type === "deployment.command.cancelled") await projectAuthoritativeTerminalCommand(state, event.command);
-  });
   return state;
 }
 
@@ -851,6 +848,28 @@ async function ensureAgentDeploymentLifecycle(
   if (!deployment || deployment.agentId !== command.agentId) throw new Error("Linked deployment is unavailable for agent lifecycle update");
   const terminal = lifecycle.status === "succeeded" || lifecycle.status === "failed" || lifecycle.status === "canceled";
   const startedAt = lifecycle.status === "running" ? deployment.startedAt ?? state.now().toISOString() : deployment.startedAt;
+  const logs = await state.deployments.listLogs(deployment.id);
+  const correlated = (message: string, requestId: string, correlationId: string) =>
+    requestId === command.requestId && correlationId === command.correlationId && message.startsWith(lifecycle.marker);
+  if (!logs.some((log) => correlated(log.message, log.requestId, log.correlationId))) {
+    const event = {
+      id: createRequestId(),
+      deploymentId: deployment.id,
+      level: lifecycle.level,
+      message: lifecycle.message,
+      timestamp: command.completedAt ?? state.now().toISOString(),
+      redactionApplied: true,
+      requestId: command.requestId,
+      correlationId: command.correlationId
+    } as const;
+    try {
+      await state.deployments.appendAllocatedLog(event);
+    } catch (error) {
+      const current = await state.deployments.listLogs(deployment.id);
+      if (!current.some((log) => correlated(log.message, log.requestId, log.correlationId))) throw error;
+    }
+  }
+
   if (deployment.status !== lifecycle.status || deployment.startedAt !== startedAt || (terminal && !deployment.finishedAt)) {
     await state.deployments.save({
       ...deployment,
@@ -858,27 +877,6 @@ async function ensureAgentDeploymentLifecycle(
       startedAt,
       finishedAt: terminal ? deployment.finishedAt ?? command.completedAt ?? state.now().toISOString() : null
     });
-  }
-
-  const logs = await state.deployments.listLogs(deployment.id);
-  const correlated = (message: string, requestId: string, correlationId: string) =>
-    requestId === command.requestId && correlationId === command.correlationId && message.startsWith(lifecycle.marker);
-  if (logs.some((log) => correlated(log.message, log.requestId, log.correlationId))) return;
-  const event = {
-    id: createRequestId(),
-    deploymentId: deployment.id,
-    level: lifecycle.level,
-    message: lifecycle.message,
-    timestamp: command.completedAt ?? state.now().toISOString(),
-    redactionApplied: true,
-    requestId: command.requestId,
-    correlationId: command.correlationId
-  } as const;
-  try {
-    await state.deployments.appendAllocatedLog(event);
-  } catch (error) {
-    const current = await state.deployments.listLogs(deployment.id);
-    if (!current.some((log) => correlated(log.message, log.requestId, log.correlationId))) throw error;
   }
 }
 
@@ -1766,10 +1764,7 @@ function registerRoutes(app: FastifyInstance, state: PlatformRepositories, adapt
     }
     const applied = cancellation?.applied ?? false;
     if (applied && command.state === "cancelled") {
-      await projectAuthoritativeTerminalCommand(state, command);
       await appendDeploymentControlLog(state, scoped.deployment.id, "info", "Deployment cancellation requested by an authorized operator.", request);
-    }
-    if (applied) {
       await appendAudit(adapters.audit, request, {
         actorUserId: request.auth?.user.id ?? null,
         action: "deployment.cancel",
@@ -1777,6 +1772,7 @@ function registerRoutes(app: FastifyInstance, state: PlatformRepositories, adapt
         targetId: scoped.deployment.id,
         metadata: { projectId: scoped.project.id, agentId: scoped.agent.id, commandId: command.id, outcome: command.state }
       });
+      await projectAuthoritativeTerminalCommand(state, command);
     }
     return ok(request, { deployment: (await state.deployments.findById(scoped.deployment.id)) ?? scoped.deployment, command, idempotent: !applied });
   });
