@@ -13,9 +13,10 @@ export async function runAgentEntrypoint(env: NodeJS.ProcessEnv = process.env): 
   const agentId = required(config, "DEPLOYLITE_AGENT_ID");
   const agentName = required(config, "DEPLOYLITE_AGENT_NAME");
   const agentEndpoint = required(config, "DEPLOYLITE_AGENT_ENDPOINT");
+  const agentToken = required(config, "DEPLOYLITE_AGENT_TOKEN");
   const transport = new HttpAgentCommandTransport({
     apiUrl: config.DEPLOYLITE_API_URL,
-    token: required(config, "DEPLOYLITE_AGENT_TOKEN")
+    token: agentToken
   });
   const logger: ExecutorLogger = { log: (level, message) => console[level](redactEnvFileForLog(message)) };
   const terminalBus = new DurableTerminalCommandBus(
@@ -45,7 +46,10 @@ export async function runAgentEntrypoint(env: NodeJS.ProcessEnv = process.env): 
       secretRoot: "/run/deploylite/secrets"
     },
     new FileCleanupRepairStore(env.DEPLOYLITE_AGENT_CLEANUP_REPAIR_PATH ?? "/var/lib/deploylite/state/cleanup-repairs.json"),
-    new FileManagedBuilderRegistry(env.DEPLOYLITE_AGENT_BUILDER_REGISTRY_PATH ?? "/var/lib/deploylite/state/managed-builders.json")
+    new FileManagedBuilderRegistry(
+      env.DEPLOYLITE_AGENT_BUILDER_REGISTRY_PATH ?? "/var/lib/deploylite/state/managed-builders.json",
+      env.DEPLOYLITE_AGENT_BUILDER_REGISTRY_INTEGRITY_KEY ?? agentToken
+    )
   );
   const worker = new AgentWorker({
     agentId,
