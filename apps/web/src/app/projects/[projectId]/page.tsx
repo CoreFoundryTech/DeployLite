@@ -248,6 +248,7 @@ export default async function ProjectDetailPage({ params }: { params: Promise<Pa
               apiBaseUrl={apiBaseUrl}
               cookieHeader={cookieHeader}
               envVariables={envVariables}
+              latestDeployment={latestDeployment}
             />
           </div>
         </div>
