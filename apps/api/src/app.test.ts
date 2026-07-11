@@ -19,7 +19,7 @@ import {
 import { createEnvSecretCipher, loadEnvSecretKey } from "@deploylite/config";
 import { EventEmitter } from "node:events";
 import { readFile } from "node:fs/promises";
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 import { buildApiApp, createDeploymentLogSseStream, createRuntimeRepositories, InMemoryAuditRepository, InMemoryAuthUserRepository, InMemorySessionRepository } from "./app.js";
 
 const contentHeaders = { "content-type": "application/json" };
@@ -2048,6 +2048,103 @@ describe("Phase 5 slice 1 — DeploymentCommandBus control plane", () => {
 });
 
 describe("Phase 5 slice 3 — Deployment log SSE lifecycle", () => {
+  it("resumes /logs/stream after a valid Last-Event-ID and resets invalid or out-of-bounds cursors to the bounded snapshot", async () => {
+    const deployments = new InMemoryDeploymentRepository();
+    const { app } = await authFixture({ state: { deployments } });
+    const cookie = await loginCookie(app);
+    await deployments.save({
+      id: "dep_mock_1",
+      projectId: "project_mock_1",
+      agentId: "agent_mock_1",
+      status: "succeeded",
+      commitSha: "abcdef1",
+      startedAt: "2026-01-01T00:00:00.000Z",
+      finishedAt: "2026-01-01T00:01:00.000Z"
+    });
+
+    const resumed = await app.inject({
+      method: "GET",
+      url: "/api/v1/deployments/dep_mock_1/logs/stream",
+      headers: { cookie, "last-event-id": "1" }
+    });
+    const invalid = await app.inject({
+      method: "GET",
+      url: "/api/v1/deployments/dep_mock_1/logs/stream",
+      headers: { cookie, "last-event-id": "not-a-cursor" }
+    });
+    const outOfBounds = await app.inject({
+      method: "GET",
+      url: "/api/v1/deployments/dep_mock_1/logs/stream",
+      headers: { cookie, "last-event-id": "1000000000000000" }
+    });
+
+    expect(resumed.statusCode).toBe(200);
+    expect(resumed.body).toContain("id: 2");
+    expect(resumed.body).not.toContain("id: 1");
+    for (const response of [invalid, outOfBounds]) {
+      expect(response.statusCode).toBe(200);
+      expect(response.body).toContain("id: 1");
+      expect(response.body).toContain("id: 2");
+      expect(response.body).toContain("event: deployment.terminal");
+    }
+
+    await app.close();
+  });
+
+  it("emits a keepalive on an idle live /logs/stream and stops polling after abort", async () => {
+    vi.useFakeTimers();
+    try {
+      const { request, response, stream } = sseStreamFixture("running");
+      await stream.start();
+
+      expect(response.writes.join("")).toContain(": keepalive\n\n");
+      request.emit("close");
+      await vi.advanceTimersByTimeAsync(30_000);
+
+      expect(response.ended).toBe(false);
+      expect(vi.getTimerCount()).toBe(0);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("redacts secret fixture text in actual /logs/stream payloads", async () => {
+    const deployments = new InMemoryDeploymentRepository();
+    const { app } = await authFixture({ state: { deployments } });
+    const cookie = await loginCookie(app);
+    await deployments.save({
+      id: "dep_mock_1",
+      projectId: "project_mock_1",
+      agentId: "agent_mock_1",
+      status: "succeeded",
+      commitSha: "abcdef1",
+      startedAt: "2026-01-01T00:00:00.000Z",
+      finishedAt: "2026-01-01T00:01:00.000Z"
+    });
+    await deployments.appendLog({
+      id: "stream-secret-log",
+      deploymentId: "dep_mock_1",
+      sequence: 3,
+      level: "info",
+      message: "stream secret dl_stream_secret_1234567890",
+      timestamp: "2026-01-01T00:00:02.000Z",
+      redactionApplied: false,
+      requestId: "req_stream_secret",
+      correlationId: "req_stream_secret"
+    });
+
+    const response = await app.inject({
+      method: "GET",
+      url: "/api/v1/deployments/dep_mock_1/logs/stream",
+      headers: { cookie }
+    });
+
+    expect(response.statusCode).toBe(200);
+    expect(response.body).toContain("[REDACTED]");
+    expect(response.body).not.toContain("dl_stream_secret_1234567890");
+    await app.close();
+  });
+
   it("closes the persistent stream on client abort and leaves no polling or close listeners behind", async () => {
     const { request, response, stream, timers } = sseStreamFixture("running");
     await stream.start();
