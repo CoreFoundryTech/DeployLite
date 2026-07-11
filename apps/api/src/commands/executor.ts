@@ -208,6 +208,8 @@ export class MockDeploymentExecutor implements DeploymentExecutor {
       const existing = await this.#deployments.findById(deploymentId);
       if (!existing) return;
       if (existing.status === "failed" || existing.status === "succeeded" || existing.status === "canceled") return;
+      const command = await this.#bus.findById(commandId);
+      if (command?.state !== "claimed") return;
       const finishedAt = status === "running" ? null : new Date().toISOString();
       const next: Deployment = { ...existing, status, finishedAt };
       const message =

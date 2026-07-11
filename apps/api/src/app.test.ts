@@ -157,30 +157,13 @@ async function loginCookie(app: Awaited<ReturnType<typeof buildApiApp>>, email =
 async function streamFixture(status: "running" | "succeeded" = "succeeded") {
   const deployments = new InMemoryDeploymentRepository();
   const deploymentId = "dep_stream_1";
-  await deployments.save({
-    id: deploymentId,
-    projectId: "project_mock_1",
-    agentId: "agent_mock_1",
-    status,
-    commitSha: "abcdef1",
-    startedAt: "2026-01-01T00:00:00.000Z",
-    finishedAt: status === "succeeded" ? "2026-01-01T00:01:00.000Z" : null
-  });
+  await deployments.save({ id: deploymentId, projectId: "project_mock_1", agentId: "agent_mock_1", status, commitSha: "abcdef1", startedAt: "2026-01-01T00:00:00.000Z", finishedAt: status === "succeeded" ? "2026-01-01T00:01:00.000Z" : null });
   const { app } = await authFixture({ state: { deployments } });
   return { app, deploymentId, deployments };
 }
 
 async function appendStreamLog(deployments: InMemoryDeploymentRepository, deploymentId: string, sequence: number, message: string) {
-  await deployments.appendAllocatedLog({
-    id: `stream-log-${sequence}`,
-    deploymentId,
-    level: "info",
-    message,
-    timestamp: "2026-01-01T00:00:00.000Z",
-    redactionApplied: true,
-    requestId: "req_stream_1",
-    correlationId: "req_stream_1"
-  });
+  await deployments.appendAllocatedLog({ id: `stream-log-${sequence}`, deploymentId, level: "info", message, timestamp: "2026-01-01T00:00:00.000Z", redactionApplied: true, requestId: "req_stream_1", correlationId: "req_stream_1" });
 }
 
 describe("DeployLite API scaffold", () => {
@@ -2010,7 +1993,34 @@ describe("Phase 5 slice 1 — DeploymentCommandBus control plane", () => {
 
     await app.close();
   });
-
+  it("keeps cancellation authoritative when it wins during the terminal timer fence", async () => {
+    const deployments = new InMemoryDeploymentRepository();
+    const commands = new InMemoryDeploymentCommandRepository();
+    const save = deployments.save.bind(deployments);
+    let running!: () => void;
+    const reachedRunning = new Promise<void>((resolve) => { running = resolve; });
+    deployments.save = async (deployment) => { const saved = await save(deployment); if (deployment.status === "running") running(); return saved; };
+    const { app, audit } = await authFixture({ state: { deployments, deploymentCommands: commands } });
+    const cookie = await loginCookie(app);
+    const project = (await app.inject({ method: "POST", url: "/api/v1/projects", headers: { ...contentHeaders, cookie }, payload: { name: "Timer fence", repoUrl: "https://github.com/example/timer-fence", defaultBranch: "main", runCommand: "node server.js" } })).json().data.project;
+    const deploymentId = (await app.inject({ method: "POST", url: `/api/v1/projects/${project.id}/deployments`, headers: { ...contentHeaders, cookie }, payload: {} })).json().data.deployment.id as string;
+    await reachedRunning;
+    const findCommand = commands.findById.bind(commands);
+    let release!: () => void;
+    let reachedFence!: () => void;
+    const terminalFence = new Promise<void>((resolve) => { reachedFence = resolve; });
+    const releaseFence = new Promise<void>((resolve) => { release = resolve; });
+    let blockNextFind = true;
+    commands.findById = async (id) => { if (blockNextFind) { blockNextFind = false; reachedFence(); await releaseFence; } return findCommand(id); };
+    await terminalFence; const cancel = await app.inject({ method: "POST", url: `/api/v1/deployments/${deploymentId}/cancel`, headers: { cookie } });
+    release(); await new Promise((resolve) => setTimeout(resolve, 25));
+    const [logs, command, deployment] = await Promise.all([deployments.listLogs(deploymentId), commands.findById(cancel.json().data.command.id), deployments.findById(deploymentId)]);
+    expect(cancel.statusCode).toBe(200);
+    expect(command).toMatchObject({ state: "cancelled" }); expect(deployment).toMatchObject({ status: "canceled" });
+    expect(logs.filter((log) => /Simulated agent marked the deployment (succeeded|failed)/.test(log.message))).toHaveLength(0); expect(logs.filter((log) => log.message.includes("cancellation requested"))).toHaveLength(1);
+    expect(logs.filter((log) => log.message.includes("Deployment command cancelled"))).toHaveLength(1);
+    expect(audit.inputs.filter((event) => event.action === "deployment.cancel")).toHaveLength(1); await app.close();
+  });
   it("marks the deployment failed when command submission fails", async () => {
     const deployments = new InMemoryDeploymentRepository();
     const deploymentCommands: DeploymentCommandRepository = {
@@ -2129,16 +2139,7 @@ describe("Phase 5 slice 1 — DeploymentCommandBus control plane", () => {
     expect(audit.inputs.some((event) => event.action === "deployment.restart.rejected")).toBe(true);
     expect(audit.inputs.some((event) => event.action === "deployment.rollback.rejected")).toBe(true);
 
-    await Promise.all(Array.from({ length: 101 }, (_, index) => deployments.appendAllocatedLog({
-      id: `terminal-log-${index}`,
-      deploymentId,
-      level: "info",
-      message: index === 100 ? "final token dl_1234567890abcdef must be redacted" : `terminal log ${index}`,
-      timestamp: now.toISOString(),
-      redactionApplied: true,
-      requestId: "req_terminal_logs",
-      correlationId: "req_terminal_logs"
-    })));
+    await Promise.all(Array.from({ length: 101 }, (_, index) => deployments.appendAllocatedLog({ id: `terminal-log-${index}`, deploymentId, level: "info", message: index === 100 ? "final token dl_1234567890abcdef must be redacted" : `terminal log ${index}`, timestamp: now.toISOString(), redactionApplied: true, requestId: "req_terminal_logs", correlationId: "req_terminal_logs" })));
     const stream = await app.inject({
       method: "GET",
       url: `/api/v1/deployments/${deploymentId}/logs/stream`,
