@@ -174,6 +174,7 @@ export type DeploymentCommandBus = {
   failSystem(commandId: string, reason: string): Promise<DeploymentCommandRecord | null>;
   failExpiredClaim(commandId: string, reason: string): Promise<DeploymentCommandRecord | null>;
   cancel(commandId: string, requestedBy: string | null): Promise<DeploymentCommandRecord | null>;
+  cancelWithResult(commandId: string, requestedBy: string | null): Promise<{ command: DeploymentCommandRecord; applied: boolean } | null>;
   list(): Promise<DeploymentCommandRecord[]>;
   findById(commandId: string): Promise<DeploymentCommandRecord | null>;
   findActiveForDeployment(deploymentId: string): Promise<DeploymentCommandRecord | null>;

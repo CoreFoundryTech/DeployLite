@@ -29,7 +29,7 @@ const testEnvSecretCipher = createEnvSecretCipher(loadEnvSecretKey(testEnvSecret
 const testEnv: NodeJS.ProcessEnv = { ...process.env, DEPLOYLITE_SECRET_KEY: testEnvSecretKey };
 const UUID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
 
-function sseStreamFixture(status: "running" | "succeeded") {
+function sseStreamFixture(status: "running" | "succeeded", logs: Array<{ sequence: number; message: string }> = []) {
   const request = new EventEmitter();
   const response = Object.assign(new EventEmitter(), {
     writes: [] as string[],
@@ -45,7 +45,19 @@ function sseStreamFixture(status: "running" | "succeeded") {
     list: async () => [],
     appendLog: async (event) => event,
     appendAllocatedLog: async (event) => ({ ...event, sequence: 1 }),
-    listLogs: async () => []
+    listLogs: async (_deploymentId, afterSequence = -1) => logs
+      .filter((log) => log.sequence > afterSequence)
+      .map((log) => ({
+        id: `log-${log.sequence}`,
+        deploymentId: "deployment-1",
+        level: "info" as const,
+        message: log.message,
+        timestamp: "2026-01-01T00:00:00.000Z",
+        redactionApplied: true,
+        requestId: "req-sse",
+        correlationId: "req-sse",
+        sequence: log.sequence
+      }))
   };
   return {
     request,
@@ -1964,8 +1976,10 @@ describe("Phase 5 slice 1 — DeploymentCommandBus control plane", () => {
     });
     const deploymentId = trigger.json().data.deployment.id as string;
 
-    const cancel = await app.inject({ method: "POST", url: `/api/v1/deployments/${deploymentId}/cancel`, headers: { cookie, "x-request-id": "req_control_cancel" } });
-    const repeatedCancel = await app.inject({ method: "POST", url: `/api/v1/deployments/${deploymentId}/cancel`, headers: { cookie } });
+    const [cancel, repeatedCancel] = await Promise.all([
+      app.inject({ method: "POST", url: `/api/v1/deployments/${deploymentId}/cancel`, headers: { cookie, "x-request-id": "req_control_cancel" } }),
+      app.inject({ method: "POST", url: `/api/v1/deployments/${deploymentId}/cancel`, headers: { cookie } })
+    ]);
     const restart = await app.inject({ method: "POST", url: `/api/v1/deployments/${deploymentId}/restart`, headers: { cookie } });
     const rollback = await app.inject({ method: "POST", url: `/api/v1/deployments/${deploymentId}/rollback`, headers: { cookie } });
     const logs = await app.inject({ method: "GET", url: `/api/v1/deployments/${deploymentId}/logs`, headers: { cookie } });
@@ -1978,7 +1992,7 @@ describe("Phase 5 slice 1 — DeploymentCommandBus control plane", () => {
     expect(rollback.json().error).toMatchObject({ code: "ROLLBACK_UNAVAILABLE" });
     expect(logs.json().data.events.some((event: { message: string }) => event.message.includes("cancellation requested"))).toBe(true);
     expect(JSON.stringify(logs.json())).not.toContain("external-agent-token-for-tests-1234567890");
-    expect(audit.inputs.some((event) => event.action === "deployment.cancel" && event.metadata?.["projectId"] === project.id)).toBe(true);
+    expect(audit.inputs.filter((event) => event.action === "deployment.cancel" && event.metadata?.["projectId"] === project.id)).toHaveLength(1);
     expect(audit.inputs.some((event) => event.action === "deployment.restart.rejected")).toBe(true);
     expect(audit.inputs.some((event) => event.action === "deployment.rollback.rejected")).toBe(true);
 
@@ -2022,5 +2036,24 @@ describe("Phase 5 slice 3 — Deployment log SSE lifecycle", () => {
     expect(request.listenerCount("close")).toBe(0);
     expect(response.listenerCount("close")).toBe(0);
     expect(response.writes).toHaveLength(writesAtClose);
+  });
+
+  it("drains terminal log pages before emitting the terminal frame", async () => {
+    const logs = Array.from({ length: 101 }, (_, index) => ({ sequence: index + 1, message: `safe log ${index + 1}` }));
+    const { response, stream, timers } = sseStreamFixture("succeeded", logs);
+    await stream.start();
+
+    expect(response.ended).toBe(false);
+    expect(response.writes.filter((chunk) => chunk.includes("event: deployment.log"))).toHaveLength(100);
+    expect(response.writes.some((chunk) => chunk.includes("event: deployment.terminal"))).toBe(false);
+
+    const [poll] = timers.values();
+    poll?.();
+    await Promise.resolve();
+    await Promise.resolve();
+
+    expect(response.writes.filter((chunk) => chunk.includes("event: deployment.log"))).toHaveLength(101);
+    expect(response.writes.filter((chunk) => chunk.includes("event: deployment.terminal"))).toHaveLength(1);
+    expect(response.ended).toBe(true);
   });
 });

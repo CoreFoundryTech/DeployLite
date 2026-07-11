@@ -200,15 +200,19 @@ export class DeploymentCommandBusService implements DeploymentCommandBus {
   }
 
   async cancel(commandId: string, requestedBy: string | null): Promise<DeploymentCommandRecord | null> {
+    return (await this.cancelWithResult(commandId, requestedBy))?.command ?? null;
+  }
+
+  async cancelWithResult(commandId: string, requestedBy: string | null): Promise<{ command: DeploymentCommandRecord; applied: boolean } | null> {
     const existing = await this.#repository.findById(commandId);
     if (!existing) return null;
     if (!isDeploymentCommandTransitionAllowed(existing.state, "cancelled")) {
       // The command is already in a terminal state. Cancelling an
       // already-finished command is a no-op and returns the existing
       // row so the caller can treat the request as idempotent.
-      return existing;
+      return { command: existing, applied: false };
     }
-    if (existing.state !== "pending" && existing.state !== "claimed") return existing;
+    if (existing.state !== "pending" && existing.state !== "claimed") return { command: existing, applied: false };
     const next: DeploymentCommandRecord = {
       ...existing,
       state: "cancelled",
@@ -218,7 +222,7 @@ export class DeploymentCommandBusService implements DeploymentCommandBus {
     };
     const result = await this.#repository.transitionTerminal(existing.id, existing.agentId, existing.state, next);
     if (result?.applied) await this.#emit("deployment.command.cancelled", result.command);
-    return result?.command ?? null;
+    return result;
   }
 
   async list(): Promise<DeploymentCommandRecord[]> {

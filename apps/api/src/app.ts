@@ -974,14 +974,17 @@ export function createDeploymentLogSseStream(options: DeploymentLogSseStreamOpti
     emitting = true;
     try {
       const current = await options.deployments.findById(options.deploymentId);
-      const logs = (await options.deployments.listLogs(options.deploymentId, cursor)).slice(0, SSE_LOG_PAGE_LIMIT);
+      const availableLogs = await options.deployments.listLogs(options.deploymentId, cursor);
+      const logs = availableLogs.slice(0, SSE_LOG_PAGE_LIMIT);
       for (const log of logs) {
         cursor = log.sequence;
         write("deployment.log", { ...log, stream: options.correlationContext }, log.sequence);
       }
       if (!closed) options.raw.write(": keepalive\n\n");
       if (current) write("deployment.status", { status: current.status });
-      if (!current || ["succeeded", "failed", "canceled"].includes(current.status)) {
+      // A terminal deployment can still have a backlog. Keep the SSE response
+      // open until the cursor has caught up, then emit the terminal frame.
+      if ((!current || ["succeeded", "failed", "canceled"].includes(current.status)) && availableLogs.length < SSE_LOG_PAGE_LIMIT) {
         write("deployment.terminal", { status: current?.status ?? "unavailable" });
         cleanup();
         options.raw.end();
@@ -1741,11 +1744,16 @@ function registerRoutes(app: FastifyInstance, state: PlatformRepositories, adapt
     if (!scoped) return reply.code(404).send(errorEnvelope(request, "NOT_FOUND", "Deployment not found."));
 
     const active = await state.deploymentCommandBus.findActiveForDeployment(scoped.deployment.id);
-    const command = active
-      ? await state.deploymentCommandBus.cancel(active.id, request.auth?.user.id ?? null)
-      : (await state.deploymentCommandBus.list())
+    const resolvedCancellation = active
+      ? await state.deploymentCommandBus.cancelWithResult(active.id, request.auth?.user.id ?? null)
+      : null;
+    const priorCommand = !active
+      ? (await state.deploymentCommandBus.list())
           .filter((item) => item.deploymentId === scoped.deployment.id)
-          .sort((left, right) => right.issuedAt.localeCompare(left.issuedAt))[0] ?? null;
+          .sort((left, right) => right.issuedAt.localeCompare(left.issuedAt))[0] ?? null
+      : null;
+    const cancellation = resolvedCancellation ?? (priorCommand ? { command: priorCommand, applied: false } : null);
+    const command = cancellation?.command ?? null;
     if (!command) {
       await appendAudit(adapters.audit, request, {
         actorUserId: request.auth?.user.id ?? null,
@@ -1756,18 +1764,21 @@ function registerRoutes(app: FastifyInstance, state: PlatformRepositories, adapt
       });
       return reply.code(409).send(errorEnvelope(request, "COMMAND_UNAVAILABLE", "This deployment has no command that can be cancelled."));
     }
-    if (active && command.state === "cancelled") {
+    const applied = cancellation?.applied ?? false;
+    if (applied && command.state === "cancelled") {
       await projectAuthoritativeTerminalCommand(state, command);
       await appendDeploymentControlLog(state, scoped.deployment.id, "info", "Deployment cancellation requested by an authorized operator.", request);
     }
-    await appendAudit(adapters.audit, request, {
-      actorUserId: request.auth?.user.id ?? null,
-      action: "deployment.cancel",
-      targetType: "deployment",
-      targetId: scoped.deployment.id,
-      metadata: { projectId: scoped.project.id, agentId: scoped.agent.id, commandId: command.id, outcome: command.state }
-    });
-    return ok(request, { deployment: (await state.deployments.findById(scoped.deployment.id)) ?? scoped.deployment, command, idempotent: !active });
+    if (applied) {
+      await appendAudit(adapters.audit, request, {
+        actorUserId: request.auth?.user.id ?? null,
+        action: "deployment.cancel",
+        targetType: "deployment",
+        targetId: scoped.deployment.id,
+        metadata: { projectId: scoped.project.id, agentId: scoped.agent.id, commandId: command.id, outcome: command.state }
+      });
+    }
+    return ok(request, { deployment: (await state.deployments.findById(scoped.deployment.id)) ?? scoped.deployment, command, idempotent: !applied });
   });
   for (const action of ["restart", "rollback"] as const) {
     app.post(`${API_PREFIX}/deployments/:deploymentId/${action}`, { preHandler: [requireAuth, requireMutationRole] }, async (request, reply) => {
