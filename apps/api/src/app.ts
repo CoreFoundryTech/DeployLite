@@ -235,6 +235,12 @@ class InMemoryAuditRepository implements AuditRepository {
   readonly inputs: AuditEventInput[] = [];
 
   async append(input: AuditEventInput): Promise<AuditEvent> {
+    return this.appendOnce(input, `audit_${createRequestId()}`);
+  }
+
+  async appendOnce(input: AuditEventInput, id: string): Promise<AuditEvent> {
+    const existing = this.events.find((event) => event.id === id);
+    if (existing) return existing;
     const safe = createAuditLogRecord({
       actorId: input.actorUserId === null ? "anonymous" : input.actorUserId ?? "system",
       action: input.action,
@@ -245,7 +251,7 @@ class InMemoryAuditRepository implements AuditRepository {
       metadata: input.metadata
     });
     const event: AuditEvent = {
-      id: `audit_${createRequestId()}`,
+      id,
       actorId: safe.actorId,
       action: safe.action,
       targetType: safe.targetType,
@@ -394,6 +400,11 @@ function sessionCookie(config: AuthConfig, token: string, maxAge: number): strin
 
 async function appendAudit(audit: AuditRepository, request: FastifyRequest, input: Omit<AuditEventInput, "requestId" | "correlationId">): Promise<AuditEvent> {
   return audit.append({ ...input, ...request.correlationContext });
+}
+
+function terminalProjectionId(commandId: string, projection: string): string {
+  const hash = createHash("sha256").update(`${commandId}:${projection}`).digest("hex");
+  return `${hash.slice(0, 8)}-${hash.slice(8, 12)}-${hash.slice(12, 16)}-${hash.slice(16, 20)}-${hash.slice(20, 32)}`;
 }
 
 function createAuthPreHandler(adapters: AuthAdapters, config: AuthConfig) {
@@ -865,7 +876,7 @@ async function ensureAgentDeploymentLifecycle(
   const appendLifecycleLog = async () => {
     if (logs.some((log) => correlated(log.message, log.requestId, log.correlationId))) return;
     const event = {
-      id: createRequestId(),
+      id: terminalProjectionId(command.id, lifecycle.marker),
       deploymentId: deployment.id,
       level: lifecycle.level,
       message: lifecycle.message,
@@ -923,19 +934,25 @@ async function appendDeploymentControlLog(
   deploymentId: string,
   level: "info" | "warn" | "error",
   message: string,
-  request: FastifyRequest
+  request: FastifyRequest,
+  idempotencyKey = deploymentId
 ): Promise<void> {
   const existing = await state.deployments.listLogs(deploymentId);
   if (existing.some((event) => event.message === redactLogMessage(message))) return;
-  await state.deployments.appendAllocatedLog({
-    id: createRequestId(),
+  const event = {
+    id: terminalProjectionId(idempotencyKey, message),
     deploymentId,
     level,
     message: redactLogMessage(message),
     timestamp: state.now().toISOString(),
     redactionApplied: true,
     ...request.correlationContext
-  });
+  } as const;
+  try {
+    await state.deployments.appendAllocatedLog(event);
+  } catch (error) {
+    if (!(await state.deployments.listLogs(deploymentId)).some((log) => log.id === event.id)) throw error;
+  }
 }
 
 function sseResumeCursor(request: FastifyRequest): number {
@@ -946,7 +963,7 @@ function sseResumeCursor(request: FastifyRequest): number {
 }
 
 async function reconcileCancelledDeployment(state: PlatformRepositories, command: DeploymentCommand, request: FastifyRequest): Promise<void> {
-  await appendDeploymentControlLog(state, command.deploymentId, "info", "Deployment cancellation requested by an authorized operator.", request);
+  await appendDeploymentControlLog(state, command.deploymentId, "info", "Deployment cancellation requested by an authorized operator.", request, command.id);
   await projectAuthoritativeTerminalCommand(state, command);
 }
 
@@ -1743,13 +1760,14 @@ function registerRoutes(app: FastifyInstance, state: PlatformRepositories, adapt
     if (command.state === "cancelled") {
       await reconcileCancelledDeployment(state, command, request);
     }
-    await appendAudit(adapters.audit, request, {
+    await adapters.audit.appendOnce({
       actorUserId: request.auth?.user.id ?? null,
       action: "deployment.cancel",
       targetType: "deployment",
       targetId: scoped.deployment.id,
-      metadata: { projectId: scoped.project.id, agentId: scoped.agent.id, commandId: command.id, outcome: command.state }
-    });
+      metadata: { projectId: scoped.project.id, agentId: scoped.agent.id, commandId: command.id, outcome: command.state },
+      ...request.correlationContext
+    }, terminalProjectionId(command.id, "audit"));
     return ok(request, { deployment: (await state.deployments.findById(scoped.deployment.id)) ?? scoped.deployment, command, idempotent: !active });
   });
   for (const action of ["restart", "rollback"] as const) {

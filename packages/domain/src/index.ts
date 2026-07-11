@@ -312,6 +312,7 @@ export type SessionRepository = {
 
 export type AuditRepository = {
   append(input: AuditEventInput): Promise<AuditEvent>;
+  appendOnce(input: AuditEventInput, id: string): Promise<AuditEvent>;
   list(filter?: AuditEventListFilter): Promise<AuditEventListPage>;
 };
 
@@ -504,8 +505,8 @@ export class InMemoryDeploymentRepository implements DeploymentRepository {
   async appendLog(event: LogEvent): Promise<LogEvent> {
     const safeEvent = { ...event, message: redactLogMessage(event.message), redactionApplied: true };
     const events = this.#logs.get(event.deploymentId) ?? [];
-    if (events.some((existing) => existing.sequence === event.sequence)) {
-      throw new Error("Log sequences are immutable and unique per deployment");
+    if (events.some((existing) => existing.sequence === event.sequence || existing.id === event.id)) {
+      throw new Error("Deployment log ids and sequences are immutable and unique per deployment");
     }
     this.#logs.set(event.deploymentId, [...events, safeEvent]);
     this.#nextLogSequence.set(event.deploymentId, Math.max(this.#nextLogSequence.get(event.deploymentId) ?? 1, event.sequence + 1));

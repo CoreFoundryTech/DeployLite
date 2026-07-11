@@ -139,8 +139,8 @@ export class MockDeploymentExecutor implements DeploymentExecutor {
 
   async #failStart(command: DeploymentCommandRecord, deployment: Deployment, reason: string): Promise<void> {
     const failed: Deployment = { ...deployment, status: "failed", finishedAt: new Date().toISOString() };
-    await this.#deployments.save(failed);
     await this.#appendLog(deployment, "error", reason, command.requestId, command.correlationId);
+    await this.#deployments.save(failed);
     await this.#bus.fail(command.id, reason);
   }
 
