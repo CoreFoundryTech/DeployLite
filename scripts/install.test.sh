@@ -121,6 +121,7 @@ test_write_env_generates_once_with_private_permissions() {
   assert_contains "$saved" 'DEPLOYLITE_PUBLIC_WEB_ORIGIN=http://198.51.100.10'
   assert_contains "$saved" 'DEPLOYLITE_PUBLIC_API_ORIGIN=http://198.51.100.10:3001'
   assert_contains "$saved" 'POSTGRES_PASSWORD=generated-secret'
+  assert_contains "$saved" 'DEPLOYLITE_REPO_ALLOWED_HOSTS=github.com'
   [[ "$(stat -f '%Lp' "$ENV_FILE" 2>/dev/null || stat -c '%a' "$ENV_FILE")" == "600" ]]
   rm -rf "$tmp"
 }
@@ -140,6 +141,7 @@ test_installed_compose_uses_source_tree_build_context() {
   agent_block="${rendered#*  agent:}"
   agent_block="${agent_block%%$'\n  web:'*}"
   assert_contains "$rendered" 'test -f /var/lib/deploylite/state/agent-ready' || return 1
+  assert_contains "$agent_block" 'DEPLOYLITE_REPO_ALLOWED_HOSTS: ${DEPLOYLITE_REPO_ALLOWED_HOSTS:?DEPLOYLITE_REPO_ALLOWED_HOSTS is required}' || return 1
   assert_not_contains "$rendered" 'process.kill(1, 0)' || return 1
   assert_not_contains "$agent_block" 'ports:' || return 1
   rm -rf "$tmp"
@@ -170,6 +172,7 @@ test_prepare_install_dir_generates_required_agent_values_before_compose_prefligh
       assert_contains "$config_values" 'DEPLOYLITE_AGENT_ID=123e4567-e89b-42d3-a456-426614174000' || return 1
       assert_contains "$config_values" 'DEPLOYLITE_AGENT_TOKEN=independent-secret-' || return 1
       assert_contains "$config_values" 'DEPLOYLITE_AGENT_BUILDER_REGISTRY_INTEGRITY_KEY=independent-secret-' || return 1
+      assert_contains "$config_values" 'DEPLOYLITE_REPO_ALLOWED_HOSTS=github.com' || return 1
     fi
   }
   start_runtime
@@ -199,6 +202,7 @@ EOF
   saved="$(cat "$ENV_FILE")"
   assert_contains "$saved" 'DEPLOYLITE_AGENT_TOKEN=existing-agent-token' || { rm -rf "$tmp"; return 1; }
   assert_contains "$saved" 'DEPLOYLITE_AGENT_BUILDER_REGISTRY_INTEGRITY_KEY=existing-registry-key' || { rm -rf "$tmp"; return 1; }
+  assert_contains "$saved" 'DEPLOYLITE_REPO_ALLOWED_HOSTS=github.com' || { rm -rf "$tmp"; return 1; }
   assert_not_contains "$saved" 'must-not-be-generated' || { rm -rf "$tmp"; return 1; }
   rm -rf "$tmp"
 }
@@ -218,6 +222,15 @@ test_runtime_starts_agent_after_config_preflight() {
   [[ "${calls[0]}" == "config" ]] || { rm -rf "$tmp_runtime"; return 1; }
   [[ " ${calls[*]} " == *" up -d --build api web agent "* ]] || { rm -rf "$tmp_runtime"; return 1; }
   rm -rf "$tmp_runtime"
+}
+
+test_missing_or_empty_repository_allowlist_fails_during_compose_preflight() {
+  local rendered agent_block
+  rendered="$(cat "${ROOT_DIR}/infra/vps/compose.yml")"
+  agent_block="${rendered#*  agent:}"
+  agent_block="${agent_block%%$'\n  web:'*}"
+  assert_contains "$agent_block" 'DEPLOYLITE_REPO_ALLOWED_HOSTS: ${DEPLOYLITE_REPO_ALLOWED_HOSTS:?DEPLOYLITE_REPO_ALLOWED_HOSTS is required}' || return 1
+  [[ "${agent_block%%healthcheck:*}" == *'DEPLOYLITE_REPO_ALLOWED_HOSTS:'* ]] || return 1
 }
 
 test_agent_health_failure_is_nonzero_and_redacts_diagnostics() {
@@ -385,6 +398,7 @@ run_test 'installed compose keeps valid build context' test_installed_compose_us
 run_test 'fresh install generates agent values before compose preflight' test_prepare_install_dir_generates_required_agent_values_before_compose_preflight
 run_test 'rerun preserves existing agent values' test_prepare_install_dir_preserves_existing_agent_values_on_rerun
 run_test 'runtime starts agent after config preflight' test_runtime_starts_agent_after_config_preflight
+run_test 'missing repository allowlist fails before agent readiness' test_missing_or_empty_repository_allowlist_fails_during_compose_preflight
 run_test 'agent health failure is surfaced with redacted diagnostics' test_agent_health_failure_is_nonzero_and_redacts_diagnostics
 run_test 'failure cleanup preserves config' test_failure_cleanup_preserves_config_and_uses_compose_down_only
 run_test 'final URL guides first owner setup' test_final_url_output_points_to_first_owner_setup

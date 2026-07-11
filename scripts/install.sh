@@ -316,6 +316,10 @@ random_secret() {
   random_hex 32
 }
 
+default_repository_allowed_hosts() {
+  printf '%s' 'github.com'
+}
+
 random_uuid_v4() {
   local value variant
   value="$(random_hex 16)"
@@ -414,6 +418,7 @@ ensure_compose_secrets() {
   ensure_env_value DEPLOYLITE_AGENT_ID random_uuid_v4
   ensure_env_value DEPLOYLITE_AGENT_TOKEN random_secret
   ensure_env_value DEPLOYLITE_AGENT_BUILDER_REGISTRY_INTEGRITY_KEY random_secret
+  ensure_env_value DEPLOYLITE_REPO_ALLOWED_HOSTS default_repository_allowed_hosts
 }
 
 prepare_install_dir() {

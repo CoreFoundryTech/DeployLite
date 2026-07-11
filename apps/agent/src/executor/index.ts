@@ -1,8 +1,8 @@
-import { chmod, lstat, mkdir, realpath, rm, writeFile } from "node:fs/promises";
+import { chmod, lstat, mkdir, readdir, readFile, realpath, rm, writeFile } from "node:fs/promises";
 import { spawn } from "node:child_process";
 import { lookup } from "node:dns/promises";
 import { isIP } from "node:net";
-import { dirname, relative, resolve } from "node:path";
+import { basename, dirname, relative, resolve } from "node:path";
 import { redactSecrets } from "@deploylite/config";
 import type { DeploymentCommand } from "@deploylite/contracts";
 import { redactEnvFileForLog } from "../redaction.js";
@@ -43,6 +43,7 @@ export type CommandBusClient = {
 export type HealthProbe = { probe(url: string, timeoutMs: number, signal?: AbortSignal): Promise<boolean> };
 export type RepositoryResolver = (hostname: string) => Promise<string[]>;
 export type RepositoryOriginPolicy = { allowedHosts: string[]; resolve?: RepositoryResolver };
+export type BuildContextInspector = (workspace: string) => Promise<void>;
 export type HealthPolicy = {
   startupGraceMs?: number;
   deadlineMs?: number;
@@ -206,7 +207,8 @@ export class AgentDeploymentExecutor {
     private readonly cleanupRepairs: CleanupRepairStore = { load: async () => [], put: async () => undefined, remove: async () => undefined },
     private readonly managedBuilders: ManagedBuilderRegistry = new InMemoryManagedBuilderRegistry(),
     private readonly healthPolicy: HealthPolicy = {},
-    private readonly repositoryPolicy: RepositoryOriginPolicy = { allowedHosts: ["github.com"] }
+    private readonly repositoryPolicy: RepositoryOriginPolicy = { allowedHosts: ["github.com"] },
+    private readonly inspectBuildContext: BuildContextInspector = assertSafeBuildContext
   ) {}
 
   async execute(input: DeploymentExecutionInput, signal?: AbortSignal): Promise<DeploymentExecutionResult> {
@@ -244,6 +246,7 @@ export class AgentDeploymentExecutor {
       // reducing the DNS-rebinding window without claiming to eliminate TOCTOU.
       await this.assertRepositoryOrigin(input.repoUrl);
       for (const plan of plans.slice(0, 3)) await this.run(plan, signal);
+      await this.inspectBuildContext(workspace!);
       await this.managedBuilders.put({ version: 1, commandId: claimed.id, builderName: builderName(claimed.id) });
       managedResourcesAttempted = true;
       for (const plan of plans.slice(3, -1)) await this.run(plan, signal);
@@ -706,6 +709,67 @@ function validateInput(input: DeploymentExecutionInput): void {
     throw new Error("Health URL must target the managed runtime container and internal port");
   }
   if (!input.envFile || typeof input.envFile.contents !== "string") throw new Error("A secret env-file is required for deployment");
+}
+
+/**
+ * Reject remote ADD sources before creating BuildKit resources. This is a
+ * deliberately small, fail-closed Dockerfile parser: it only accepts complete
+ * logical instructions and treats malformed continuations as unsafe.
+ */
+export async function assertSafeBuildContext(workspace: string): Promise<void> {
+  const dockerfiles = await discoverDockerfiles(workspace);
+  if (dockerfiles.length === 0) throw new Error("Build context Dockerfile is missing");
+  for (const path of dockerfiles) validateDockerfileAddInstructions(await readFile(path, "utf8"));
+}
+
+async function discoverDockerfiles(root: string): Promise<string[]> {
+  const files: string[] = [];
+  const pending = [root];
+  while (pending.length > 0) {
+    const directory = pending.pop()!;
+    let entries;
+    try { entries = await readdir(directory, { withFileTypes: true }); }
+    catch { throw new Error("Build context inspection failed"); }
+    for (const entry of entries) {
+      const path = resolve(directory, entry.name);
+      if (entry.isDirectory()) pending.push(path);
+      else if (entry.isFile() && /^dockerfile(?:\.[a-z0-9_.-]+)?$/i.test(basename(path))) files.push(path);
+    }
+  }
+  return files;
+}
+
+export function validateDockerfileAddInstructions(contents: string): void {
+  let instruction = "";
+  let continuation = false;
+  for (const rawLine of contents.replace(/^\uFEFF/, "").split(/\r?\n/)) {
+    const line = rawLine.trim();
+    if (!continuation && (!line || line.startsWith("#"))) continue;
+    if (continuation && (!line || line.startsWith("#"))) throw new Error("Dockerfile continuation is invalid");
+    const continues = /\\\s*$/.test(rawLine);
+    instruction += `${instruction ? " " : ""}${rawLine.replace(/\\\s*$/, "").trim()}`;
+    continuation = continues;
+    if (continuation) continue;
+    validateDockerfileInstruction(instruction);
+    instruction = "";
+  }
+  if (continuation || instruction) {
+    if (continuation) throw new Error("Dockerfile continuation is invalid");
+    validateDockerfileInstruction(instruction);
+  }
+}
+
+function validateDockerfileInstruction(instruction: string): void {
+  const match = instruction.match(/^\s*([a-z]+)\b([\s\S]*)$/i);
+  if (!match) throw new Error("Dockerfile instruction is invalid");
+  if (match[1]!.toUpperCase() !== "ADD") return;
+  const argumentsText = match[2]!.trim();
+  if (!argumentsText) throw new Error("Dockerfile ADD instruction is invalid");
+  // This catches HTTP(S), protocol-relative, and scheme/git-like forms in
+  // shell and JSON-array ADD syntax without disclosing the source in errors.
+  if (/(?:^|[\s[\]",'])(?:[a-z][a-z0-9+.-]*:\/\/|\/\/|git@)/i.test(argumentsText)) {
+    throw new Error("Remote ADD sources are not permitted");
+  }
 }
 
 function safeWorkspace(root: string, commandId: string): string {

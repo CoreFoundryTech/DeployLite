@@ -4,7 +4,7 @@ import { createRequire } from "node:module";
 import { resolve } from "node:path";
 import { describe, expect, it, vi } from "vitest";
 import type { DeploymentCommand } from "@deploylite/contracts";
-import { AgentDeploymentExecutor, assertSafeRuntimePlan, createDeploymentPlan, createSpawnProcessRunner, type CleanupRepairStore, type CommandBusClient, type HealthPolicy, type HealthProbe, type ProcessRunner, type RepositoryOriginPolicy, type SpawnedProcess, type WorkspaceFilesystem } from "./index.js";
+import { AgentDeploymentExecutor, assertSafeRuntimePlan, createDeploymentPlan, createSpawnProcessRunner, validateDockerfileAddInstructions, type CleanupRepairStore, type CommandBusClient, type HealthPolicy, type HealthProbe, type ProcessRunner, type RepositoryOriginPolicy, type SpawnedProcess, type WorkspaceFilesystem } from "./index.js";
 import { InMemoryCleanupRepairStore } from "../cleanup-repairs.js";
 import { InMemoryManagedBuilderRegistry } from "../managed-builders.js";
 
@@ -37,7 +37,7 @@ function setup(results = [{ code: 0, stdout: "", stderr: "", timedOut: false }])
   };
   const logger = { log: vi.fn() };
   const cleanupRepairs = new InMemoryCleanupRepairStore();
-  return { runner, bus, fail, health, filesystem, logger, cleanupRepairs, executor: new AgentDeploymentExecutor(runner, bus, health, logger, async () => undefined, filesystem, executorConfig, cleanupRepairs, undefined, {}, publicGithubPolicy) };
+  return { runner, bus, fail, health, filesystem, logger, cleanupRepairs, executor: new AgentDeploymentExecutor(runner, bus, health, logger, async () => undefined, filesystem, executorConfig, cleanupRepairs, undefined, {}, publicGithubPolicy, async () => undefined) };
 }
 
 describe("AgentDeploymentExecutor", () => {
@@ -106,7 +106,7 @@ describe("AgentDeploymentExecutor", () => {
     test.health.probe = vi.fn(async () => false);
     let elapsed = 0;
     const policy: HealthPolicy = { startupGraceMs: 0, deadlineMs: 8_000, probeTimeoutMs: 1_000, retryIntervalMs: 2_000, now: () => elapsed };
-    const executor = new AgentDeploymentExecutor(test.runner, test.bus, test.health, test.logger, async (milliseconds) => { elapsed += milliseconds; }, test.filesystem, executorConfig, test.cleanupRepairs, undefined, policy);
+    const executor = new AgentDeploymentExecutor(test.runner, test.bus, test.health, test.logger, async (milliseconds) => { elapsed += milliseconds; }, test.filesystem, executorConfig, test.cleanupRepairs, undefined, policy, publicGithubPolicy, async () => undefined);
     const result = await executor.execute(input);
     expect(result.reason).toBe("Health probe timed out");
     expect(test.health.probe).toHaveBeenCalledTimes(4);
@@ -119,7 +119,7 @@ describe("AgentDeploymentExecutor", () => {
     const probeTimes: number[] = [];
     test.health.probe = vi.fn(async () => { probeTimes.push(elapsed); return elapsed >= 8_000; });
     const policy: HealthPolicy = { startupGraceMs: 0, deadlineMs: 12_000, probeTimeoutMs: 1_000, retryIntervalMs: 2_000, now: () => elapsed };
-    const executor = new AgentDeploymentExecutor(test.runner, test.bus, test.health, test.logger, async (milliseconds) => { elapsed += milliseconds; }, test.filesystem, executorConfig, test.cleanupRepairs, undefined, policy);
+    const executor = new AgentDeploymentExecutor(test.runner, test.bus, test.health, test.logger, async (milliseconds) => { elapsed += milliseconds; }, test.filesystem, executorConfig, test.cleanupRepairs, undefined, policy, publicGithubPolicy, async () => undefined);
 
     await expect(executor.execute(input)).resolves.toMatchObject({ ok: true });
     expect(test.health.probe).toHaveBeenCalledTimes(5);
@@ -130,7 +130,7 @@ describe("AgentDeploymentExecutor", () => {
     const test = setup();
     const controller = new AbortController();
     test.health.probe = vi.fn(async () => { controller.abort(); return false; });
-    const executor = new AgentDeploymentExecutor(test.runner, test.bus, test.health, test.logger, async () => undefined, test.filesystem, executorConfig, test.cleanupRepairs, undefined, { startupGraceMs: 0, deadlineMs: 12_000 });
+    const executor = new AgentDeploymentExecutor(test.runner, test.bus, test.health, test.logger, async () => undefined, test.filesystem, executorConfig, test.cleanupRepairs, undefined, { startupGraceMs: 0, deadlineMs: 12_000 }, publicGithubPolicy, async () => undefined);
 
     const result = await executor.execute({ ...input, command: { ...input.command, state: "claimed", leaseExpiresAt: "2026-01-01T00:00:30.000Z" } }, controller.signal);
     expect(result).toMatchObject({ ok: false, reason: "Deployment execution lease was lost" });
@@ -263,6 +263,48 @@ describe("AgentDeploymentExecutor", () => {
     expect(test.runner.run).not.toHaveBeenCalledWith(expect.objectContaining({ args: expect.arrayContaining(["buildx", "build"]) }), expect.any(Number));
   });
 
+  it.each([
+    "ADD https://user:secret@example.test/archive.tar.gz /app/",
+    ["aDd https://example.test/archive.tar.gz \\", "  /app/ # remote source split across lines"].join("\n"),
+    "ADD //example.test/archive.tar.gz /app/",
+    "ADD git://example.test/repository.git /app/",
+    "ADD [\"https://user:secret@example.test/archive.tar.gz\", \"/app/\"]"
+  ])("rejects remote ADD syntax without including its source in the error", (dockerfile) => {
+    let error = "";
+    try { validateDockerfileAddInstructions(dockerfile); }
+    catch (caught) { error = caught instanceof Error ? caught.message : ""; }
+    expect(error).toBe("Remote ADD sources are not permitted");
+    expect(error).not.toContain("example.test");
+    expect(error).not.toContain("secret");
+  });
+
+  it.each([
+    "ADD package.json /app/",
+    "COPY package.json /app/",
+    "ADD [\"package.json\", \"/app/\"]",
+    ["# comment", "ADD src/ \\", "  /app/"].join("\n")
+  ])("allows local Dockerfile copy syntax", (dockerfile) => {
+    expect(() => validateDockerfileAddInstructions(dockerfile)).not.toThrow();
+  });
+
+  it("rejects a remote Dockerfile ADD before BuildKit is invoked", async () => {
+    const test = setup();
+    const inspectBuildContext = vi.fn(async () => validateDockerfileAddInstructions("ADD https://user:secret@example.test/archive.tar.gz /app/"));
+    const executor = new AgentDeploymentExecutor(test.runner, test.bus, test.health, test.logger, async () => undefined, test.filesystem, executorConfig, test.cleanupRepairs, undefined, {}, publicGithubPolicy, inspectBuildContext);
+
+    const result = await executor.execute(input);
+
+    expect(result).toMatchObject({ ok: false, reason: "Remote ADD sources are not permitted" });
+    expect(inspectBuildContext).toHaveBeenCalledTimes(1);
+    expect(vi.mocked(test.runner.run).mock.calls.some(([plan]) => plan.args[0] === "buildx")).toBe(false);
+    expect(JSON.stringify([result, test.logger.log.mock.calls, test.fail.mock.calls])).not.toContain("example.test");
+    expect(JSON.stringify([result, test.logger.log.mock.calls, test.fail.mock.calls])).not.toContain("user:secret");
+  });
+
+  it("rejects an unterminated Dockerfile continuation", () => {
+    expect(() => validateDockerfileAddInstructions(["ADD local-file \\"].join("\n"))).toThrow("Dockerfile continuation is invalid");
+  });
+
   it("rechecks absent resources, removes late labelled container and image IDs, and preserves unrelated IDs", async () => {
     const test = setup();
     let containerChecks = 0;
@@ -328,7 +370,7 @@ describe("AgentDeploymentExecutor", () => {
     const test = setup();
     test.health.probe = vi.fn(async () => false);
     let elapsed = 0;
-    const executor = new AgentDeploymentExecutor(test.runner, test.bus, test.health, test.logger, async (milliseconds) => { elapsed += milliseconds; }, test.filesystem, executorConfig, test.cleanupRepairs, undefined, { startupGraceMs: 0, deadlineMs: 1_000, probeTimeoutMs: 500, retryIntervalMs: 500, now: () => elapsed }, publicGithubPolicy);
+    const executor = new AgentDeploymentExecutor(test.runner, test.bus, test.health, test.logger, async (milliseconds) => { elapsed += milliseconds; }, test.filesystem, executorConfig, test.cleanupRepairs, undefined, { startupGraceMs: 0, deadlineMs: 1_000, probeTimeoutMs: 500, retryIntervalMs: 500, now: () => elapsed }, publicGithubPolicy, async () => undefined);
 
     await expect(executor.execute(input)).resolves.toMatchObject({ ok: false, reason: "Health probe timed out" });
     expect(vi.mocked(test.runner.run).mock.calls.some(([plan]) => plan.args[0] === "stop")).toBe(false);
@@ -357,7 +399,7 @@ describe("AgentDeploymentExecutor", () => {
       signal?.addEventListener("abort", () => { probeAborted(); resolveProbe(false); }, { once: true });
       execution.abort();
     }));
-    const executor = new AgentDeploymentExecutor(test.runner, test.bus, test.health, test.logger, async () => undefined, test.filesystem, executorConfig, test.cleanupRepairs, undefined, { startupGraceMs: 0, deadlineMs: 10_000 }, publicGithubPolicy);
+    const executor = new AgentDeploymentExecutor(test.runner, test.bus, test.health, test.logger, async () => undefined, test.filesystem, executorConfig, test.cleanupRepairs, undefined, { startupGraceMs: 0, deadlineMs: 10_000 }, publicGithubPolicy, async () => undefined);
 
     await expect(executor.execute({ ...input, command: { ...command, state: "claimed", leaseExpiresAt: "2026-01-01T00:00:30.000Z" } }, execution.signal)).resolves.toMatchObject({ ok: false, reason: "Deployment execution lease was lost" });
     expect(probeAborted).toHaveBeenCalledTimes(1);
@@ -482,6 +524,13 @@ describe("agent-only Docker socket compose boundary", () => {
       expect(block).not.toContain("agent-state:/var/lib/deploylite/state");
     }
     expect(compose).not.toMatch(/DEPLOYLITE_AGENT_TOKEN:\s+[A-Za-z0-9]{32,}/);
+  });
+
+  it("requires the repository allowlist in the agent before its readiness healthcheck", async () => {
+    const compose = await readFile(resolve(import.meta.dirname, "../../../../infra/vps/compose.yml"), "utf8");
+    const agentBlock = compose.match(/  agent:([\s\S]*?)(?=\n  web:)/)?.[1] ?? "";
+    expect(agentBlock).toContain("DEPLOYLITE_REPO_ALLOWED_HOSTS: ${DEPLOYLITE_REPO_ALLOWED_HOSTS:?DEPLOYLITE_REPO_ALLOWED_HOSTS is required}");
+    expect(agentBlock.indexOf("DEPLOYLITE_REPO_ALLOWED_HOSTS:")).toBeLessThan(agentBlock.indexOf("healthcheck:"));
   });
 
   it("installs the executor runtime tools in the minimal pinned Alpine image", async () => {
