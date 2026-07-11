@@ -29,6 +29,20 @@ describe("DeploymentStreamController", () => {
     vi.useRealTimers();
   });
 
+  it("treats a normal close without progress as a bounded reconnect", async () => {
+    vi.useFakeTimers();
+    const fetchImpl = vi.fn(async () => new Response("", { status: 200 }));
+    const stream = new DeploymentStreamController({ deploymentId: "dep-1", apiBaseUrl: "https://api.example.test", fetchImpl: fetchImpl as unknown as typeof fetch }, () => undefined, 1);
+    stream.start();
+    await Promise.resolve();
+    await vi.advanceTimersByTimeAsync(250);
+    expect(fetchImpl).toHaveBeenCalledTimes(2);
+    await vi.advanceTimersByTimeAsync(500);
+    expect(fetchImpl).toHaveBeenCalledTimes(2);
+    stream.stop();
+    vi.useRealTimers();
+  });
+
   it("stops immediately on an auth failure", async () => {
     const states: string[] = [];
     const stream = new DeploymentStreamController({ deploymentId: "dep-1", apiBaseUrl: "https://api.example.test", fetchImpl: vi.fn(async () => new Response(null, { status: 401 })) as unknown as typeof fetch }, (snapshot) => states.push(snapshot.state));
