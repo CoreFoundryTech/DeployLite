@@ -20,6 +20,7 @@ export const deployLiteEnvSchema = z.object({
   DEPLOYLITE_AGENT_BUILDER_REGISTRY_PREVIOUS_INTEGRITY_KEY: optionalStrongSecret,
   DEPLOYLITE_AGENT_NAME: z.string().min(1).max(128).optional(),
   DEPLOYLITE_AGENT_ENDPOINT: z.string().url().optional(),
+  DEPLOYLITE_REPO_ALLOWED_HOSTS: z.string().optional(),
   DATABASE_URL: z.string().url().optional(),
   DEPLOYLITE_SECRET_KEY: z.string().min(1).optional(),
   DEPLOYLITE_SESSION_TTL_SECONDS: z.coerce.number().int().positive().default(60 * 60 * 8),

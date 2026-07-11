@@ -4,7 +4,7 @@ import { createRequire } from "node:module";
 import { resolve } from "node:path";
 import { describe, expect, it, vi } from "vitest";
 import type { DeploymentCommand } from "@deploylite/contracts";
-import { AgentDeploymentExecutor, assertSafeRuntimePlan, createDeploymentPlan, createSpawnProcessRunner, type CleanupRepairStore, type CommandBusClient, type HealthPolicy, type HealthProbe, type ProcessRunner, type SpawnedProcess, type WorkspaceFilesystem } from "./index.js";
+import { AgentDeploymentExecutor, assertSafeRuntimePlan, createDeploymentPlan, createSpawnProcessRunner, type CleanupRepairStore, type CommandBusClient, type HealthPolicy, type HealthProbe, type ProcessRunner, type RepositoryOriginPolicy, type SpawnedProcess, type WorkspaceFilesystem } from "./index.js";
 import { InMemoryCleanupRepairStore } from "../cleanup-repairs.js";
 import { InMemoryManagedBuilderRegistry } from "../managed-builders.js";
 
@@ -14,6 +14,7 @@ const command: DeploymentCommand = {
 };
 const executorConfig = { workspaceRoot: "/var/lib/deploylite/workspaces", secretRoot: "/run/deploylite/secrets" };
 const input = { command, repoUrl: "https://github.com/acme/service.git", ref: "main", projectSlug: "service", healthUrl: "http://deploylite-command-1:3000/health", envFile: { contents: "TOKEN=super-secret" } };
+const publicGithubPolicy: RepositoryOriginPolicy = { allowedHosts: ["github.com"], resolve: async () => ["8.8.8.8"] };
 
 function setup(results = [{ code: 0, stdout: "", stderr: "", timedOut: false }]) {
   const runner: ProcessRunner = { run: vi.fn(async (plan) => {
@@ -36,7 +37,7 @@ function setup(results = [{ code: 0, stdout: "", stderr: "", timedOut: false }])
   };
   const logger = { log: vi.fn() };
   const cleanupRepairs = new InMemoryCleanupRepairStore();
-  return { runner, bus, fail, health, filesystem, logger, cleanupRepairs, executor: new AgentDeploymentExecutor(runner, bus, health, logger, async () => undefined, filesystem, executorConfig, cleanupRepairs) };
+  return { runner, bus, fail, health, filesystem, logger, cleanupRepairs, executor: new AgentDeploymentExecutor(runner, bus, health, logger, async () => undefined, filesystem, executorConfig, cleanupRepairs, undefined, {}, publicGithubPolicy) };
 }
 
 describe("AgentDeploymentExecutor", () => {
@@ -44,7 +45,7 @@ describe("AgentDeploymentExecutor", () => {
     const test = setup();
     const result = await test.executor.execute(input);
     expect(result.ok).toBe(true);
-    expect(test.runner.run).toHaveBeenCalledTimes(18);
+    expect(test.runner.run).toHaveBeenCalledTimes(19);
     expect(test.runner.run).toHaveBeenNthCalledWith(1, expect.objectContaining({ command: "git", args: expect.arrayContaining(["clone", "--no-checkout"]) }), expect.any(Number));
     expect(test.runner.run).toHaveBeenNthCalledWith(9, expect.objectContaining({ command: "docker", args: expect.arrayContaining(["buildx", "build", "--builder", "deploylite-command-1", "--network", "none", "--output", "type=docker,name=deploylite/service:command-1"]) }), expect.any(Number));
     expect(test.runner.run).toHaveBeenNthCalledWith(10, expect.objectContaining({ command: "docker", args: expect.arrayContaining(["run", "--read-only", "--env-file"]) }), expect.any(Number));
@@ -305,6 +306,104 @@ describe("AgentDeploymentExecutor", () => {
     const result = await test.executor.execute(input);
     expect(result.reason).not.toContain("user:secret");
     expect(test.bus.fail).toHaveBeenCalledWith("command-1", expect.not.stringContaining("user:secret"));
+  });
+
+  it("replaces only an exact prior managed runtime after the new runtime is healthy", async () => {
+    const test = setup();
+    const oldId = "a".repeat(64);
+    vi.mocked(test.runner.run).mockImplementation(async (plan) => {
+      if (plan.args.includes("{{json .HostConfig}}")) return boundedBuilderResult();
+      if (plan.args[0] === "ps" && plan.args.includes("{{.ID}}\t{{.Names}}\t{{.Label \"com.deploylite.managed\"}}\t{{.Label \"com.deploylite.command-id\"}}\t{{.Label \"com.deploylite.project-slug\"}}")) {
+        return { code: 0, stdout: `${oldId}\tdeploylite-command-0\ttrue\tcommand-0\tservice`, stderr: "", timedOut: false };
+      }
+      return { code: 0, stdout: "", stderr: "", timedOut: false };
+    });
+
+    await expect(test.executor.execute(input)).resolves.toMatchObject({ ok: true });
+    expect(test.runner.run).toHaveBeenCalledWith({ command: "docker", args: ["stop", "--time", "5", oldId] }, 60_000);
+    expect(test.runner.run).toHaveBeenCalledWith({ command: "docker", args: ["rm", oldId] }, 60_000);
+  });
+
+  it("preserves the old runtime when the replacement never becomes healthy", async () => {
+    const test = setup();
+    test.health.probe = vi.fn(async () => false);
+    let elapsed = 0;
+    const executor = new AgentDeploymentExecutor(test.runner, test.bus, test.health, test.logger, async (milliseconds) => { elapsed += milliseconds; }, test.filesystem, executorConfig, test.cleanupRepairs, undefined, { startupGraceMs: 0, deadlineMs: 1_000, probeTimeoutMs: 500, retryIntervalMs: 500, now: () => elapsed }, publicGithubPolicy);
+
+    await expect(executor.execute(input)).resolves.toMatchObject({ ok: false, reason: "Health probe timed out" });
+    expect(vi.mocked(test.runner.run).mock.calls.some(([plan]) => plan.args[0] === "stop")).toBe(false);
+    expect(vi.mocked(test.runner.run).mock.calls.some(([plan]) => plan.args.includes("{{.ID}}\t{{.Names}}\t{{.Label \"com.deploylite.managed\"}}\t{{.Label \"com.deploylite.command-id\"}}\t{{.Label \"com.deploylite.project-slug\"}}"))).toBe(false);
+  });
+
+  it("ignores forged or unrelated runtime labels during replacement cleanup", async () => {
+    const test = setup();
+    vi.mocked(test.runner.run).mockImplementation(async (plan) => {
+      if (plan.args.includes("{{json .HostConfig}}")) return boundedBuilderResult();
+      if (plan.args[0] === "ps" && plan.args.includes("{{.ID}}\t{{.Names}}\t{{.Label \"com.deploylite.managed\"}}\t{{.Label \"com.deploylite.command-id\"}}\t{{.Label \"com.deploylite.project-slug\"}}")) {
+        return { code: 0, stdout: `${"b".repeat(64)}\tforeign\ttrue\tcommand-0\tservice\n${"c".repeat(64)}\tdeploylite-command-0\ttrue\tcommand-0\tother`, stderr: "", timedOut: false };
+      }
+      return { code: 0, stdout: "", stderr: "", timedOut: false };
+    });
+
+    await expect(test.executor.execute(input)).resolves.toMatchObject({ ok: true });
+    expect(vi.mocked(test.runner.run).mock.calls.some(([plan]) => plan.args[0] === "stop")).toBe(false);
+  });
+
+  it("aborts an in-flight health probe immediately on lease loss", async () => {
+    const test = setup();
+    const execution = new AbortController();
+    const probeAborted = vi.fn();
+    test.health.probe = vi.fn(async (_url, _timeout, signal) => new Promise<boolean>((resolveProbe) => {
+      signal?.addEventListener("abort", () => { probeAborted(); resolveProbe(false); }, { once: true });
+      execution.abort();
+    }));
+    const executor = new AgentDeploymentExecutor(test.runner, test.bus, test.health, test.logger, async () => undefined, test.filesystem, executorConfig, test.cleanupRepairs, undefined, { startupGraceMs: 0, deadlineMs: 10_000 }, publicGithubPolicy);
+
+    await expect(executor.execute({ ...input, command: { ...command, state: "claimed", leaseExpiresAt: "2026-01-01T00:00:30.000Z" } }, execution.signal)).resolves.toMatchObject({ ok: false, reason: "Deployment execution lease was lost" });
+    expect(probeAborted).toHaveBeenCalledTimes(1);
+  });
+
+  it.each([
+    ["api", ["8.8.8.8"]], ["github.com", ["127.0.0.1"]], ["github.com", ["10.0.0.1"]], ["github.com", ["169.254.1.1"]], ["github.com", ["100.64.0.1"]], ["github.com", ["fc00::1"]], ["github.com", ["fe80::1"]]
+  ])("rejects disallowed repository origin %s before git starts", async (host, addresses) => {
+    const test = setup();
+    const policy: RepositoryOriginPolicy = { allowedHosts: ["github.com"], resolve: async () => addresses };
+    const executor = new AgentDeploymentExecutor(test.runner, test.bus, test.health, test.logger, async () => undefined, test.filesystem, executorConfig, test.cleanupRepairs, undefined, {}, policy);
+    const repoUrl = host === "api" ? "https://api/acme/service.git" : "https://github.com/acme/service.git";
+
+    await expect(executor.execute({ ...input, repoUrl })).resolves.toMatchObject({ ok: false });
+    expect(vi.mocked(test.runner.run)).not.toHaveBeenCalled();
+  });
+
+  it("rejects credentials and nonstandard repository ports before resolution or git", async () => {
+    const test = setup();
+    const resolve = vi.fn(async () => ["8.8.8.8"]);
+    const executor = new AgentDeploymentExecutor(test.runner, test.bus, test.health, test.logger, async () => undefined, test.filesystem, executorConfig, test.cleanupRepairs, undefined, {}, { allowedHosts: ["github.com"], resolve });
+    for (const repoUrl of ["https://user:secret@github.com/acme/service.git", "https://github.com:8443/acme/service.git"]) {
+      await expect(executor.execute({ ...input, repoUrl })).resolves.toMatchObject({ ok: false });
+    }
+    expect(resolve).not.toHaveBeenCalled();
+    expect(vi.mocked(test.runner.run)).not.toHaveBeenCalled();
+  });
+
+  it("rejects Compose service names even if an operator incorrectly allowlists one", async () => {
+    const test = setup();
+    const resolve = vi.fn(async () => ["8.8.8.8"]);
+    const executor = new AgentDeploymentExecutor(test.runner, test.bus, test.health, test.logger, async () => undefined, test.filesystem, executorConfig, test.cleanupRepairs, undefined, {}, { allowedHosts: ["api"], resolve });
+
+    await expect(executor.execute({ ...input, repoUrl: "https://api/acme/service.git" })).resolves.toMatchObject({ ok: false });
+    expect(resolve).not.toHaveBeenCalled();
+    expect(vi.mocked(test.runner.run)).not.toHaveBeenCalled();
+  });
+
+  it("fails closed when the second repository resolution detects DNS rebinding", async () => {
+    const test = setup();
+    const resolve = vi.fn().mockResolvedValueOnce(["8.8.8.8"]).mockResolvedValueOnce(["127.0.0.1"]);
+    const executor = new AgentDeploymentExecutor(test.runner, test.bus, test.health, test.logger, async () => undefined, test.filesystem, executorConfig, test.cleanupRepairs, undefined, {}, { allowedHosts: ["github.com"], resolve });
+
+    await expect(executor.execute(input)).resolves.toMatchObject({ ok: false });
+    expect(resolve).toHaveBeenCalledTimes(2);
+    expect(vi.mocked(test.runner.run)).not.toHaveBeenCalled();
   });
 });
 

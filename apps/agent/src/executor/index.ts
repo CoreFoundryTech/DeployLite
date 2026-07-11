@@ -1,5 +1,7 @@
 import { chmod, lstat, mkdir, realpath, rm, writeFile } from "node:fs/promises";
 import { spawn } from "node:child_process";
+import { lookup } from "node:dns/promises";
+import { isIP } from "node:net";
 import { dirname, relative, resolve } from "node:path";
 import { redactSecrets } from "@deploylite/config";
 import type { DeploymentCommand } from "@deploylite/contracts";
@@ -25,7 +27,7 @@ export const DEPLOYLITE_RUNTIME_NETWORK = "deploylite-runtime";
 const SAFE_REF = /^[A-Za-z0-9][A-Za-z0-9._/-]{0,127}$/;
 const SAFE_ID = /^[a-z0-9][a-z0-9-]{0,62}$/;
 const SAFE_NETWORK = /^deploylite-[a-z0-9][a-z0-9_.-]{0,52}$/;
-const SAFE_REPOSITORY = /^(https:\/\/[^\s]+|git@[A-Za-z0-9._-]+:[A-Za-z0-9._/-]+\.git)$/;
+const SAFE_REPOSITORY = /^https:\/\/[^\s]+$/;
 
 export type CommandPlan = { command: string; args: string[]; cwd?: string };
 export type ProcessResult = { code: number; stdout: string; stderr: string; timedOut: boolean };
@@ -39,6 +41,8 @@ export type CommandBusClient = {
   renewLease(commandId: string, agentId: string): Promise<DeploymentCommand | null>;
 };
 export type HealthProbe = { probe(url: string, timeoutMs: number, signal?: AbortSignal): Promise<boolean> };
+export type RepositoryResolver = (hostname: string) => Promise<string[]>;
+export type RepositoryOriginPolicy = { allowedHosts: string[]; resolve?: RepositoryResolver };
 export type HealthPolicy = {
   startupGraceMs?: number;
   deadlineMs?: number;
@@ -201,7 +205,8 @@ export class AgentDeploymentExecutor {
     private readonly config: ExecutorConfig = { workspaceRoot: `${AGENT_WORK_BASE}/workspaces`, secretRoot: AGENT_SECRET_BASE },
     private readonly cleanupRepairs: CleanupRepairStore = { load: async () => [], put: async () => undefined, remove: async () => undefined },
     private readonly managedBuilders: ManagedBuilderRegistry = new InMemoryManagedBuilderRegistry(),
-    private readonly healthPolicy: HealthPolicy = {}
+    private readonly healthPolicy: HealthPolicy = {},
+    private readonly repositoryPolicy: RepositoryOriginPolicy = { allowedHosts: ["github.com"] }
   ) {}
 
   async execute(input: DeploymentExecutionInput, signal?: AbortSignal): Promise<DeploymentExecutionResult> {
@@ -233,7 +238,11 @@ export class AgentDeploymentExecutor {
     let envFileWritten = false;
     let failure: unknown;
     try {
+      await this.assertRepositoryOrigin(input.repoUrl);
       await this.filesystem.create(workspace!);
+      // Resolve immediately before git starts as well as before workspace work,
+      // reducing the DNS-rebinding window without claiming to eliminate TOCTOU.
+      await this.assertRepositoryOrigin(input.repoUrl);
       for (const plan of plans.slice(0, 3)) await this.run(plan, signal);
       await this.managedBuilders.put({ version: 1, commandId: claimed.id, builderName: builderName(claimed.id) });
       managedResourcesAttempted = true;
@@ -255,6 +264,12 @@ export class AgentDeploymentExecutor {
       }
       if (workspace) await this.bestEffort("Deployment workspace cleanup failed", () => this.filesystem.remove(workspace));
       return this.fail(claimed, errorMessage(failure), plans);
+    }
+    const retired = await this.retirePriorRuntimes(input, signal);
+    if (!retired) {
+      await this.reconcileRuntime(input, false, signal);
+      if (workspace) await this.bestEffort("Deployment workspace cleanup failed", () => this.filesystem.remove(workspace));
+      return this.fail(claimed, "Replacement cleanup incomplete; the healthy new runtime remains active and deterministic repair is scheduled.", plans);
     }
     const buildResourcesClean = await this.reconcileRuntime(input, false);
     if (!buildResourcesClean) {
@@ -337,12 +352,52 @@ export class AgentDeploymentExecutor {
     while (now() < deadline) {
       if (signal?.aborted) throw new Error("Deployment execution lease was lost");
       const remaining = deadline - now();
-      if (await this.health.probe(url, Math.min(probeTimeoutMs, remaining), signal)) return;
+      const probeSignal = composeAbortSignals(signal, Math.min(probeTimeoutMs, remaining));
+      try {
+        if (await this.health.probe(url, Math.min(probeTimeoutMs, remaining), probeSignal.signal)) return;
+      } finally {
+        probeSignal.dispose();
+      }
       if (signal?.aborted) throw new Error("Deployment execution lease was lost");
       const delay = Math.min(retryIntervalMs, deadline - now());
       if (delay > 0) await this.wait(delay, signal);
     }
     throw new Error("Health probe timed out");
+  }
+
+  private async assertRepositoryOrigin(repoUrl: string): Promise<void> {
+    const origin = parseRepositoryOrigin(repoUrl, this.repositoryPolicy.allowedHosts);
+    const resolveHostname = this.repositoryPolicy.resolve ?? defaultRepositoryResolver;
+    let addresses: string[];
+    try { addresses = await resolveHostname(origin.hostname); }
+    catch { throw new Error("Repository origin resolution failed"); }
+    if (addresses.length === 0 || addresses.some((address) => isForbiddenRepositoryAddress(address))) {
+      throw new Error("Repository origin is not permitted");
+    }
+  }
+
+  /** Retire only exact, label-backed DeployLite runtimes after the replacement is healthy. */
+  private async retirePriorRuntimes(input: DeploymentExecutionInput, signal?: AbortSignal): Promise<boolean> {
+    const query: CommandPlan = {
+      command: "docker",
+      args: ["ps", "--all", "--format", "{{.ID}}\t{{.Names}}\t{{.Label \"com.deploylite.managed\"}}\t{{.Label \"com.deploylite.command-id\"}}\t{{.Label \"com.deploylite.project-slug\"}}", "--filter", `label=${MANAGED_LABEL}`, "--filter", `label=${MANAGED_PROJECT_LABEL}=${input.projectSlug}`]
+    };
+    let result: ProcessResult;
+    try { result = await this.runCleanupPlan(query, signal); }
+    catch { return false; }
+    if (result.code !== 0) return false;
+    const previous = result.stdout.split("\n").map((line) => managedRuntimeFromLine(line, input.projectSlug)).filter((entry): entry is { id: string; commandId: string } => entry !== null && entry.commandId !== input.command.id);
+    for (const runtime of previous) {
+      const oldInput = { ...input, command: { ...input.command, id: runtime.commandId } };
+      try { await this.cleanupRepairs.put(cleanupRepairRecord(oldInput)); }
+      catch { return false; }
+      try {
+        if ((await this.runCleanupPlan({ command: "docker", args: ["stop", "--time", "5", runtime.id] }, signal)).code !== 0) return false;
+        if ((await this.runCleanupPlan({ command: "docker", args: ["rm", runtime.id] }, signal)).code !== 0) return false;
+      } catch { return false; }
+      if (!(await this.reconcileRuntime(oldInput, true, signal))) return false;
+    }
+    return true;
   }
 
   private async cleanupSecret(written: boolean, envFilePath: string, secretDirectory: string): Promise<Error | undefined> {
@@ -678,6 +733,71 @@ function hasCredentialedUrl(value: string): boolean {
   if (!value.startsWith("https://")) return false;
   try { const url = new URL(value); return Boolean(url.username || url.password); }
   catch { return true; }
+}
+function parseRepositoryOrigin(value: string, allowedHosts: string[]): URL {
+  let url: URL;
+  try { url = new URL(value); }
+  catch { throw new Error("Invalid repository URL"); }
+  if (url.protocol !== "https:" || url.username || url.password || url.port && url.port !== "443" || !url.hostname || !url.pathname.endsWith(".git") || url.search || url.hash) {
+    throw new Error("Repository origin is not permitted");
+  }
+  const hostname = url.hostname.toLowerCase().replace(/\.$/, "");
+  const approved = new Set(allowedHosts.map((host) => host.trim().toLowerCase().replace(/\.$/, "")).filter(Boolean));
+  if (["api", "agent", "migrate", "postgres", "web"].includes(hostname) || !approved.has(hostname)) throw new Error("Repository origin is not permitted");
+  url.hostname = hostname;
+  return url;
+}
+async function defaultRepositoryResolver(hostname: string): Promise<string[]> {
+  return (await lookup(hostname, { all: true })).map((record) => record.address);
+}
+function isForbiddenRepositoryAddress(address: string): boolean {
+  const normalized = address.toLowerCase();
+  const family = isIP(normalized);
+  if (family === 4) return isForbiddenIpv4(normalized);
+  if (family !== 6) return true;
+  const mapped = normalized.match(/^(?:0{0,4}:){0,5}ffff:([0-9.]+)$/i);
+  if (mapped) return isForbiddenIpv4(mapped[1]!);
+  const expanded = expandIpv6(normalized);
+  if (!expanded) return true;
+  const first = Number.parseInt(expanded[0]!, 16);
+  const second = Number.parseInt(expanded[1]!, 16);
+  if (expanded.every((part) => part === "0000") || expanded.slice(0, 7).every((part) => part === "0000") && expanded[7] === "0001") return true;
+  if ((first & 0xfe00) === 0xfc00 || (first & 0xffc0) === 0xfe80 || (first & 0xff00) === 0xff00) return true;
+  // Documentation, discard-only, and benchmark ranges are not public origins.
+  return (first === 0x2001 && (second === 0x0db8 || second === 0x0002)) || (first === 0x0100 && second === 0x0000);
+}
+function isForbiddenIpv4(address: string): boolean {
+  const octets = address.split(".").map(Number);
+  if (octets.length !== 4 || octets.some((value) => !Number.isInteger(value) || value < 0 || value > 255)) return true;
+  const a = octets[0]!;
+  const b = octets[1]!;
+  return a === 0 || a === 10 || a === 127 || (a === 100 && b >= 64 && b <= 127) || (a === 169 && b === 254) || (a === 172 && b >= 16 && b <= 31) || (a === 192 && (b === 0 || b === 168)) || (a === 198 && (b === 18 || b === 19)) || a >= 224;
+}
+function expandIpv6(address: string): string[] | null {
+  const [left, right] = address.split("::");
+  if (address.split("::").length > 2) return null;
+  const leftParts = left ? left.split(":") : [];
+  const rightParts = right ? right.split(":") : [];
+  if (leftParts.some((part) => !/^[0-9a-f]{1,4}$/i.test(part)) || rightParts.some((part) => !/^[0-9a-f]{1,4}$/i.test(part))) return null;
+  const missing = 8 - leftParts.length - rightParts.length;
+  if (missing < 0 || (address.includes("::") && missing < 1) || (!address.includes("::") && missing !== 0)) return null;
+  return [...leftParts, ...Array(missing).fill("0"), ...rightParts].map((part) => part.padStart(4, "0"));
+}
+function managedRuntimeFromLine(line: string, projectSlug: string): { id: string; commandId: string } | null {
+  const [id, name, managed, commandId, labelledProject, ...rest] = line.split("\t");
+  if (rest.length || !id || !/^[a-f0-9]{12,64}$/i.test(id) || managed !== "true" || !commandId || !SAFE_ID.test(commandId) || labelledProject !== projectSlug) return null;
+  try { return name === containerName(projectSlug, commandId) ? { id, commandId } : null; }
+  catch { return null; }
+}
+function composeAbortSignals(parent: AbortSignal | undefined, timeoutMs: number): { signal: AbortSignal; dispose(): void } {
+  const deadline = AbortSignal.timeout(timeoutMs);
+  if (!parent) return { signal: deadline, dispose: () => undefined };
+  const controller = new AbortController();
+  const abort = () => controller.abort();
+  parent.addEventListener("abort", abort, { once: true });
+  deadline.addEventListener("abort", abort, { once: true });
+  if (parent.aborted || deadline.aborted) abort();
+  return { signal: controller.signal, dispose: () => { parent.removeEventListener("abort", abort); deadline.removeEventListener("abort", abort); } };
 }
 function valueAfter(args: string[], option: string): string | undefined {
   const index = args.indexOf(option);

@@ -32,14 +32,7 @@ export async function runAgentEntrypoint(env: NodeJS.ProcessEnv = process.env): 
     undefined,
     (event) => logger.log("error", `${event.message} command=${event.commandId} attempted=${event.attemptedState} authoritative=${event.authoritativeState}`)
   );
-  const health: HealthProbe = {
-    async probe(url, timeoutMs) {
-      try {
-        const response = await fetch(url, { signal: AbortSignal.timeout(timeoutMs) });
-        return response.ok;
-      } catch { return false; }
-    }
-  };
+  const health = createFetchHealthProbe();
   const executor = new AgentDeploymentExecutor(
     spawnProcessRunner,
     terminalBus,
@@ -57,7 +50,9 @@ export async function runAgentEntrypoint(env: NodeJS.ProcessEnv = process.env): 
       required(config, "DEPLOYLITE_AGENT_BUILDER_REGISTRY_INTEGRITY_KEY"),
       undefined,
       config.DEPLOYLITE_AGENT_BUILDER_REGISTRY_PREVIOUS_INTEGRITY_KEY
-    )
+    ),
+    {},
+    { allowedHosts: requiredRepositoryHosts(config, env) }
   );
   const worker = new AgentWorker({
     agentId,
@@ -96,11 +91,40 @@ export async function runAgentEntrypoint(env: NodeJS.ProcessEnv = process.env): 
   }
 }
 
+export function createFetchHealthProbe(fetchImpl: typeof fetch = fetch): HealthProbe {
+  return {
+    async probe(url, timeoutMs, signal) {
+      const deadline = AbortSignal.timeout(timeoutMs);
+      const controller = new AbortController();
+      const abort = () => controller.abort();
+      try {
+        signal?.addEventListener("abort", abort, { once: true });
+        deadline.addEventListener("abort", abort, { once: true });
+        if (signal?.aborted || deadline.aborted) abort();
+        const response = await fetchImpl(url, { signal: controller.signal });
+        return response.ok;
+      } catch { return false; }
+      finally {
+        signal?.removeEventListener("abort", abort);
+        deadline.removeEventListener("abort", abort);
+      }
+    }
+  };
+}
+
 function required(env: Record<string, unknown>, key: string): string {
   const raw = env[key];
   const value = typeof raw === "string" ? raw.trim() : "";
   if (!value) throw new Error(`${key} is required`);
   return value;
+}
+
+function requiredRepositoryHosts(config: Record<string, unknown>, env: NodeJS.ProcessEnv): string[] {
+  const configured = typeof config.DEPLOYLITE_REPO_ALLOWED_HOSTS === "string" ? config.DEPLOYLITE_REPO_ALLOWED_HOSTS : "";
+  const hosts = configured.split(",").map((host) => host.trim()).filter(Boolean);
+  if (hosts.length > 0) return hosts;
+  if (env.NODE_ENV === "production") throw new Error("DEPLOYLITE_REPO_ALLOWED_HOSTS is required in production");
+  return ["github.com"];
 }
 
 if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) {
