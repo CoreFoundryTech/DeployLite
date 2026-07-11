@@ -71,6 +71,18 @@ const baseRow: EnvSecretValueRow = {
 };
 
 describe("DbEnvSecretValueRepository DB boundary", () => {
+  it("exposes ciphertext only through the internal materialization port", async () => {
+    const { db } = createFakeDb(baseRow);
+    const repo = new DbEnvSecretValueRepository(db as never);
+
+    const [record] = await repo.listEncryptedByProject(baseRow.projectId);
+
+    expect(record).toMatchObject({ projectId: baseRow.projectId, key: baseRow.key, scope: "project", keyVersion: 1 });
+    expect(record?.encryptedValue.toString("utf8")).toBe("encrypted-blob");
+    expect(record).not.toHaveProperty("value");
+    expect(record).not.toHaveProperty("plaintext");
+  });
+
   it("persists the encryptedValue bytea payload to the database adapter", async () => {
     const { db, captured } = createFakeDb(baseRow);
     const repo = new DbEnvSecretValueRepository(db as never);

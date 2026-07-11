@@ -1,3 +1,4 @@
+import { readFile } from "node:fs/promises";
 import { describe, expect, it } from "vitest";
 
 import type { DeploymentCommandRow } from "../schema.js";
@@ -18,6 +19,7 @@ function deploymentCommandRow(overrides: Partial<DeploymentCommandRow> = {}): De
     correlationId: "req_1",
     issuedAt: now,
     claimedAt: null,
+    leaseExpiresAt: null,
     completedAt: null,
     failureReason: null,
     createdAt: now,
@@ -40,6 +42,7 @@ describe("deployment command bus persistence mapping", () => {
       correlationId: "req_1",
       issuedAt: "2026-01-01T00:00:00.000Z",
       claimedAt: null,
+      leaseExpiresAt: null,
       completedAt: null,
       failureReason: null
     });
@@ -59,5 +62,16 @@ describe("deployment command bus persistence mapping", () => {
     // surface as `undefined` from the helper and is treated as a
     // programming error by callers.
     expect((describeDeploymentCommandEventType as (state: string) => unknown)("unknown")).toBeUndefined();
+  });
+
+  it("guards terminal updates with command, assignment, and expected-state predicates", async () => {
+    const source = await readFile(new URL("./deployment-commands.ts", import.meta.url), "utf8");
+    const method = source.slice(source.indexOf("async transitionTerminal"), source.indexOf("async findActiveForDeployment"));
+    expect(method).toContain("eq(deploymentCommands.id, commandId)");
+    expect(method).toContain("eq(deploymentCommands.agentId, agentId)");
+    expect(method).toContain("eq(deploymentCommands.state, expectedState)");
+    expect(method).toContain("lte(deploymentCommands.leaseExpiresAt, sql`clock_timestamp()`)");
+    expect(method).toContain("gt(deploymentCommands.leaseExpiresAt, sql`clock_timestamp()`)");
+    expect(method).toContain("const authoritative = await this.findById(commandId)");
   });
 });

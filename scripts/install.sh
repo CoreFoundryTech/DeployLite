@@ -28,6 +28,7 @@ redact() {
   local value="${1:-}"
   value="$(printf '%s' "$value" | sed -E 's#(postgres://[^:]+:)[^@]+@#\1[REDACTED]@#g')"
   value="$(printf '%s' "$value" | sed -E 's#((PASSWORD|SECRET|TOKEN|COOKIE|DATABASE_URL)[A-Z_]*=)[^[:space:]]+#\1[REDACTED]#Ig')"
+  value="$(printf '%s' "$value" | sed -E 's#(DEPLOYLITE_AGENT_(ID|TOKEN|BUILDER_REGISTRY_INTEGRITY_KEY|BUILDER_REGISTRY_PREVIOUS_INTEGRITY_KEY)=)[^[:space:]]+#\1[REDACTED]#Ig')"
   printf '%s' "$value"
 }
 
@@ -40,7 +41,8 @@ redact() {
 redact_stream() {
   sed -u -E \
     -e 's#(postgres://[^:]+:)[^@]+@#\1[REDACTED]@#g' \
-    -e 's#((PASSWORD|SECRET|TOKEN|COOKIE|DATABASE_URL)[A-Z_]*=)[^[:space:]]+#\1[REDACTED]#Ig'
+    -e 's#((PASSWORD|SECRET|TOKEN|COOKIE|DATABASE_URL)[A-Z_]*=)[^[:space:]]+#\1[REDACTED]#Ig' \
+    -e 's#(DEPLOYLITE_AGENT_(ID|TOKEN|BUILDER_REGISTRY_INTEGRITY_KEY|BUILDER_REGISTRY_PREVIOUS_INTEGRITY_KEY)=)[^[:space:]]+#\1[REDACTED]#Ig'
 }
 
 on_error() {
@@ -296,12 +298,34 @@ install_docker_apt_repository() {
     | as_root tee "$repo_file" >/dev/null
 }
 
-random_secret() {
+random_hex() {
+  local bytes="$1" value=""
   if command_exists openssl; then
-    openssl rand -hex 32 | tr -d '\n'
+    value="$(openssl rand -hex "$bytes" 2>/dev/null)" || fail "Could not generate installer secrets with OpenSSL." 1
+  elif [[ -r /dev/urandom ]] && command_exists od; then
+    value="$(od -An -N "$bytes" -tx1 /dev/urandom 2>/dev/null | tr -d '[:space:]')" || fail "Could not read secure system entropy for installer secrets." 1
   else
-    LC_ALL=C tr -dc 'A-Za-z0-9_-' </dev/urandom | head -c 48
+    fail "Secure entropy tooling is unavailable; install OpenSSL or provide readable /dev/urandom with od." 1
   fi
+  [[ "$value" =~ ^[0-9a-fA-F]+$ ]] && [[ "${#value}" -eq $((bytes * 2)) ]] \
+    || fail "Secure entropy generation returned an invalid value." 1
+  printf '%s' "$value"
+}
+
+random_secret() {
+  random_hex 32
+}
+
+default_repository_allowed_hosts() {
+  printf '%s' 'github.com'
+}
+
+random_uuid_v4() {
+  local value variant
+  value="$(random_hex 16)"
+  variant=$(( (16#${value:16:1} & 3) | 8 ))
+  printf '%s-%s-4%s-%x%s-%s' \
+    "${value:0:8}" "${value:8:4}" "${value:13:3}" "$variant" "${value:17:3}" "${value:20:12}"
 }
 
 detect_public_host_inner() {
@@ -335,7 +359,7 @@ env_get() {
 }
 
 write_env() {
-  local host postgres_password tmp detected interactive_host
+  local host postgres_password secret_key tmp detected interactive_host
   if [[ "${INTERACTIVE}" == "1" ]]; then
     # Offer a sensible default to the prompt without aborting the
     # installer on detection failure. The detect helper caps its own
@@ -352,6 +376,8 @@ write_env() {
   [[ -n "${host:-}" ]] || fail "Could not determine the public host. Set DEPLOYLITE_PUBLIC_HOST=<ip-or-host> and retry." 2
   postgres_password="$(env_get POSTGRES_PASSWORD || true)"
   [[ -n "$postgres_password" ]] || postgres_password="$(random_secret)"
+  secret_key="$(env_get DEPLOYLITE_SECRET_KEY || true)"
+  [[ -n "$secret_key" ]] || secret_key="$(random_secret)"
   tmp="$(mktemp)"
   umask 077
   cat >"$tmp" <<EOF
@@ -360,18 +386,39 @@ DEPLOYLITE_PUBLIC_HOST=${host}
 DEPLOYLITE_PUBLIC_WEB_ORIGIN=http://${host}
 DEPLOYLITE_PUBLIC_API_ORIGIN=http://${host}:3001
 POSTGRES_PASSWORD=${postgres_password}
+DEPLOYLITE_SECRET_KEY=${secret_key}
 POSTGRES_DB=deploylite
 POSTGRES_USER=deploylite
 DEPLOYLITE_SESSION_TTL_SECONDS=28800
 DEPLOYLITE_SESSION_COOKIE_NAME=deploylite_session
 DEPLOYLITE_SESSION_COOKIE_SECURE=false
 DEPLOYLITE_BCRYPT_COST=12
+DEPLOYLITE_REPO_ALLOWED_HOSTS=github.com
 EOF
   as_root install -m 600 "$tmp" "$ENV_FILE"
   rm -f "$tmp"
   if [[ "${INTERACTIVE}" == "1" ]]; then
     info "Public host confirmed: ${host}"
   fi
+}
+
+ensure_env_value() {
+  local key="$1" generator="$2" value
+  value="$(env_get "$key" || true)"
+  [[ -n "$value" ]] && return 0
+  value="$($generator)"
+  [[ -n "$value" ]] || fail "Could not generate required ${key} without exposing its value." 1
+  ( umask 077; printf '%s=%s\n' "$key" "$value" ) | as_root tee -a "$ENV_FILE" >/dev/null
+  as_root chmod 600 "$ENV_FILE"
+}
+
+ensure_compose_secrets() {
+  # Keep each secret independent. Values are never logged or passed as command arguments.
+  ensure_env_value DEPLOYLITE_SECRET_KEY random_secret
+  ensure_env_value DEPLOYLITE_AGENT_ID random_uuid_v4
+  ensure_env_value DEPLOYLITE_AGENT_TOKEN random_secret
+  ensure_env_value DEPLOYLITE_AGENT_BUILDER_REGISTRY_INTEGRITY_KEY random_secret
+  ensure_env_value DEPLOYLITE_REPO_ALLOWED_HOSTS default_repository_allowed_hosts
 }
 
 prepare_install_dir() {
@@ -389,6 +436,7 @@ prepare_install_dir() {
     as_root chmod 600 "$ENV_FILE"
     info "Existing .env found; preserving generated secrets."
   fi
+  ensure_compose_secrets
   record_change "runtime-files-installed"
 }
 
@@ -410,7 +458,7 @@ start_runtime() {
   compose up -d --build postgres
   CREATED_RUNTIME=1
   compose up --build migrate
-  compose up -d --build api web
+  compose up -d --build api web agent
   record_change "runtime-started"
 }
 
@@ -429,6 +477,12 @@ wait_for_url() {
 wait_for_health() {
   wait_for_url "API" "http://127.0.0.1:3001/api/v1/health" 30 5
   wait_for_url "Web" "http://127.0.0.1/" 30 5
+  if ! compose up -d --wait --wait-timeout 150 agent; then
+    warn "Agent did not become healthy. Redacted agent diagnostics follow."
+    compose logs --tail 100 agent 2>&1 | redact_stream >&2 || true
+    fail "Agent startup failed. Check redacted Docker Compose diagnostics." 1
+  fi
+  info "Agent is healthy."
 }
 
 print_success() {

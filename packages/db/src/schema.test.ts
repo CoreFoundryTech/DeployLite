@@ -9,6 +9,7 @@ const envSecretValuesMigrationSql = readFileSync(
   new URL("../migrations/0004_env_secret_values.sql", import.meta.url),
   "utf8"
 );
+const deploymentCommandLeaseMigrationSql = readFileSync(new URL("../migrations/0006_deployment_command_leases.sql", import.meta.url), "utf8");
 
 describe("auth PostgreSQL schema foundation", () => {
   it("seeds only the canonical RBAC roles", () => {
@@ -86,6 +87,15 @@ describe("env secret values storage migration", () => {
     expect(envSecretValuesMigrationSql).not.toMatch(/\bDROP\b/);
     expect(envSecretValuesMigrationSql).not.toMatch(/\bTRUNCATE\b/);
     expect(envSecretValuesMigrationSql).not.toMatch(/\bALTER\s+TABLE\s+\w+\s+RENAME\b/i);
+  });
+});
+
+describe("deployment command lease migration", () => {
+  it("adds an indexed lease expiry with a claimed-state invariant and no destructive operation", () => {
+    expect(deploymentCommandLeaseMigrationSql).toContain("ADD COLUMN lease_expires_at timestamptz");
+    expect(deploymentCommandLeaseMigrationSql).toContain("deployment_commands_lease_expires_at_idx");
+    expect(deploymentCommandLeaseMigrationSql).toContain("(state = 'claimed') = (lease_expires_at IS NOT NULL)");
+    expect(deploymentCommandLeaseMigrationSql).not.toMatch(/\bDROP\b|\bTRUNCATE\b/);
   });
 });
 

@@ -188,6 +188,24 @@ describe("redactEnvFileForLog", () => {
     );
   });
 
+  it("scrubs lowercase and mixed-case PEM environment keys without leaking continuation lines", () => {
+    const rendered = [
+      "private_key=-----BEGIN PRIVATE KEY-----",
+      "lowercasePemBodyThatMustNeverLeak1234567890=",
+      "-----END PRIVATE KEY-----",
+      "Tls_Cert=-----BEGIN CERTIFICATE-----",
+      "mixedCasePemBodyThatMustNeverLeak1234567890==",
+      "-----END CERTIFICATE-----"
+    ].join("\n");
+
+    const redacted = redactEnvFileForLog(rendered);
+
+    expect(redacted).toContain("private_key=[REDACTED]");
+    expect(redacted).toContain("Tls_Cert=[REDACTED]");
+    expect(redacted).not.toContain("lowercasePemBodyThatMustNeverLeak");
+    expect(redacted).not.toContain("mixedCasePemBodyThatMustNeverLeak");
+  });
+
   it("scrubs a certificate chain that spans multiple KEY= blocks without leaking the chain", () => {
     // A more realistic case: two KEY= blocks back-to-back, each with a
     // multiline PEM body. The state machine must reset after each

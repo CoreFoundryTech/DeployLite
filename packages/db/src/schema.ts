@@ -276,6 +276,7 @@ export const deploymentCommands = pgTable(
     correlationId: text("correlation_id").notNull(),
     issuedAt: timestamp("issued_at", { withTimezone: true }).notNull().defaultNow(),
     claimedAt: timestamp("claimed_at", { withTimezone: true }),
+    leaseExpiresAt: timestamp("lease_expires_at", { withTimezone: true }),
     completedAt: timestamp("completed_at", { withTimezone: true }),
     failureReason: text("failure_reason"),
     ...timestamps
@@ -285,6 +286,7 @@ export const deploymentCommands = pgTable(
     index("deployment_commands_agent_id_idx").on(table.agentId),
     index("deployment_commands_state_idx").on(table.state),
     index("deployment_commands_issued_at_idx").on(table.issuedAt),
+    index("deployment_commands_lease_expires_at_idx").on(table.leaseExpiresAt),
     check("deployment_commands_kind_valid", sql`${table.kind} in ('start', 'cancel', 'restart', 'rollback')`),
     check("deployment_commands_state_valid", sql`${table.state} in ('pending', 'claimed', 'completed', 'cancelled', 'failed')`),
     check(
@@ -294,6 +296,10 @@ export const deploymentCommands = pgTable(
     check(
       "deployment_commands_failure_reason_only_on_failed",
       sql`(${table.state} = 'failed') = (${table.failureReason} is not null)`
+    ),
+    check(
+      "deployment_commands_claimed_has_lease",
+      sql`(${table.state} = 'claimed') = (${table.leaseExpiresAt} is not null)`
     )
   ]
 );

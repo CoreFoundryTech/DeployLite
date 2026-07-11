@@ -1,4 +1,4 @@
-import { and, asc, desc, eq, inArray } from "drizzle-orm";
+import { and, asc, desc, eq, gt, inArray, lte, sql } from "drizzle-orm";
 import type { DeploymentCommandKind, DeploymentCommandState } from "@deploylite/contracts";
 import type {
   DeploymentCommandBusSubmitInput,
@@ -43,6 +43,7 @@ export class DbDeploymentCommandRepository implements DeploymentCommandRepositor
       correlationId: command.correlationId,
       issuedAt: new Date(command.issuedAt),
       claimedAt: command.claimedAt ? new Date(command.claimedAt) : null,
+      leaseExpiresAt: command.leaseExpiresAt ? new Date(command.leaseExpiresAt) : null,
       completedAt: command.completedAt ? new Date(command.completedAt) : null,
       failureReason: command.failureReason
     };
@@ -58,6 +59,7 @@ export class DbDeploymentCommandRepository implements DeploymentCommandRepositor
           payload: values.payload,
           requestedBy: values.requestedBy,
           claimedAt: values.claimedAt,
+          leaseExpiresAt: values.leaseExpiresAt,
           completedAt: values.completedAt,
           failureReason: values.failureReason,
           updatedAt: new Date()
@@ -75,6 +77,56 @@ export class DbDeploymentCommandRepository implements DeploymentCommandRepositor
   async findById(id: string): Promise<DeploymentCommandRecord | null> {
     const [row] = await this.db.select().from(deploymentCommands).where(eq(deploymentCommands.id, id)).limit(1);
     return row ? toDeploymentCommand(row) : null;
+  }
+
+  async claim(commandId: string, agentId: string, claimedAt: string, leaseExpiresAt: string): Promise<DeploymentCommandRecord | null> {
+    const [row] = await this.db.update(deploymentCommands).set({
+      state: "claimed",
+      claimedAt: new Date(claimedAt),
+      leaseExpiresAt: new Date(leaseExpiresAt),
+      updatedAt: new Date()
+    }).where(and(eq(deploymentCommands.id, commandId), eq(deploymentCommands.agentId, agentId), eq(deploymentCommands.state, "pending"))).returning();
+    return row ? toDeploymentCommand(row) : null;
+  }
+
+  async renewLease(commandId: string, agentId: string, now: string, leaseExpiresAt: string): Promise<DeploymentCommandRecord | null> {
+    const [row] = await this.db.update(deploymentCommands).set({
+      leaseExpiresAt: new Date(leaseExpiresAt),
+      updatedAt: new Date()
+    }).where(and(
+      eq(deploymentCommands.id, commandId),
+      eq(deploymentCommands.agentId, agentId),
+      eq(deploymentCommands.state, "claimed"),
+      gt(deploymentCommands.leaseExpiresAt, new Date(now))
+    )).returning();
+    return row ? toDeploymentCommand(row) : null;
+  }
+
+  async transitionTerminal(
+    commandId: string,
+    agentId: string,
+    expectedState: "pending" | "claimed",
+    next: Pick<DeploymentCommandRecord, "state" | "completedAt" | "leaseExpiresAt" | "failureReason" | "payload">,
+    condition?: { leaseExpiresAtNotAfterNow: () => string } | { leaseExpiresAtAfterNow: () => string }
+  ): Promise<{ command: DeploymentCommandRecord; applied: boolean } | null> {
+    const [row] = await this.db.update(deploymentCommands).set({
+      state: next.state,
+      payload: next.payload,
+      completedAt: next.completedAt ? new Date(next.completedAt) : null,
+      leaseExpiresAt: null,
+      failureReason: next.failureReason,
+      updatedAt: new Date()
+    }).where(and(
+      eq(deploymentCommands.id, commandId),
+      eq(deploymentCommands.agentId, agentId),
+      eq(deploymentCommands.state, expectedState),
+      ...(condition && "leaseExpiresAtNotAfterNow" in condition
+        ? [lte(deploymentCommands.leaseExpiresAt, sql`clock_timestamp()`)]
+        : condition ? [gt(deploymentCommands.leaseExpiresAt, sql`clock_timestamp()`)] : [])
+    )).returning();
+    if (row) return { command: toDeploymentCommand(row), applied: true };
+    const authoritative = await this.findById(commandId);
+    return authoritative?.agentId === agentId ? { command: authoritative, applied: false } : null;
   }
 
   async findActiveForDeployment(deploymentId: string): Promise<DeploymentCommandRecord | null> {
@@ -114,6 +166,7 @@ export function toDeploymentCommand(row: DeploymentCommandRow): DeploymentComman
     correlationId: row.correlationId,
     issuedAt: row.issuedAt.toISOString(),
     claimedAt: row.claimedAt ? row.claimedAt.toISOString() : null,
+    leaseExpiresAt: row.leaseExpiresAt ? row.leaseExpiresAt.toISOString() : null,
     completedAt: row.completedAt ? row.completedAt.toISOString() : null,
     failureReason: row.failureReason
   };

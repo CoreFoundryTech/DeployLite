@@ -50,8 +50,8 @@ DeployLite is designed so AI tools can help operate it without getting broad des
 
 - MCP tools are read-only.
 - Secret-like values pass through shared redaction helpers before leaving a boundary.
-- Deployment control surfaces are split so the API/web/MCP layers do not need direct Docker socket access.
-- Agent-facing work is developed in isolated, reviewable slices before host mutation is enabled.
+- Only the deployment agent mounts the Docker socket; API, Web, MCP, and PostgreSQL do not.
+- Privileged agent changes are kept isolated, explicit, and reviewable.
 
 This is the architectural point: **AI can inspect, summarize, and recommend first; privileged execution stays gated and explicit.**
 
@@ -61,7 +61,7 @@ DeployLite is a private TypeScript monorepo today, structured so the repository 
 
 - `apps/api` — Fastify control-plane API.
 - `apps/web` — Next.js 15 App Router UI.
-- `apps/agent` — deployment agent surface; real executor work is still gated.
+- `apps/agent` — privileged deployment agent and real runtime executor.
 - `apps/mcp` — read-only MCP adapter.
 - `packages/config` — environment parsing, redaction, crypto helpers.
 - `packages/contracts` — shared Zod contracts.
@@ -70,11 +70,19 @@ DeployLite is a private TypeScript monorepo today, structured so the repository 
 
 ## Safety guardrails
 
-- API, web, and MCP do not get direct host mutation powers by default.
+- API, Web, MCP, and PostgreSQL do not mount the Docker socket.
+- The agent intentionally mounts the Docker socket and therefore has host-root-equivalent privilege. A compromised agent must be treated as a compromised host.
+- Separate control-plane/runtime networks and generated runtime restrictions reduce exposure; they do not sandbox a compromised socket-enabled agent.
+- Repository images are built only through a per-command Buildx `docker-container` builder on a dedicated build network. DeployLite fixes CPU, memory, swap, PID, process-parallelism, build network, labels, builder name, and local image output; repository metadata cannot override them. The executor fails closed if post-creation inspection cannot prove those bounds, and it never falls back to `docker build`.
+- Production deployments require `DEPLOYLITE_REPO_ALLOWED_HOSTS`, a comma-separated allowlist of approved HTTPS Git hosts (the installer/example defaults to `github.com`). The agent rejects credentials, non-443 ports, unapproved names, Compose service names, and origins resolving to loopback, private, link-local, carrier-grade, multicast, reserved, IPv6-local, or unique-local addresses. Immediately before each Git clone/fetch it validates two matching public DNS answer sets, pins those answers with Git's `http.curloptResolve` configuration, and disables Git redirects; approved origins remain required.
+- A replacement runtime is health-checked before exact labelled prior runtimes for the same project are stopped and removed. Failed replacements preserve the previous healthy runtime; cleanup repair remains durable and deterministic when retirement cannot be proven.
+- Build steps run with `--network none`; before BuildKit is created, the checked-out context's Dockerfile(s) are parsed conservatively and remote `ADD` sources are rejected. BuildKit daemon traffic uses only the dedicated per-command bridge and never joins the DeployLite control-plane or runtime network. Bounded reconciliation removes late labelled resources and retains durable repair state when absence cannot be proven.
+- These controls limit ordinary repository build resource exhaustion, but they do not remove Docker socket or BuildKit risk. The socket-enabled agent remains host-root-equivalent; the Docker-container driver may run its trusted BuildKit daemon with elevated container privileges; disk/cache pressure is not a complete quota boundary; and a daemon, BuildKit, or runtime vulnerability can escape the intended isolation. Repository input cannot request those privileges or change the trusted builder policy.
+- Live activation requires an operational security review and least-privilege host controls.
 - MCP tools are read-only and non-destructive: `deploylite_get_server_status`, `deploylite_list_deployments`, and `deploylite_get_deployment_logs`.
 - Auth is an MVP cookie-session boundary for local administration. It is not a production hardening claim yet.
 - Secret-like values must pass through shared redaction helpers before leaving a boundary.
-- Traefik, ACME, production auth claims, and real Docker execution remain gated until their dedicated phases land.
+- Traefik, ACME, and production auth claims remain gated until their dedicated phases land.
 
 ## Development checks
 
@@ -96,14 +104,14 @@ pnpm check
 | PR3 | `feat/initial-platform-pr3-web-agent-shell` | Static/mock web shell, server status/log views, mock agent heartbeat client, and local-only infra note. |
 | PR4 | `feat/initial-platform-pr4-mcp-docs` | Read-only MCP adapter, cross-surface shape verification, and scaffold docs. |
 
-## Safety guardrails
+## Scaffold history
 
-- No Docker socket deployment-agent access or host mutation is implemented by the app.
+- The deployment agent now intentionally mounts the Docker socket and has host-root-equivalent privilege; API, Web, MCP, and PostgreSQL remain socket-free.
 - Auth is an MVP cookie-session boundary for local administration. It is not a production hardening claim.
 - Secret-like values must pass through shared redaction helpers before leaving a boundary.
-- API, web, agent, and MCP deployment-control surfaces are mock-only in this scaffold.
+- Historical scaffold surfaces were mock-only; the current agent includes a real executor.
 - MCP tools are read-only and non-destructive: `deploylite_get_server_status`, `deploylite_list_deployments`, and `deploylite_get_deployment_logs`.
-- Traefik, ACME, production auth claims, real secret storage, and host shell execution are out of scope.
+- Traefik, ACME, production auth claims, and host shell execution outside the reviewed agent path are out of scope.
 
 ## VPS plug-and-play install
 
@@ -136,7 +144,7 @@ The GitHub bootstrap command downloads the requested repository ref, runs the re
 Included:
 
 - Production-oriented Dockerfiles for the API and Web apps.
-- `infra/vps/compose.yml` with Postgres, one-shot migrations, API, Web, named volumes, an internal network, health checks, and restart policies.
+- `infra/vps/compose.yml` with Postgres, one-shot migrations, API, Web, named volumes, separate stable control-plane/runtime networks bridged only by the agent, health checks, and restart policies.
 - Temporary HTTP exposure: Web on host `:80` and API on host `:3001`.
 - Browser-first initial owner creation through the existing setup UI. There are no default admin credentials.
 - `scripts/bootstrap.sh`, a GitHub raw bootstrapper with mocked tests in `scripts/bootstrap.test.sh`.
@@ -144,7 +152,7 @@ Included:
 
 Deferred non-goals:
 
-- Upgrades, uninstall/reset, backups, firewall mutation, Dokploy access, deployment-agent/server Docker socket integration, Traefik, ACME, domains, and HTTPS automation.
+- Upgrades, uninstall/reset, backups, firewall mutation, Dokploy access, Traefik, ACME, domains, and HTTPS automation.
 
 For local review without starting services, render the Compose configuration with the checked-in example env:
 

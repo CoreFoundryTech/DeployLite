@@ -64,6 +64,20 @@ export const agentRegistrationSchema = z.object({
   endpoint: z.string().url()
 });
 
+export const agentSelfRegistrationSchema = z.object({
+  agentId: idSchema,
+  name: z.string().min(1).max(128),
+  endpoint: z.string().url(),
+  observedAt: isoDateSchema,
+  resourceSnapshot: resourceSnapshotSchema
+}).strict();
+
+export const agentSelfHeartbeatSchema = z.object({
+  agentId: idSchema,
+  observedAt: isoDateSchema,
+  resourceSnapshot: resourceSnapshotSchema
+}).strict();
+
 export const agentHeartbeatSchema = requestContextSchema.extend({
   agentId: idSchema,
   observedAt: isoDateSchema,
@@ -212,6 +226,7 @@ export const deploymentCommandSchema = z.object({
   correlationId: idSchema,
   issuedAt: isoDateSchema,
   claimedAt: isoDateSchema.nullable(),
+  leaseExpiresAt: isoDateSchema.nullable(),
   completedAt: isoDateSchema.nullable(),
   failureReason: z.string().nullable()
 });

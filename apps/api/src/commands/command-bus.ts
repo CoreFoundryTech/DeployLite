@@ -12,6 +12,7 @@ import {
   type DeploymentCommandRepository,
   type DeploymentExecutor
 } from "@deploylite/domain";
+import { DEPLOYMENT_COMMAND_LEASE_MS } from "@deploylite/domain";
 
 /**
  * Application-level deployment command bus.
@@ -41,7 +42,7 @@ export class DeploymentCommandBusService implements DeploymentCommandBus {
   readonly #listeners = new Set<DeploymentCommandEventListener>();
   #executor: DeploymentExecutor | null = null;
 
-  constructor(repository: DeploymentCommandRepository) {
+  constructor(repository: DeploymentCommandRepository, private readonly now: () => Date = () => new Date()) {
     this.#repository = repository;
   }
 
@@ -72,6 +73,7 @@ export class DeploymentCommandBusService implements DeploymentCommandBus {
       correlationId: input.correlationId,
       issuedAt,
       claimedAt: null,
+      leaseExpiresAt: null,
       completedAt: null,
       failureReason: null
     };
@@ -89,51 +91,112 @@ export class DeploymentCommandBusService implements DeploymentCommandBus {
       // protect the real agent from a misrouted claim.
       return null;
     }
+    if (existing.state === "claimed") return existing;
     if (!isDeploymentCommandTransitionAllowed(existing.state, "claimed")) {
       return null;
     }
-    const next: DeploymentCommandRecord = {
-      ...existing,
-      state: "claimed",
-      claimedAt: existing.claimedAt ?? new Date().toISOString()
-    };
-    const saved = await this.#repository.save(next);
+    const now = this.now();
+    const claimedAt = now.toISOString();
+    const saved = await this.#repository.claim(existing.id, agentId, claimedAt, new Date(now.getTime() + DEPLOYMENT_COMMAND_LEASE_MS).toISOString());
+    if (!saved) return null;
     await this.#emit("deployment.command.claimed", saved);
     return saved;
+  }
+
+  async renewLease(commandId: string, agentId: string): Promise<DeploymentCommandRecord | null> {
+    const now = this.now();
+    return this.#repository.renewLease(commandId, agentId, now.toISOString(), new Date(now.getTime() + DEPLOYMENT_COMMAND_LEASE_MS).toISOString());
   }
 
   async complete(commandId: string, output?: Record<string, unknown>): Promise<DeploymentCommandRecord | null> {
     const existing = await this.#repository.findById(commandId);
     if (!existing) return null;
+    if (existing.state === "completed" || existing.state === "failed" || existing.state === "cancelled") return existing;
     if (!isDeploymentCommandTransitionAllowed(existing.state, "completed")) {
       throw new IllegalDeploymentCommandTransitionError(existing.state, "completed", commandId);
     }
     const next: DeploymentCommandRecord = {
       ...existing,
       state: "completed",
-      completedAt: new Date().toISOString(),
+      completedAt: this.now().toISOString(),
+      leaseExpiresAt: null,
       payload: output ? { ...existing.payload, output } : existing.payload
     };
-    const saved = await this.#repository.save(next);
-    await this.#emit("deployment.command.completed", saved);
-    return saved;
+    const result = await this.#repository.transitionTerminal(existing.id, existing.agentId, "claimed", next, {
+      leaseExpiresAtAfterNow: () => this.now().toISOString()
+    });
+    if (result && !result.applied && result.command.state === "claimed") {
+      return this.failExpiredClaim(commandId, "Agent command lease expired; completion was rejected.");
+    }
+    if (result?.applied) await this.#emit("deployment.command.completed", result.command);
+    return result?.command ?? null;
   }
 
   async fail(commandId: string, reason: string): Promise<DeploymentCommandRecord | null> {
     const existing = await this.#repository.findById(commandId);
     if (!existing) return null;
+    if (existing.state === "completed" || existing.state === "failed" || existing.state === "cancelled") return existing;
     if (!isDeploymentCommandTransitionAllowed(existing.state, "failed")) {
       throw new IllegalDeploymentCommandTransitionError(existing.state, "failed", commandId);
     }
     const next: DeploymentCommandRecord = {
       ...existing,
       state: "failed",
-      completedAt: new Date().toISOString(),
+      completedAt: this.now().toISOString(),
+      leaseExpiresAt: null,
       failureReason: reason
     };
-    const saved = await this.#repository.save(next);
-    await this.#emit("deployment.command.failed", saved);
-    return saved;
+    const result = await this.#repository.transitionTerminal(existing.id, existing.agentId, "claimed", next, {
+      leaseExpiresAtAfterNow: () => this.now().toISOString()
+    });
+    if (result?.applied) await this.#emit("deployment.command.failed", result.command);
+    return result?.command ?? null;
+  }
+
+  async failSystem(commandId: string, reason: string): Promise<DeploymentCommandRecord | null> {
+    const existing = await this.#repository.findById(commandId);
+    if (!existing) return null;
+    if (existing.state === "completed" || existing.state === "failed" || existing.state === "cancelled") return existing;
+    const next: DeploymentCommandRecord = {
+      ...existing,
+      state: "failed",
+      completedAt: this.now().toISOString(),
+      leaseExpiresAt: null,
+      failureReason: reason
+    };
+    let result = await this.#repository.transitionTerminal(existing.id, existing.agentId, existing.state, next);
+    if (result && !result.applied && (result.command.state === "pending" || result.command.state === "claimed")) {
+      const authoritativeNext: DeploymentCommandRecord = {
+        ...result.command,
+        state: "failed",
+        completedAt: this.now().toISOString(),
+        leaseExpiresAt: null,
+        failureReason: reason
+      };
+      result = await this.#repository.transitionTerminal(result.command.id, result.command.agentId, result.command.state, authoritativeNext);
+    }
+    if (result?.applied) await this.#emit("deployment.command.failed", result.command);
+    return result?.command ?? null;
+  }
+
+  async failExpiredClaim(commandId: string, reason: string): Promise<DeploymentCommandRecord | null> {
+    const existing = await this.#repository.findById(commandId);
+    if (!existing) return null;
+    if (existing.state === "completed" || existing.state === "failed" || existing.state === "cancelled") return existing;
+    if (existing.state !== "claimed") return existing;
+    const now = this.now().toISOString();
+    const next: DeploymentCommandRecord = {
+      ...existing,
+      state: "failed",
+      completedAt: now,
+      leaseExpiresAt: null,
+      failureReason: reason
+    };
+    const result = await this.#repository.transitionTerminal(existing.id, existing.agentId, "claimed", next, {
+      leaseExpiresAtNotAfterNow: () => this.now().toISOString()
+    });
+    if (result?.applied) await this.#emit("deployment.command.failed", result.command);
+    return result?.command ?? null;
   }
 
   async cancel(commandId: string, requestedBy: string | null): Promise<DeploymentCommandRecord | null> {
@@ -145,15 +208,17 @@ export class DeploymentCommandBusService implements DeploymentCommandBus {
       // row so the caller can treat the request as idempotent.
       return existing;
     }
+    if (existing.state !== "pending" && existing.state !== "claimed") return existing;
     const next: DeploymentCommandRecord = {
       ...existing,
       state: "cancelled",
-      completedAt: new Date().toISOString(),
-      payload: requestedBy ? { ...existing.payload, cancelledBy: requestedBy } : existing.payload
+      completedAt: this.now().toISOString(),
+      leaseExpiresAt: null,
+      payload: requestedBy ? { ...existing.payload, cancelledBy: redactSecrets(requestedBy) } : existing.payload
     };
-    const saved = await this.#repository.save(next);
-    await this.#emit("deployment.command.cancelled", saved);
-    return saved;
+    const result = await this.#repository.transitionTerminal(existing.id, existing.agentId, existing.state, next);
+    if (result?.applied) await this.#emit("deployment.command.cancelled", result.command);
+    return result?.command ?? null;
   }
 
   async list(): Promise<DeploymentCommandRecord[]> {

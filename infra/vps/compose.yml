@@ -11,7 +11,7 @@ services:
     volumes:
       - postgres-data:/var/lib/postgresql/data
     networks:
-      - deploylite
+      - control-plane
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U $${POSTGRES_USER:-deploylite} -d $${POSTGRES_DB:-deploylite}"]
       interval: 5s
@@ -31,7 +31,7 @@ services:
       DATABASE_URL: postgres://${POSTGRES_USER:-deploylite}:${POSTGRES_PASSWORD:?POSTGRES_PASSWORD is required}@postgres:5432/${POSTGRES_DB:-deploylite}
     command: ["node", "packages/db/scripts/migrate.mjs"]
     networks:
-      - deploylite
+      - control-plane
 
   api:
     build:
@@ -50,17 +50,64 @@ services:
       DEPLOYLITE_API_HOST: 0.0.0.0
       DEPLOYLITE_API_PORT: 3001
       DEPLOYLITE_API_URL: http://api:3001
+      DEPLOYLITE_SECRET_KEY: ${DEPLOYLITE_SECRET_KEY:?DEPLOYLITE_SECRET_KEY is required}
       DEPLOYLITE_CORS_ORIGIN: ${DEPLOYLITE_PUBLIC_WEB_ORIGIN:?DEPLOYLITE_PUBLIC_WEB_ORIGIN is required}
       DEPLOYLITE_SESSION_TTL_SECONDS: ${DEPLOYLITE_SESSION_TTL_SECONDS:-28800}
       DEPLOYLITE_SESSION_COOKIE_NAME: ${DEPLOYLITE_SESSION_COOKIE_NAME:-deploylite_session}
       DEPLOYLITE_SESSION_COOKIE_SECURE: ${DEPLOYLITE_SESSION_COOKIE_SECURE:-false}
       DEPLOYLITE_BCRYPT_COST: ${DEPLOYLITE_BCRYPT_COST:-12}
+      DEPLOYLITE_AGENT_ID: ${DEPLOYLITE_AGENT_ID:?DEPLOYLITE_AGENT_ID is required}
+      DEPLOYLITE_AGENT_TOKEN: ${DEPLOYLITE_AGENT_TOKEN:?DEPLOYLITE_AGENT_TOKEN is required}
     ports:
       - "3001:3001"
     networks:
-      - deploylite
+      - control-plane
     healthcheck:
       test: ["CMD-SHELL", "wget -qO- http://127.0.0.1:3001/api/v1/health >/dev/null"]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+
+  # The agent is the sole bridge between the trusted control plane and
+  # untrusted project runtimes. The Docker socket is privileged host control;
+  # API, web, migration, and MCP services MUST remain socket-free and MUST NOT
+  # join the runtime network.
+  agent:
+    build:
+      context: ../..
+      dockerfile: apps/agent/Dockerfile
+    image: deploylite-agent:local
+    restart: unless-stopped
+    depends_on:
+      api:
+        condition: service_healthy
+    environment:
+      NODE_ENV: production
+      DEPLOYLITE_API_URL: http://api:3001
+      DEPLOYLITE_AGENT_ID: ${DEPLOYLITE_AGENT_ID:?DEPLOYLITE_AGENT_ID is required}
+      DEPLOYLITE_AGENT_TOKEN: ${DEPLOYLITE_AGENT_TOKEN:?DEPLOYLITE_AGENT_TOKEN is required}
+      DEPLOYLITE_AGENT_BUILDER_REGISTRY_INTEGRITY_KEY: ${DEPLOYLITE_AGENT_BUILDER_REGISTRY_INTEGRITY_KEY:?DEPLOYLITE_AGENT_BUILDER_REGISTRY_INTEGRITY_KEY is required}
+      DEPLOYLITE_AGENT_BUILDER_REGISTRY_PREVIOUS_INTEGRITY_KEY: ${DEPLOYLITE_AGENT_BUILDER_REGISTRY_PREVIOUS_INTEGRITY_KEY:-}
+      DEPLOYLITE_AGENT_NAME: ${DEPLOYLITE_AGENT_NAME:-DeployLite VPS Agent}
+      DEPLOYLITE_AGENT_ENDPOINT: ${DEPLOYLITE_AGENT_ENDPOINT:-http://agent:3002}
+      DEPLOYLITE_REPO_ALLOWED_HOSTS: ${DEPLOYLITE_REPO_ALLOWED_HOSTS:?DEPLOYLITE_REPO_ALLOWED_HOSTS is required}
+      DEPLOYLITE_AGENT_WORKSPACE_ROOT: /var/lib/deploylite/workspaces
+      DEPLOYLITE_AGENT_OUTBOX_PATH: /var/lib/deploylite/state/terminal-acks.json
+      DEPLOYLITE_AGENT_CLEANUP_REPAIR_PATH: /var/lib/deploylite/state/cleanup-repairs.json
+      DEPLOYLITE_AGENT_BUILDER_REGISTRY_PATH: /var/lib/deploylite/state/managed-builders.json
+      DEPLOYLITE_AGENT_READINESS_PATH: /var/lib/deploylite/state/agent-ready
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+      - agent-workspaces:/var/lib/deploylite/workspaces
+      - agent-state:/var/lib/deploylite/state
+    tmpfs:
+      - /run/deploylite/secrets:mode=0700,size=16m
+    networks:
+      - control-plane
+      - runtime
+    healthcheck:
+      # Local file state is written only after authenticated registration and a successful poll.
+      test: ["CMD-SHELL", "test -f /var/lib/deploylite/state/agent-ready"]
       interval: 10s
       timeout: 5s
       retries: 12
@@ -81,7 +128,7 @@ services:
     ports:
       - "80:3000"
     networks:
-      - deploylite
+      - control-plane
     healthcheck:
       test: ["CMD-SHELL", "wget -qO- http://127.0.0.1:3000/ >/dev/null"]
       interval: 10s
@@ -90,7 +137,13 @@ services:
 
 volumes:
   postgres-data:
+  agent-workspaces:
+  agent-state:
 
 networks:
-  deploylite:
+  control-plane:
+    name: deploylite-control-plane
+    driver: bridge
+  runtime:
+    name: deploylite-runtime
     driver: bridge

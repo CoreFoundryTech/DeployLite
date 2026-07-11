@@ -3,7 +3,7 @@
 This directory contains local-development infrastructure and the first reviewable VPS runtime contract used by `scripts/bootstrap.sh` and `scripts/install.sh`.
 
 - No production Traefik, ACME, DNS, or certificate mutation is performed here.
-- No Docker socket path or host shell command is required by these templates.
+- The deployment agent intentionally mounts the Docker socket; API, Web, MCP, and PostgreSQL do not.
 - Future infrastructure changes must stay behind explicit review and real environment configuration.
 
 ## Local PostgreSQL
@@ -18,6 +18,14 @@ This directory contains local-development infrastructure and the first reviewabl
 - `migrate` runs the existing hand-authored SQL migrations once before the API starts.
 - `api` builds `apps/api/Dockerfile`, binds internally to `0.0.0.0:3001`, and is temporarily exposed on host `:3001`.
 - `web` builds `apps/web/Dockerfile`, serves Next.js on container `:3000`, and is temporarily exposed on host `:80`.
+- `deploylite-control-plane` connects PostgreSQL, migrations, API, Web, and the agent. `deploylite-runtime` connects only the agent and dynamically launched project runtimes, so untrusted runtime containers cannot resolve control-plane services through Compose network membership.
+- The agent is the only service on both networks and the only service with the Docker socket mount.
+- Docker socket access gives the agent host-root-equivalent privilege. The network split and generated runtime policy reduce exposure but do not sandbox a compromised agent.
+- Repository builds use a DeployLite-created per-command Buildx `docker-container` builder with fixed CPU, memory/swap, PID, and BuildKit parallelism limits. Build steps have no network; the BuildKit daemon uses a dedicated labelled bridge that is never the control-plane, runtime, or host network. The executor verifies the builder container bounds before building and fails closed without an unbounded `docker build` fallback.
+- Repository Git HTTPS traffic requires an approved origin and is DNS-validated twice immediately before each clone/fetch. Matching public answers are pinned into Git with `http.curloptResolve`, and redirects are disabled.
+- Cleanup repeatedly discovers only exact command-labelled containers, images, and build networks plus the exact trusted builder name. If bounded attempts cannot prove absence, the command reports cleanup incomplete and a durable repair record is retried after agent restart.
+- Residual risk remains material: Docker socket access is host-root-equivalent; the Docker-container driver may run the trusted BuildKit daemon with elevated container privileges; BuildKit and Docker daemon vulnerabilities can bypass these controls; builder limits do not provide a complete host-disk/cache quota. Repository input cannot request those privileges or alter the trusted policy. Treat the agent and builder configuration as privileged infrastructure.
+- Live activation requires an operational security review and least-privilege host controls.
 - Health checks gate API/Web startup where Compose supports dependency conditions.
 
 For local review, render the configuration without starting services:
@@ -58,4 +66,4 @@ On failure, the installer reports changed steps with secret redaction, stops new
 
 ### HTTP-first limits
 
-This slice intentionally uses plain HTTP for reviewability: Web `:80`, API `:3001`, `DEPLOYLITE_SESSION_COOKIE_SECURE=false`, and credentialed CORS only for `DEPLOYLITE_CORS_ORIGIN`. It does not configure Traefik, ACME, domains, HTTPS, firewall rules, backups, upgrades, uninstall/reset, Dokploy, or a deployment agent/server Docker socket. The first owner/admin is still created only in the browser while the user table is empty; no default admin is seeded or documented.
+This slice intentionally uses plain HTTP for reviewability: Web `:80`, API `:3001`, `DEPLOYLITE_SESSION_COOKIE_SECURE=false`, and credentialed CORS only for `DEPLOYLITE_CORS_ORIGIN`. It does not configure Traefik, ACME, domains, HTTPS, firewall rules, backups, upgrades, uninstall/reset, or Dokploy. The first owner/admin is still created only in the browser while the user table is empty; no default admin is seeded or documented.

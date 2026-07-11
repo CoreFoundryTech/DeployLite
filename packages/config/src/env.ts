@@ -6,6 +6,7 @@ const booleanString = z.preprocess((value) => {
   if (value.toLowerCase() === "false") return false;
   return value;
 }, z.boolean());
+const optionalStrongSecret = z.preprocess((value) => value === "" ? undefined : value, z.string().min(32).optional());
 
 export const deployLiteEnvSchema = z.object({
   NODE_ENV: z.enum(["development", "test", "production"]).default("development"),
@@ -13,12 +14,27 @@ export const deployLiteEnvSchema = z.object({
   DEPLOYLITE_CORS_ORIGIN: z.string().url().optional(),
   DEPLOYLITE_API_HOST: z.string().min(1).default("127.0.0.1"),
   DEPLOYLITE_API_PORT: z.coerce.number().int().min(1).max(65_535).default(3001),
+  DEPLOYLITE_AGENT_ID: z.string().uuid().optional(),
+  DEPLOYLITE_AGENT_TOKEN: z.string().min(32).optional(),
+  DEPLOYLITE_AGENT_BUILDER_REGISTRY_INTEGRITY_KEY: optionalStrongSecret,
+  DEPLOYLITE_AGENT_BUILDER_REGISTRY_PREVIOUS_INTEGRITY_KEY: optionalStrongSecret,
+  DEPLOYLITE_AGENT_NAME: z.string().min(1).max(128).optional(),
+  DEPLOYLITE_AGENT_ENDPOINT: z.string().url().optional(),
+  DEPLOYLITE_REPO_ALLOWED_HOSTS: z.string().optional(),
   DATABASE_URL: z.string().url().optional(),
   DEPLOYLITE_SECRET_KEY: z.string().min(1).optional(),
   DEPLOYLITE_SESSION_TTL_SECONDS: z.coerce.number().int().positive().default(60 * 60 * 8),
   DEPLOYLITE_SESSION_COOKIE_NAME: z.string().min(1).default("deploylite_session"),
   DEPLOYLITE_SESSION_COOKIE_SECURE: booleanString.optional(),
   DEPLOYLITE_BCRYPT_COST: z.coerce.number().int().min(10).max(14).default(12)
+}).superRefine((env, context) => {
+  if (Boolean(env.DEPLOYLITE_AGENT_ID) !== Boolean(env.DEPLOYLITE_AGENT_TOKEN)) {
+    context.addIssue({
+      code: z.ZodIssueCode.custom,
+      path: [env.DEPLOYLITE_AGENT_ID ? "DEPLOYLITE_AGENT_TOKEN" : "DEPLOYLITE_AGENT_ID"],
+      message: "DEPLOYLITE_AGENT_ID and DEPLOYLITE_AGENT_TOKEN must be configured together"
+    });
+  }
 });
 
 export type DeployLiteEnv = z.infer<typeof deployLiteEnvSchema>;
