@@ -282,9 +282,34 @@ describe("AgentDeploymentExecutor", () => {
     "ADD package.json /app/",
     "COPY package.json /app/",
     "ADD [\"package.json\", \"/app/\"]",
+    "COPY [\"package.json\", \"/app/\"]",
+    ["# a comment", "aDd [\"package.json\", \"/app/\"]", "CoPy package-lock.json /app/"].join("\n"),
     ["# comment", "ADD src/ \\", "  /app/"].join("\n")
   ])("allows local Dockerfile copy syntax", (dockerfile) => {
     expect(() => validateDockerfileAddInstructions(dockerfile)).not.toThrow();
+  });
+
+  it.each([
+    "ADD [\"package.json\", \"/app\"",
+    "COPY [\"package.json\", \"/app\"",
+    "ADD [\"package.json, \"/app\"]",
+    "COPY [\"package.json\", /app]",
+    "ADD [\"https://user:secret@example.test/archive.tar.gz\", \"/app\"",
+    ["aDd [\"package.json\", \\", "  # comment", "  \"/app\"]"].join("\n"),
+    ["CoPy [\"package.json\", \\", "  \"/app\"].join(\"\")"].join("\n")
+  ])("rejects malformed JSON-array ADD/COPY before BuildKit is invoked", async (dockerfile) => {
+    const test = setup();
+    const inspectBuildContext = vi.fn(async () => validateDockerfileAddInstructions(dockerfile));
+    const executor = new AgentDeploymentExecutor(test.runner, test.bus, test.health, test.logger, async () => undefined, test.filesystem, executorConfig, test.cleanupRepairs, undefined, {}, publicGithubPolicy, inspectBuildContext);
+
+    const result = await executor.execute(input);
+
+    expect(result).toMatchObject({ ok: false, reason: expect.stringMatching(/^Dockerfile (?:(ADD|COPY) instruction is invalid|continuation is invalid)$/) });
+    expect(inspectBuildContext).toHaveBeenCalledTimes(1);
+    expect(vi.mocked(test.runner.run).mock.calls.some(([plan]) => plan.args[0] === "buildx")).toBe(false);
+    expect(JSON.stringify([result, test.logger.log.mock.calls, test.fail.mock.calls])).not.toContain("package.json");
+    expect(JSON.stringify([result, test.logger.log.mock.calls, test.fail.mock.calls])).not.toContain("example.test");
+    expect(JSON.stringify([result, test.logger.log.mock.calls, test.fail.mock.calls])).not.toContain("user:secret");
   });
 
   it("rejects a remote Dockerfile ADD before BuildKit is invoked", async () => {

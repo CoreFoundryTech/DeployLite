@@ -762,14 +762,32 @@ export function validateDockerfileAddInstructions(contents: string): void {
 function validateDockerfileInstruction(instruction: string): void {
   const match = instruction.match(/^\s*([a-z]+)\b([\s\S]*)$/i);
   if (!match) throw new Error("Dockerfile instruction is invalid");
-  if (match[1]!.toUpperCase() !== "ADD") return;
+  const operation = match[1]!.toUpperCase();
+  if (operation !== "ADD" && operation !== "COPY") return;
   const argumentsText = match[2]!.trim();
-  if (!argumentsText) throw new Error("Dockerfile ADD instruction is invalid");
+  if (!argumentsText) throw new Error(`Dockerfile ${operation} instruction is invalid`);
+  if (argumentsText.startsWith("[")) {
+    let argumentsArray: unknown;
+    try { argumentsArray = JSON.parse(argumentsText); }
+    catch { throw new Error(`Dockerfile ${operation} instruction is invalid`); }
+    if (!Array.isArray(argumentsArray) || argumentsArray.length < 2 || argumentsArray.some((argument) => typeof argument !== "string")) {
+      throw new Error(`Dockerfile ${operation} instruction is invalid`);
+    }
+    if (operation === "ADD" && argumentsArray.slice(0, -1).some(isRemoteDockerfileSource)) {
+      throw new Error("Remote ADD sources are not permitted");
+    }
+    return;
+  }
+  if (operation !== "ADD") return;
   // This catches HTTP(S), protocol-relative, and scheme/git-like forms in
   // shell and JSON-array ADD syntax without disclosing the source in errors.
-  if (/(?:^|[\s[\]",'])(?:[a-z][a-z0-9+.-]*:\/\/|\/\/|git@)/i.test(argumentsText)) {
+  if (isRemoteDockerfileSource(argumentsText)) {
     throw new Error("Remote ADD sources are not permitted");
   }
+}
+
+function isRemoteDockerfileSource(value: string): boolean {
+  return /(?:^|[\s[\]",'])(?:[a-z][a-z0-9+.-]*:\/\/|\/\/|git@)/i.test(value);
 }
 
 function safeWorkspace(root: string, commandId: string): string {
