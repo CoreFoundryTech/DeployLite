@@ -153,6 +153,12 @@ describe("domain foundation", () => {
     expect(events.map((event) => event.sequence).sort((left, right) => left - right)).toEqual(Array.from({ length: 128 }, (_, index) => index + 1));
   });
 
+  it("advances allocation after an explicit log sequence", async () => {
+    const deployments = new InMemoryDeploymentRepository();
+    await deployments.appendLog({ id: "log_explicit", deploymentId: "dep_1", sequence: 41, level: "info", message: "explicit", timestamp: now.toISOString(), redactionApplied: false, requestId: "req_1", correlationId: "req_1" });
+    await expect(deployments.appendAllocatedLog({ id: "log_allocated", deploymentId: "dep_1", level: "info", message: "allocated", timestamp: now.toISOString(), redactionApplied: false, requestId: "req_1", correlationId: "req_1" })).resolves.toMatchObject({ sequence: 42 });
+  });
+
   it("matches PostgreSQL by rejecting a terminal projection at the lease expiry boundary", async () => {
     const deployments = new InMemoryDeploymentRepository();
     const commands = new InMemoryDeploymentCommandRepository(() => now);

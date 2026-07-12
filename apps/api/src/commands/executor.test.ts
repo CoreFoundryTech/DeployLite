@@ -39,11 +39,10 @@ describe("MockDeploymentExecutor", () => {
     await vi.advanceTimersByTimeAsync(50);
     await projectionStarted;
     await bus.cancel(command.id, "user_1");
-    await deployments.save({ ...deployment, status: "canceled", finishedAt: now.toISOString() });
     release();
 
     await expect(commands.findById(command.id)).resolves.toMatchObject({ state: "cancelled" });
-    await expect(deployments.findById(deployment.id)).resolves.toMatchObject({ status: "canceled" });
+    await expect(deployments.findById(deployment.id)).resolves.toMatchObject({ status: "queued" });
     await expect(deployments.listLogs(deployment.id)).resolves.not.toContainEqual(expect.objectContaining({ message: expect.stringContaining("picked up") }));
   });
 });

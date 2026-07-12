@@ -443,6 +443,13 @@ describeIntegration("PostgreSQL auth foundation integration", () => {
     await expect(requireDbDeploymentRepository().listLogs(boundary.deployment.id)).resolves.toEqual([]);
   });
 
+  it("allocates directly after an explicit log sequence", async () => {
+    const terminal = await createClaimedDeploymentCommand();
+    const deployments = requireDbDeploymentRepository();
+    await deployments.appendLog({ ...terminalLog(terminal.deployment.id, "explicit log"), sequence: 41 });
+    await expect(deployments.appendAllocatedLog({ ...terminalLog(terminal.deployment.id, "allocated log"), id: randomUUID() })).resolves.toMatchObject({ sequence: 42 });
+  });
+
   it("allocates terminal and restarted executor logs after explicit sequences without collisions", async () => {
     const terminal = await createClaimedDeploymentCommand();
     const deployments = requireDbDeploymentRepository();

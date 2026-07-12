@@ -130,6 +130,20 @@ export class DbDeploymentCommandRepository implements DeploymentCommandRepositor
     return authoritative?.agentId === agentId ? { command: authoritative, applied: false } : null;
   }
 
+  async projectRunning(commandId: string, agentId: string, deployment: Deployment, expectedStatus: Deployment["status"], event: Omit<LogEvent, "sequence">, _deployments: DeploymentRepository): Promise<{ command: DeploymentCommandRecord; applied: boolean } | null> {
+    return this.db.transaction(async (tx) => {
+      const [current] = await tx.select().from(deploymentCommands).where(and(eq(deploymentCommands.id, commandId), eq(deploymentCommands.agentId, agentId))).for("update").limit(1);
+      if (!current) return null;
+      const command = toDeploymentCommand(current); if (command.state !== "claimed") return { command, applied: false };
+      const [projected] = await tx.update(deployments).set({ status: deployment.status, finishedAt: null, updatedAt: new Date() }).where(and(eq(deployments.id, deployment.id), eq(deployments.status, expectedStatus))).returning();
+      if (!projected) return { command, applied: false };
+      const [allocation] = await tx.insert(deploymentLogSequences).values({ deploymentId: event.deploymentId, nextSequence: sql<number>`COALESCE((SELECT MAX(${deploymentLogs.sequence}) + 2 FROM ${deploymentLogs} WHERE ${deploymentLogs.deploymentId} = ${event.deploymentId}), 2)` }).onConflictDoUpdate({ target: deploymentLogSequences.deploymentId, set: { nextSequence: sql`GREATEST(${deploymentLogSequences.nextSequence}, COALESCE((SELECT MAX(${deploymentLogs.sequence}) + 1 FROM ${deploymentLogs} WHERE ${deploymentLogs.deploymentId} = ${event.deploymentId}), 1)) + 1` } }).returning({ sequence: sql<number>`${deploymentLogSequences.nextSequence} - 1` });
+      if (!allocation) throw new Error("Failed to allocate deployment log sequence");
+      await tx.insert(deploymentLogs).values({ ...event, sequence: allocation.sequence, message: redactLogMessage(event.message), redactionApplied: true });
+      return { command, applied: true };
+    });
+  }
+
   async projectTerminal(commandId: string, agentId: string, state: "completed" | "failed", deployment: Deployment, expectedStatus: Deployment["status"], event: Omit<LogEvent, "sequence">, _deployments: DeploymentRepository): Promise<{ command: DeploymentCommandRecord; applied: boolean } | null> {
     return this.db.transaction(async (tx) => {
       const [current] = await tx.select().from(deploymentCommands).where(and(eq(deploymentCommands.id, commandId), eq(deploymentCommands.agentId, agentId))).limit(1);

@@ -176,6 +176,7 @@ export type DeploymentCommandBus = {
   failSystem(commandId: string, reason: string): Promise<DeploymentCommandRecord | null>;
   failExpiredClaim(commandId: string, reason: string): Promise<DeploymentCommandRecord | null>;
   cancel(commandId: string, requestedBy: string | null): Promise<DeploymentCommandRecord | null>;
+  projectRunning(commandId: string, deployment: Deployment, expectedStatus: Deployment["status"], event: Omit<LogEvent, "sequence">, deployments: DeploymentRepository): Promise<DeploymentCommandRecord | null>;
   projectTerminal(commandId: string, state: "completed" | "failed", deployment: Deployment, expectedStatus: Deployment["status"], event: Omit<LogEvent, "sequence">): Promise<DeploymentCommandRecord | null>;
   list(): Promise<DeploymentCommandRecord[]>;
   findById(commandId: string): Promise<DeploymentCommandRecord | null>;
@@ -208,6 +209,7 @@ export type DeploymentCommandRepository = {
     next: Pick<DeploymentCommandRecord, "state" | "completedAt" | "leaseExpiresAt" | "failureReason" | "payload">,
     condition?: { leaseExpiresAtNotAfterNow: () => string } | { leaseExpiresAtAfterNow: () => string }
   ): Promise<{ command: DeploymentCommandRecord; applied: boolean } | null>;
+  projectRunning?(commandId: string, agentId: string, deployment: Deployment, expectedStatus: Deployment["status"], event: Omit<LogEvent, "sequence">, deployments: DeploymentRepository): Promise<{ command: DeploymentCommandRecord; applied: boolean } | null>;
   projectTerminal(commandId: string, agentId: string, state: "completed" | "failed", deployment: Deployment, expectedStatus: Deployment["status"], event: Omit<LogEvent, "sequence">, deployments: DeploymentRepository): Promise<{ command: DeploymentCommandRecord; applied: boolean } | null>;
   findById(id: string): Promise<DeploymentCommandRecord | null>;
   findActiveForDeployment(deploymentId: string): Promise<DeploymentCommandRecord | null>;
@@ -581,6 +583,18 @@ export class InMemoryDeploymentCommandRepository implements DeploymentCommandRep
     const command = structuredClone({ ...existing, ...next });
     this.#commands.set(command.id, command);
     return { command: structuredClone(command), applied: true };
+  }
+
+  async projectRunning(commandId: string, agentId: string, deployment: Deployment, expectedStatus: Deployment["status"], event: Omit<LogEvent, "sequence">, deployments: DeploymentRepository): Promise<{ command: DeploymentCommandRecord; applied: boolean } | null> {
+    const command = this.#commands.get(commandId); if (!command || command.agentId !== agentId) return null;
+    if (command.state !== "claimed") return { command, applied: false };
+    const projected = await deployments.saveWithLogIfStatus(deployment, expectedStatus, event);
+    const authoritative = this.#commands.get(commandId);
+    if (!projected || !authoritative || authoritative.state !== "claimed") {
+      if (projected) await deployments.rollbackTerminalProjection({ ...deployment, status: expectedStatus }, deployment, event.id);
+      return { command: authoritative ?? command, applied: false };
+    }
+    return { command: authoritative, applied: true };
   }
 
   async projectTerminal(commandId: string, agentId: string, state: "completed" | "failed", deployment: Deployment, expectedStatus: Deployment["status"], event: Omit<LogEvent, "sequence">, deployments: DeploymentRepository): Promise<{ command: DeploymentCommandRecord; applied: boolean } | null> {
