@@ -122,6 +122,12 @@ export class DeploymentCommandBusService implements DeploymentCommandBus {
     return result?.command ?? null;
   }
 
+  async reconcileTerminal(commandId: string, agentId: string, projection: DeploymentLifecycleProjection): Promise<DeploymentCommandRecord | null> {
+    if (!this.#repository.reconcileTerminal) return this.#repository.findById(commandId);
+    const result = await this.#repository.reconcileTerminal(commandId, agentId, projection);
+    return result?.command ?? null;
+  }
+
   async complete(commandId: string, output?: Record<string, unknown>): Promise<DeploymentCommandRecord | null> {
     const existing = await this.#repository.findById(commandId);
     if (!existing) return null;

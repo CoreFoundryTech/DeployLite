@@ -777,23 +777,27 @@ async function projectAuthoritativeTerminalCommand(
   command: DeploymentCommand,
   failedLifecycle?: { marker: string; message: string }
 ): Promise<void> {
-  if (!(await state.deployments.findById(command.deploymentId))) return;
+  const deployment = await state.deployments.findById(command.deploymentId);
+  if (!deployment || deployment.agentId !== command.agentId) return;
+  const finishedAt = command.completedAt ?? state.now().toISOString();
   if (command.state === "completed") {
-    await ensureAgentDeploymentLifecycle(state, command, { status: "succeeded", level: "info", marker: "Agent completed deployment command", message: "Agent completed deployment command; deployment succeeded." });
+    await state.deploymentCommandBus.reconcileTerminal(command.id, command.agentId, {
+      deployment: { ...deployment, status: "succeeded", finishedAt }, expectedDeploymentStatus: deployment.status, terminalState: "completed",
+      log: { id: createRequestId(), deploymentId: deployment.id, level: "info", message: "Agent completed deployment command; deployment succeeded.", timestamp: finishedAt, redactionApplied: true, requestId: command.requestId, correlationId: command.correlationId },
+      audit: { action: "deployment.command.completed", targetType: "deployment-command", targetId: command.id, requestId: command.requestId, correlationId: command.correlationId, metadata: { deploymentId: deployment.id } }
+    });
   } else if (command.state === "failed") {
     const fallback = `Agent command failed: ${redactLogMessage(command.failureReason ?? "Unknown failure").slice(0, INVALID_COMMAND_REASON_MAX)}`;
-    await ensureAgentDeploymentLifecycle(state, command, {
-      status: "failed",
-      level: "error",
-      marker: failedLifecycle?.marker ?? "Agent command failed",
-      message: failedLifecycle?.message ?? fallback
+    await state.deploymentCommandBus.reconcileTerminal(command.id, command.agentId, {
+      deployment: { ...deployment, status: "failed", finishedAt }, expectedDeploymentStatus: deployment.status, terminalState: "failed", failureReason: command.failureReason,
+      log: { id: createRequestId(), deploymentId: deployment.id, level: "error", message: failedLifecycle?.message ?? fallback, timestamp: finishedAt, redactionApplied: true, requestId: command.requestId, correlationId: command.correlationId },
+      audit: { action: "deployment.command.failed", targetType: "deployment-command", targetId: command.id, requestId: command.requestId, correlationId: command.correlationId, metadata: { deploymentId: deployment.id } }
     });
   } else if (command.state === "cancelled") {
-    await ensureAgentDeploymentLifecycle(state, command, {
-      status: "canceled",
-      level: "error",
-      marker: "Deployment command cancelled",
-      message: "Deployment command cancelled; deployment was canceled."
+    await state.deploymentCommandBus.reconcileTerminal(command.id, command.agentId, {
+      deployment: { ...deployment, status: "canceled", finishedAt }, expectedDeploymentStatus: deployment.status, terminalState: "cancelled",
+      log: { id: createRequestId(), deploymentId: deployment.id, level: "error", message: "Deployment command cancelled; deployment was canceled.", timestamp: finishedAt, redactionApplied: true, requestId: command.requestId, correlationId: command.correlationId },
+      audit: { action: "deployment.command.cancelled", targetType: "deployment-command", targetId: command.id, requestId: command.requestId, correlationId: command.correlationId, metadata: { deploymentId: deployment.id } }
     });
   }
 }
@@ -823,6 +827,19 @@ async function projectLiveAgentTerminalCommand(
     log: { id: createRequestId(), deploymentId: deployment.id, level: failed ? "error" : "info", message, timestamp: finishedAt, redactionApplied: true, requestId: command.requestId, correlationId: command.correlationId },
     audit: { action: failed ? "deployment.command.failed" : "deployment.command.completed", targetType: "deployment-command", targetId: command.id, requestId: command.requestId, correlationId: command.correlationId, metadata: { deploymentId: deployment.id } }
   });
+}
+
+async function ensureAgentDeploymentRunning(state: PlatformRepositories, command: DeploymentCommand): Promise<void> {
+  const deployment = await state.deployments.findById(command.deploymentId);
+  if (!deployment || deployment.agentId !== command.agentId) throw new Error("Linked deployment is unavailable for agent lifecycle update");
+  const startedAt = deployment.startedAt ?? state.now().toISOString();
+  if (deployment.status !== "running" || deployment.startedAt !== startedAt) {
+    await state.deployments.save({ ...deployment, status: "running", startedAt, finishedAt: null });
+  }
+  const logs = await state.deployments.listLogs(deployment.id);
+  if (!logs.some((log) => log.requestId === command.requestId && log.correlationId === command.correlationId && log.message.startsWith("Agent claimed deployment command"))) {
+    await state.deployments.appendLog({ id: createRequestId(), deploymentId: deployment.id, sequence: Math.max(0, ...logs.map((log) => log.sequence)) + 1, level: "info", message: "Agent claimed deployment command; deployment is running.", timestamp: startedAt, redactionApplied: true, requestId: command.requestId, correlationId: command.correlationId });
+  }
 }
 
 async function terminallyFailAgentCommand(state: PlatformRepositories, command: DeploymentCommand, reason: string, marker = "Agent command rejected"): Promise<DeploymentCommand | null> {
@@ -865,54 +882,6 @@ async function reconcileExpiredClaims(state: PlatformRepositories, agentId: stri
       });
     }
     if (command.state === "cancelled") await projectAuthoritativeTerminalCommand(state, command);
-  }
-}
-
-type AgentDeploymentLifecycle = {
-  status: "running" | "succeeded" | "failed" | "canceled";
-  level: "info" | "error";
-  marker: string;
-  message: string;
-};
-
-async function ensureAgentDeploymentLifecycle(
-  state: PlatformRepositories,
-  command: DeploymentCommand,
-  lifecycle: AgentDeploymentLifecycle
-): Promise<void> {
-  const deployment = await state.deployments.findById(command.deploymentId);
-  if (!deployment || deployment.agentId !== command.agentId) throw new Error("Linked deployment is unavailable for agent lifecycle update");
-  const terminal = lifecycle.status === "succeeded" || lifecycle.status === "failed" || lifecycle.status === "canceled";
-  const startedAt = lifecycle.status === "running" ? deployment.startedAt ?? state.now().toISOString() : deployment.startedAt;
-  if (deployment.status !== lifecycle.status || deployment.startedAt !== startedAt || (terminal && !deployment.finishedAt)) {
-    await state.deployments.save({
-      ...deployment,
-      status: lifecycle.status,
-      startedAt,
-      finishedAt: terminal ? deployment.finishedAt ?? command.completedAt ?? state.now().toISOString() : null
-    });
-  }
-
-  const logs = await state.deployments.listLogs(deployment.id);
-  const correlated = (message: string, requestId: string, correlationId: string) =>
-    requestId === command.requestId && correlationId === command.correlationId && message.startsWith(lifecycle.marker);
-  if (logs.some((log) => correlated(log.message, log.requestId, log.correlationId))) return;
-  const event = {
-    id: createRequestId(),
-    deploymentId: deployment.id,
-    sequence: Math.max(0, ...logs.map((log) => log.sequence)) + 1,
-    level: lifecycle.level,
-    message: lifecycle.message,
-    timestamp: command.completedAt ?? state.now().toISOString(),
-    redactionApplied: true,
-    requestId: command.requestId,
-    correlationId: command.correlationId
-  } as const;
-  try {
-    await state.deployments.appendLog(event);
-  } catch (error) {
-    const current = await state.deployments.listLogs(deployment.id);
-    if (!current.some((log) => correlated(log.message, log.requestId, log.correlationId))) throw error;
   }
 }
 
@@ -1065,7 +1034,7 @@ function registerRoutes(app: FastifyInstance, state: PlatformRepositories, adapt
         const claimed = await state.deploymentCommandBus.claim(command.id, parsed.data.agentId);
         if (claimed) {
           try {
-            await ensureAgentDeploymentLifecycle(state, claimed, { status: "running", level: "info", marker: "Agent claimed deployment command", message: "Agent claimed deployment command; deployment is running." });
+            await ensureAgentDeploymentRunning(state, claimed);
           } catch (error) {
             await compensateAgentLifecycleFailure(state, claimed);
             throw error;
@@ -1111,7 +1080,7 @@ function registerRoutes(app: FastifyInstance, state: PlatformRepositories, adapt
     const claimed = existing.state === "claimed" ? existing : await state.deploymentCommandBus.claim(existing.id, state.externalAgentIdentity.agentId);
     if (!claimed) return reply.code(409).send(errorEnvelope(request, "COMMAND_STATE_CONFLICT", "Command cannot be claimed in its current state."));
     try {
-      await ensureAgentDeploymentLifecycle(state, claimed, { status: "running", level: "info", marker: "Agent claimed deployment command", message: "Agent claimed deployment command; deployment is running." });
+      await ensureAgentDeploymentRunning(state, claimed);
     } catch (error) {
       await compensateAgentLifecycleFailure(state, claimed);
       throw error;

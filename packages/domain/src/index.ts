@@ -148,7 +148,7 @@ export type DeploymentLifecycleProjection = {
   audit?: AuditEventInput;
   expectedCommandState?: "pending" | "claimed";
   leaseCondition?: "live" | "expired" | "none";
-  terminalState?: "completed" | "failed";
+  terminalState?: "completed" | "cancelled" | "failed";
   failureReason?: string | null;
   output?: Record<string, unknown>;
 };
@@ -184,6 +184,7 @@ export type DeploymentCommandBus = {
   renewLease(commandId: string, agentId: string): Promise<DeploymentCommandRecord | null>;
   projectRunning(commandId: string, agentId: string, projection: DeploymentLifecycleProjection): Promise<DeploymentCommandRecord | null>;
   projectTerminal(commandId: string, agentId: string, projection: DeploymentLifecycleProjection): Promise<DeploymentCommandRecord | null>;
+  reconcileTerminal(commandId: string, agentId: string, projection: DeploymentLifecycleProjection): Promise<DeploymentCommandRecord | null>;
   complete(commandId: string, output?: Record<string, unknown>): Promise<DeploymentCommandRecord | null>;
   fail(commandId: string, reason: string): Promise<DeploymentCommandRecord | null>;
   failSystem(commandId: string, reason: string): Promise<DeploymentCommandRecord | null>;
@@ -222,6 +223,7 @@ export type DeploymentCommandRepository = {
   ): Promise<{ command: DeploymentCommandRecord; applied: boolean } | null>;
   projectRunning?(commandId: string, agentId: string, projection: DeploymentLifecycleProjection): Promise<{ command: DeploymentCommandRecord; applied: boolean } | null>;
   projectTerminal?(commandId: string, agentId: string, projection: DeploymentLifecycleProjection): Promise<{ command: DeploymentCommandRecord; applied: boolean } | null>;
+  reconcileTerminal?(commandId: string, agentId: string, projection: DeploymentLifecycleProjection): Promise<{ command: DeploymentCommandRecord; applied: boolean } | null>;
   cancel?(commandId: string, requestedBy: string | null, now: string): Promise<{ command: DeploymentCommandRecord; applied: boolean } | null>;
   findById(id: string): Promise<DeploymentCommandRecord | null>;
   findActiveForDeployment(deploymentId: string): Promise<DeploymentCommandRecord | null>;
@@ -601,6 +603,26 @@ export class InMemoryDeploymentCommandRepository implements DeploymentCommandRep
 
   async projectTerminal(commandId: string, agentId: string, projection: DeploymentLifecycleProjection): Promise<{ command: DeploymentCommandRecord; applied: boolean } | null> {
     return this.#project(commandId, agentId, projection, true);
+  }
+
+  async reconcileTerminal(commandId: string, agentId: string, projection: DeploymentLifecycleProjection): Promise<{ command: DeploymentCommandRecord; applied: boolean } | null> {
+    const existing = this.#commands.get(commandId);
+    if (!existing || existing.agentId !== agentId) return null;
+    if (existing.state !== projection.terminalState || !this.#deployments) return { command: structuredClone(existing), applied: false };
+    const deployment = await this.#deployments.findById(existing.deploymentId);
+    if (!deployment) return { command: structuredClone(existing), applied: false };
+    const logs = await this.#deployments.listLogs(deployment.id);
+    const message = redactLogMessage(projection.log.message);
+    const hasLog = logs.some((log) => log.message === message && log.requestId === projection.log.requestId && log.correlationId === projection.log.correlationId);
+    await this.#deployments.save({ ...deployment, status: projection.deployment.status, finishedAt: projection.deployment.finishedAt });
+    if (!hasLog) await this.#deployments.appendAllocatedLog({ ...projection.log, message, redactionApplied: true });
+    if (projection.audit && this.#audit) {
+      const audits = await this.#audit.list({ action: projection.audit.action });
+      if (!audits.events.some((event) => event.targetId === projection.audit!.targetId && event.requestId === projection.audit!.requestId && event.correlationId === projection.audit!.correlationId)) {
+        await this.#audit.append(projection.audit);
+      }
+    }
+    return { command: structuredClone(existing), applied: !hasLog || deployment.status !== projection.deployment.status || deployment.finishedAt !== projection.deployment.finishedAt };
   }
 
   async cancel(commandId: string, requestedBy: string | null, now: string): Promise<{ command: DeploymentCommandRecord; applied: boolean } | null> {

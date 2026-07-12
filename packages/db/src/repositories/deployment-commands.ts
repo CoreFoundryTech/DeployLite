@@ -140,6 +140,52 @@ export class DbDeploymentCommandRepository implements DeploymentCommandRepositor
     return this.#project(commandId, agentId, projection, true);
   }
 
+  async reconcileTerminal(commandId: string, agentId: string, projection: DeploymentLifecycleProjection): Promise<{ command: DeploymentCommandRecord; applied: boolean } | null> {
+    return this.db.transaction(async (tx) => {
+      const [command] = await tx.select().from(deploymentCommands).where(and(eq(deploymentCommands.id, commandId), eq(deploymentCommands.agentId, agentId))).limit(1);
+      if (!command) return null;
+      if (command.state !== projection.terminalState) return { command: toDeploymentCommand(command), applied: false };
+
+      // This update locks the deployment row, serializing concurrent recovery attempts
+      // before either can decide that its terminal log/audit is absent.
+      const [deployment] = await tx.update(deployments).set({
+        status: projection.deployment.status,
+        finishedAt: projection.deployment.finishedAt ? new Date(projection.deployment.finishedAt) : null,
+        updatedAt: new Date()
+      }).where(eq(deployments.id, projection.deployment.id)).returning();
+      if (!deployment) throw new Error("Terminal recovery deployment is missing");
+
+      const message = redactLogMessage(projection.log.message);
+      const existingLogs = await tx.select({ id: deploymentLogs.id }).from(deploymentLogs).where(and(
+        eq(deploymentLogs.deploymentId, projection.deployment.id),
+        eq(deploymentLogs.requestId, projection.log.requestId),
+        eq(deploymentLogs.correlationId, projection.log.correlationId),
+        eq(deploymentLogs.message, message)
+      )).limit(1);
+      let repaired = deployment.status !== projection.deployment.status || (deployment.finishedAt?.getTime() ?? null) !== (projection.deployment.finishedAt ? new Date(projection.deployment.finishedAt).getTime() : null);
+      if (existingLogs.length === 0) {
+        const [allocation] = await tx.insert(deploymentLogSequences).values({ deploymentId: projection.deployment.id, nextSequence: 2 }).onConflictDoUpdate({ target: deploymentLogSequences.deploymentId, set: { nextSequence: sql`${deploymentLogSequences.nextSequence} + 1` } }).returning({ sequence: sql<number>`${deploymentLogSequences.nextSequence} - 1` });
+        if (!allocation) throw new Error("Terminal recovery could not allocate log sequence");
+        await tx.insert(deploymentLogs).values({ ...projection.log, sequence: allocation.sequence, message, redactionApplied: true });
+        repaired = true;
+      }
+      if (projection.audit) {
+        const existingAudits = await tx.select({ id: auditEvents.id }).from(auditEvents).where(and(
+          eq(auditEvents.action, projection.audit.action),
+          eq(auditEvents.targetType, projection.audit.targetType),
+          eq(auditEvents.targetId, projection.audit.targetId),
+          eq(auditEvents.requestId, projection.audit.requestId),
+          eq(auditEvents.correlationId, projection.audit.correlationId)
+        )).limit(1);
+        if (existingAudits.length === 0) {
+          await tx.insert(auditEvents).values({ actorUserId: projection.audit.actorUserId ?? null, action: projection.audit.action, targetType: projection.audit.targetType, targetId: projection.audit.targetId, requestId: projection.audit.requestId, correlationId: projection.audit.correlationId, metadata: projection.audit.metadata ?? {} });
+          repaired = true;
+        }
+      }
+      return { command: toDeploymentCommand(command), applied: repaired };
+    });
+  }
+
   async cancel(commandId: string, requestedBy: string | null, now: string): Promise<{ command: DeploymentCommandRecord; applied: boolean } | null> {
     return this.db.transaction(async (tx) => {
       const payload = requestedBy === null

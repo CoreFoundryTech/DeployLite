@@ -346,6 +346,24 @@ describeIntegration("PostgreSQL auth foundation integration", () => {
     await expect(deployments.listLogs(expired.deployment.id)).resolves.toEqual([expect.objectContaining({ message: "lease expired" })]);
     await expect(requirePool().query("SELECT action FROM audit_events WHERE target_id = $1", [expired.command.id])).resolves.toMatchObject({ rows: [expect.objectContaining({ action: "deployment.command.failed" })] });
 
+    const missingFailed = await createClaimedDeploymentCommand({ status: "queued" });
+    await requirePool().query("UPDATE deployment_commands SET state = 'failed', completed_at = now(), lease_expires_at = NULL, failure_reason = 'recovery failed' WHERE id = $1", [missingFailed.command.id]);
+    const failedRecovery = { ...lifecycleProjection(missingFailed.deployment, "queued", "failed", "failed", "Agent command failed: recovery failed"), audit: terminalAudit(missingFailed.command) };
+    await expect(commands.reconcileTerminal(missingFailed.command.id, missingFailed.command.agentId, failedRecovery)).resolves.toMatchObject({ applied: true, command: { state: "failed" } });
+    await expect(commands.reconcileTerminal(missingFailed.command.id, missingFailed.command.agentId, failedRecovery)).resolves.toMatchObject({ applied: false, command: { state: "failed" } });
+    await expect(deployments.findById(missingFailed.deployment.id)).resolves.toMatchObject({ status: "failed" });
+    await expect(requirePool().query("SELECT count(*)::int AS count FROM deployment_logs WHERE deployment_id = $1 AND message = $2", [missingFailed.deployment.id, "Agent command failed: recovery failed"])).resolves.toMatchObject({ rows: [{ count: 1 }] });
+    await expect(requirePool().query("SELECT count(*)::int AS count FROM audit_events WHERE target_id = $1 AND action = 'deployment.command.failed'", [missingFailed.command.id])).resolves.toMatchObject({ rows: [{ count: 1 }] });
+
+    const missingCancelled = await createClaimedDeploymentCommand({ status: "queued" });
+    await requirePool().query("UPDATE deployment_commands SET state = 'cancelled', completed_at = now(), lease_expires_at = NULL WHERE id = $1", [missingCancelled.command.id]);
+    const cancelledRecovery = { ...lifecycleProjection(missingCancelled.deployment, "queued", "canceled" as const, "cancelled"), log: { ...lifecycleProjection(missingCancelled.deployment, "queued", "failed", "failed").log, level: "error" as const, message: "Deployment command cancelled; deployment was canceled." }, audit: { action: "deployment.command.cancelled", targetType: "deployment-command", targetId: missingCancelled.command.id, requestId: missingCancelled.command.requestId, correlationId: missingCancelled.command.correlationId, metadata: { deploymentId: missingCancelled.deployment.id } } };
+    await expect(commands.reconcileTerminal(missingCancelled.command.id, missingCancelled.command.agentId, cancelledRecovery)).resolves.toMatchObject({ applied: true, command: { state: "cancelled" } });
+    await expect(commands.reconcileTerminal(missingCancelled.command.id, missingCancelled.command.agentId, cancelledRecovery)).resolves.toMatchObject({ applied: false, command: { state: "cancelled" } });
+    await expect(deployments.findById(missingCancelled.deployment.id)).resolves.toMatchObject({ status: "canceled" });
+    await expect(requirePool().query("SELECT count(*)::int AS count FROM deployment_logs WHERE deployment_id = $1 AND message = $2", [missingCancelled.deployment.id, "Deployment command cancelled; deployment was canceled."])).resolves.toMatchObject({ rows: [{ count: 1 }] });
+    await expect(requirePool().query("SELECT count(*)::int AS count FROM audit_events WHERE target_id = $1 AND action = 'deployment.command.cancelled'", [missingCancelled.command.id])).resolves.toMatchObject({ rows: [{ count: 1 }] });
+
     const reconciled = await createClaimedDeploymentCommand({ status: "queued" });
     await requirePool().query("INSERT INTO deployment_logs (id, deployment_id, sequence, level, message, redaction_applied, request_id, correlation_id) VALUES ($1, $2, 41, 'info', 'legacy', true, 'req_legacy', 'corr_legacy')", [randomUUID(), reconciled.deployment.id]);
     await requirePool().query("DELETE FROM deployment_log_sequences WHERE deployment_id = $1", [reconciled.deployment.id]);
@@ -367,7 +385,7 @@ async function createClaimedDeploymentCommand(options: { status: "queued" | "run
   return { deployment, command };
 }
 
-function lifecycleProjection(deployment: Deployment, expectedDeploymentStatus: "queued" | "running", status: "running" | "succeeded" | "failed", terminalState?: "completed" | "failed", failureReason?: string) {
+function lifecycleProjection(deployment: Deployment, expectedDeploymentStatus: "queued" | "running", status: "running" | "succeeded" | "failed" | "canceled", terminalState?: "completed" | "cancelled" | "failed", failureReason?: string) {
   return { deployment: { ...deployment, status, finishedAt: status === "running" ? null : new Date().toISOString() }, expectedDeploymentStatus, terminalState, failureReason: failureReason ?? null, log: { id: randomUUID(), deploymentId: deployment.id, level: status === "failed" ? "error" as const : "info" as const, message: failureReason ?? status, timestamp: new Date().toISOString(), redactionApplied: true, requestId: `req_${deployment.id}`, correlationId: `corr_${deployment.id}` } };
 }
 

@@ -381,6 +381,23 @@ describe("agent command HTTP transport integration", () => {
     expect(repaired.statusCode).toBe(409);
     expect(await test.deployments.findById(deploymentId)).toMatchObject({ status: "canceled", finishedAt: completedAt });
     expect((await test.deployments.listLogs(deploymentId)).filter((log) => log.message.startsWith("Deployment command cancelled"))).toHaveLength(1);
+    expect(test.audit.inputs.filter((event) => event.targetId === commandId)).toEqual([expect.objectContaining({ action: "deployment.command.cancelled" })]);
+  });
+
+  it("repairs an already-failed command projection exactly once without letting a late completion win", async () => {
+    const completedAt = "2026-07-10T00:00:04.000Z";
+    const test = await fixture({ state: "failed", completedAt, failureReason: "lease expired", leaseExpiresAt: null });
+    const headers = { authorization: `Bearer ${token}`, "content-type": "application/json" };
+
+    for (let attempt = 0; attempt < 2; attempt += 1) {
+      const lateComplete = await test.app.inject({ method: "POST", url: `/api/v1/agent/commands/${commandId}/complete`, headers, payload: {} });
+      expect(lateComplete.statusCode).toBe(409);
+    }
+
+    expect(await test.commands.findById(commandId)).toMatchObject({ state: "failed", completedAt });
+    expect(await test.deployments.findById(deploymentId)).toMatchObject({ status: "failed", finishedAt: completedAt });
+    expect((await test.deployments.listLogs(deploymentId)).filter((log) => log.message.startsWith("Agent command failed: lease expired"))).toHaveLength(1);
+    expect(test.audit.inputs.filter((event) => event.targetId === commandId)).toEqual([expect.objectContaining({ action: "deployment.command.failed" })]);
   });
 
   it("autonomously reconciles a crashed agent claim after lease expiry without another poll", async () => {
