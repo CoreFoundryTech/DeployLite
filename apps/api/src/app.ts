@@ -805,7 +805,8 @@ async function projectLiveAgentTerminalCommand(
   message: string,
   output?: Record<string, unknown>,
   failureReason?: string,
-  leaseCondition?: "live" | "expired"
+  leaseCondition?: "live" | "expired" | "none",
+  expectedCommandState?: "pending" | "claimed"
 ): Promise<DeploymentCommand | null> {
   const deployment = await state.deployments.findById(command.deploymentId);
   if (!deployment || deployment.agentId !== command.agentId) throw new Error("Linked deployment is unavailable for agent lifecycle update");
@@ -816,6 +817,7 @@ async function projectLiveAgentTerminalCommand(
     expectedDeploymentStatus: deployment.status,
     terminalState,
     leaseCondition,
+    expectedCommandState,
     failureReason: failureReason ?? null,
     output,
     log: { id: createRequestId(), deploymentId: deployment.id, level: failed ? "error" : "info", message, timestamp: finishedAt, redactionApplied: true, requestId: command.requestId, correlationId: command.correlationId },
@@ -825,18 +827,25 @@ async function projectLiveAgentTerminalCommand(
 
 async function terminallyFailAgentCommand(state: PlatformRepositories, command: DeploymentCommand, reason: string, marker = "Agent command rejected"): Promise<DeploymentCommand | null> {
   const safeReason = redactLogMessage(reason).slice(0, INVALID_COMMAND_REASON_MAX);
-  const authoritative = await state.deploymentCommandBus.failSystem(command.id, safeReason);
-  if (authoritative) await projectAuthoritativeTerminalCommand(state, authoritative, { marker, message: `${marker}: ${safeReason}` });
-  return authoritative;
+  if (command.state !== "pending" && command.state !== "claimed") return command;
+  if (!(await state.deployments.findById(command.deploymentId))) {
+    return state.deploymentCommandBus.failSystem(command.id, safeReason);
+  }
+  return projectLiveAgentTerminalCommand(
+    state,
+    command,
+    "failed",
+    `${marker}: ${safeReason}`,
+    undefined,
+    safeReason,
+    command.state === "claimed" ? "live" : "none",
+    command.state
+  );
 }
 
 async function terminallyExpireAgentCommand(state: PlatformRepositories, command: DeploymentCommand, reason: string, marker: string): Promise<DeploymentCommand | null> {
   const safeReason = redactLogMessage(reason).slice(0, INVALID_COMMAND_REASON_MAX);
-  const authoritative = await state.deploymentCommandBus.failExpiredClaim(command.id, safeReason);
-  if (authoritative && authoritative.state !== "claimed") {
-    await projectAuthoritativeTerminalCommand(state, authoritative, { marker, message: `${marker}: ${safeReason}` });
-  }
-  return authoritative;
+  return projectLiveAgentTerminalCommand(state, command, "failed", `${marker}: ${safeReason}`, undefined, safeReason, "expired", "claimed");
 }
 
 async function reconcileExpiredClaims(state: PlatformRepositories, agentId: string): Promise<void> {

@@ -163,10 +163,19 @@ export class DbDeploymentCommandRepository implements DeploymentCommandRepositor
   async #project(commandId: string, agentId: string, projection: DeploymentLifecycleProjection, terminal: boolean): Promise<{ command: DeploymentCommandRecord; applied: boolean } | null> {
     return this.db.transaction(async (tx) => {
       const commandSet = terminal ? { state: projection.terminalState!, completedAt: new Date(), leaseExpiresAt: null, failureReason: projection.failureReason ?? null, payload: projection.output ? sql`${deploymentCommands.payload} || ${JSON.stringify({ output: projection.output })}::jsonb` : deploymentCommands.payload, updatedAt: new Date() } : { updatedAt: new Date() };
-      const leaseMatches = projection.leaseCondition === "expired"
+      const expectedCommandState = projection.expectedCommandState ?? "claimed";
+      const leaseCondition = projection.leaseCondition ?? (expectedCommandState === "claimed" ? "live" : "none");
+      const leaseMatches = leaseCondition === "expired"
         ? lte(deploymentCommands.leaseExpiresAt, sql`clock_timestamp()`)
-        : gt(deploymentCommands.leaseExpiresAt, sql`clock_timestamp()`);
-      const [command] = await tx.update(deploymentCommands).set(commandSet).where(and(eq(deploymentCommands.id, commandId), eq(deploymentCommands.agentId, agentId), eq(deploymentCommands.state, "claimed"), leaseMatches)).returning();
+        : leaseCondition === "live"
+          ? gt(deploymentCommands.leaseExpiresAt, sql`clock_timestamp()`)
+          : undefined;
+      const [command] = await tx.update(deploymentCommands).set(commandSet).where(and(
+        eq(deploymentCommands.id, commandId),
+        eq(deploymentCommands.agentId, agentId),
+        eq(deploymentCommands.state, expectedCommandState),
+        ...(leaseMatches ? [leaseMatches] : [])
+      )).returning();
       if (!command) {
         const authoritative = await tx.select().from(deploymentCommands).where(eq(deploymentCommands.id, commandId)).limit(1);
         return authoritative[0] ? { command: toDeploymentCommand(authoritative[0]), applied: false } : null;

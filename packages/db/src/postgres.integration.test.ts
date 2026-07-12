@@ -328,6 +328,11 @@ describeIntegration("PostgreSQL auth foundation integration", () => {
     await expect(commands.projectTerminal(failed.command.id, failed.command.agentId, lifecycleProjection(failed.deployment, "queued", "failed", "failed", "required environment unavailable"))).resolves.toMatchObject({ applied: true, command: { state: "failed", failureReason: "required environment unavailable" } });
     await expect(deployments.findById(failed.deployment.id)).resolves.toMatchObject({ status: "failed" });
 
+    const system = await createClaimedDeploymentCommand({ status: "queued" });
+    await requirePool().query("UPDATE deployment_commands SET state = 'pending', claimed_at = NULL, lease_expires_at = NULL WHERE id = $1", [system.command.id]);
+    await expect(commands.projectTerminal(system.command.id, system.command.agentId, { ...lifecycleProjection(system.deployment, "queued", "failed", "failed", "system projection rejected"), expectedCommandState: "pending", leaseCondition: "none", audit: terminalAudit(system.command) })).resolves.toMatchObject({ applied: true, command: { state: "failed", failureReason: "system projection rejected" } });
+    await expect(requirePool().query("SELECT action FROM audit_events WHERE target_id = $1", [system.command.id])).resolves.toMatchObject({ rows: [expect.objectContaining({ action: "deployment.command.failed" })] });
+
     const cancelled = await createClaimedDeploymentCommand({ status: "queued" });
     await expect(commands.cancel(cancelled.command.id, null, new Date().toISOString())).resolves.toMatchObject({ applied: true, command: { state: "cancelled" } });
     await expect(commands.projectTerminal(cancelled.command.id, cancelled.command.agentId, lifecycleProjection(cancelled.deployment, "queued", "failed", "failed", "must not overwrite cancellation"))).resolves.toMatchObject({ applied: false, command: { state: "cancelled" } });
@@ -336,9 +341,10 @@ describeIntegration("PostgreSQL auth foundation integration", () => {
     await expect(requirePool().query("SELECT action FROM audit_events WHERE target_id = $1", [cancelled.command.id])).resolves.toMatchObject({ rows: [expect.objectContaining({ action: "deployment.command.cancelled" })] });
 
     const expired = await createClaimedDeploymentCommand({ status: "queued", leaseExpiresAt: new Date("2000-01-01T00:00:00.000Z") });
-    await expect(commands.projectRunning(expired.command.id, expired.command.agentId, lifecycleProjection(expired.deployment, "queued", "running"))).resolves.toMatchObject({ applied: false, command: { state: "claimed" } });
-    await expect(deployments.findById(expired.deployment.id)).resolves.toEqual(expired.deployment);
-    await expect(deployments.listLogs(expired.deployment.id)).resolves.toEqual([]);
+    await expect(commands.projectTerminal(expired.command.id, expired.command.agentId, { ...lifecycleProjection(expired.deployment, "queued", "failed", "failed", "lease expired"), leaseCondition: "expired", audit: terminalAudit(expired.command) })).resolves.toMatchObject({ applied: true, command: { state: "failed", failureReason: "lease expired" } });
+    await expect(deployments.findById(expired.deployment.id)).resolves.toMatchObject({ status: "failed" });
+    await expect(deployments.listLogs(expired.deployment.id)).resolves.toEqual([expect.objectContaining({ message: "lease expired" })]);
+    await expect(requirePool().query("SELECT action FROM audit_events WHERE target_id = $1", [expired.command.id])).resolves.toMatchObject({ rows: [expect.objectContaining({ action: "deployment.command.failed" })] });
 
     const reconciled = await createClaimedDeploymentCommand({ status: "queued" });
     await requirePool().query("INSERT INTO deployment_logs (id, deployment_id, sequence, level, message, redaction_applied, request_id, correlation_id) VALUES ($1, $2, 41, 'info', 'legacy', true, 'req_legacy', 'corr_legacy')", [randomUUID(), reconciled.deployment.id]);
@@ -363,6 +369,10 @@ async function createClaimedDeploymentCommand(options: { status: "queued" | "run
 
 function lifecycleProjection(deployment: Deployment, expectedDeploymentStatus: "queued" | "running", status: "running" | "succeeded" | "failed", terminalState?: "completed" | "failed", failureReason?: string) {
   return { deployment: { ...deployment, status, finishedAt: status === "running" ? null : new Date().toISOString() }, expectedDeploymentStatus, terminalState, failureReason: failureReason ?? null, log: { id: randomUUID(), deploymentId: deployment.id, level: status === "failed" ? "error" as const : "info" as const, message: failureReason ?? status, timestamp: new Date().toISOString(), redactionApplied: true, requestId: `req_${deployment.id}`, correlationId: `corr_${deployment.id}` } };
+}
+
+function terminalAudit(command: { id: string; deploymentId: string; requestId: string; correlationId: string }) {
+  return { action: "deployment.command.failed", targetType: "deployment-command", targetId: command.id, requestId: command.requestId, correlationId: command.correlationId, metadata: { deploymentId: command.deploymentId } };
 }
 
 function requirePool(): pg.Pool {
