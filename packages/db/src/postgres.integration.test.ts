@@ -498,6 +498,21 @@ describeIntegration("PostgreSQL auth foundation integration", () => {
       expect.objectContaining({ sequence: 43 })
     ]));
   }, 30_000);
+
+  it("advances the PostgreSQL allocator after an explicit repository log", async () => {
+    const fixture = await createClaimedDeploymentCommand();
+    const deployments = requireDbDeploymentRepository();
+    await deployments.appendLog({
+      ...terminalLog(fixture.deployment.id, "explicit repository log"),
+      id: randomUUID(),
+      sequence: 41
+    });
+
+    await expect(deployments.appendAllocatedLog({
+      ...terminalLog(fixture.deployment.id, "allocated after explicit repository log"),
+      id: randomUUID()
+    })).resolves.toMatchObject({ sequence: 42 });
+  }, 30_000);
 });
 
 function requirePool(): pg.Pool {
