@@ -540,6 +540,8 @@ export class InMemoryDeploymentRepository implements DeploymentRepository {
 export class InMemoryDeploymentCommandRepository implements DeploymentCommandRepository {
   readonly #commands = new Map<string, DeploymentCommandRecord>();
 
+  constructor(private readonly now: () => Date = () => new Date()) {}
+
   async save(command: DeploymentCommandRecord): Promise<DeploymentCommandRecord> {
     const clone = structuredClone(command);
     this.#commands.set(clone.id, clone);
@@ -585,6 +587,8 @@ export class InMemoryDeploymentCommandRepository implements DeploymentCommandRep
     const command = this.#commands.get(commandId);
     if (!command || command.agentId !== agentId) return null;
     if (command.state !== "claimed") return { command, applied: false };
+    const leaseExpiresAt = command.leaseExpiresAt ? Date.parse(command.leaseExpiresAt) : Number.NaN;
+    if (!Number.isFinite(leaseExpiresAt) || leaseExpiresAt <= this.now().getTime()) return { command, applied: false };
     const previousDeployment = await deployments.findById(deployment.id);
     if (!previousDeployment) return { command, applied: false };
     if (!(await deployments.saveWithLogIfStatus(deployment, expectedStatus, event))) return { command: this.#commands.get(commandId) ?? command, applied: false };

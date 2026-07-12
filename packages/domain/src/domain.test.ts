@@ -153,9 +153,22 @@ describe("domain foundation", () => {
     expect(events.map((event) => event.sequence).sort((left, right) => left - right)).toEqual(Array.from({ length: 128 }, (_, index) => index + 1));
   });
 
+  it("matches PostgreSQL by rejecting a terminal projection at the lease expiry boundary", async () => {
+    const deployments = new InMemoryDeploymentRepository();
+    const commands = new InMemoryDeploymentCommandRepository(() => now);
+    const deployment = { id: "dep_1", projectId: "project_1", agentId: "agent_1", status: "running" as const, commitSha: "abcdef1", startedAt: now.toISOString(), finishedAt: null };
+    const command = { id: "cmd_1", deploymentId: deployment.id, agentId: deployment.agentId, kind: "start" as const, state: "claimed" as const, payload: {}, requestedBy: null, requestId: "req_1", correlationId: "req_1", issuedAt: now.toISOString(), claimedAt: now.toISOString(), leaseExpiresAt: now.toISOString(), completedAt: null, failureReason: null };
+    await deployments.save(deployment);
+    await commands.save(command);
+
+    await expect(commands.projectTerminal(command.id, command.agentId, "completed", { ...deployment, status: "succeeded", finishedAt: now.toISOString() }, "running", { id: "log_1", deploymentId: deployment.id, level: "info", message: "expired lease must not project", timestamp: now.toISOString(), redactionApplied: true, requestId: command.requestId, correlationId: command.correlationId }, deployments)).resolves.toMatchObject({ applied: false, command: { state: "claimed" } });
+    await expect(deployments.findById(deployment.id)).resolves.toEqual(deployment);
+    await expect(deployments.listLogs(deployment.id)).resolves.toEqual([]);
+  });
+
   it("keeps cancellation authoritative when it wins after the terminal command read and before projection", async () => {
     const deployments = new InMemoryDeploymentRepository();
-    const commands = new InMemoryDeploymentCommandRepository();
+    const commands = new InMemoryDeploymentCommandRepository(() => now);
     const deployment = { id: "dep_1", projectId: "project_1", agentId: "agent_1", status: "running" as const, commitSha: "abcdef1", startedAt: now.toISOString(), finishedAt: null };
     const command = { id: "cmd_1", deploymentId: deployment.id, agentId: deployment.agentId, kind: "start" as const, state: "claimed" as const, payload: {}, requestedBy: null, requestId: "req_1", correlationId: "req_1", issuedAt: now.toISOString(), claimedAt: now.toISOString(), leaseExpiresAt: "2026-01-01T00:00:30.000Z", completedAt: null, failureReason: null };
     await deployments.save(deployment);
@@ -180,7 +193,7 @@ describe("domain foundation", () => {
 
   it("rolls back a terminal projection when cancellation wins after its save and before the command update", async () => {
     const deployments = new InMemoryDeploymentRepository();
-    const commands = new InMemoryDeploymentCommandRepository();
+    const commands = new InMemoryDeploymentCommandRepository(() => now);
     const deployment = { id: "dep_1", projectId: "project_1", agentId: "agent_1", status: "running" as const, commitSha: "abcdef1", startedAt: now.toISOString(), finishedAt: null };
     const command = { id: "cmd_1", deploymentId: deployment.id, agentId: deployment.agentId, kind: "start" as const, state: "claimed" as const, payload: {}, requestedBy: null, requestId: "req_1", correlationId: "req_1", issuedAt: now.toISOString(), claimedAt: now.toISOString(), leaseExpiresAt: "2026-01-01T00:00:30.000Z", completedAt: null, failureReason: null };
     await deployments.save(deployment);

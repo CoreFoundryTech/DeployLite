@@ -394,6 +394,22 @@ describeIntegration("PostgreSQL auth foundation integration", () => {
     ]);
   }, 30_000);
 
+  it("rejects expired claimed terminal projections without changing the deployment or logs", async () => {
+    const expired = await createClaimedDeploymentCommand(new Date("2000-01-01T00:00:00.000Z"));
+
+    await expect(requireDbDeploymentCommandRepository().projectTerminal(
+      expired.command.id,
+      expired.command.agentId,
+      "completed",
+      { ...expired.deployment, status: "succeeded", finishedAt: new Date().toISOString() },
+      "running",
+      terminalLog(expired.deployment.id, "expired lease must not project"),
+      requireDbDeploymentRepository()
+    )).resolves.toMatchObject({ applied: false, command: { id: expired.command.id, state: "claimed" } });
+    await expect(requireDbDeploymentRepository().findById(expired.deployment.id)).resolves.toEqual(expired.deployment);
+    await expect(requireDbDeploymentRepository().listLogs(expired.deployment.id)).resolves.toEqual([]);
+  });
+
   it("allocates terminal and restarted executor logs after explicit sequences without collisions", async () => {
     const terminal = await createClaimedDeploymentCommand();
     const deployments = requireDbDeploymentRepository();
@@ -462,7 +478,7 @@ function requireDbDeploymentCommandRepository(): DbDeploymentCommandRepository {
   return new DbDeploymentCommandRepository(requireDb());
 }
 
-async function createClaimedDeploymentCommand(): Promise<{
+async function createClaimedDeploymentCommand(leaseExpiresAt = new Date(Date.now() + 60_000)): Promise<{
   deployment: { id: string; projectId: string; agentId: string; status: "running"; commitSha: string; startedAt: string; finishedAt: null };
   command: Awaited<ReturnType<DbDeploymentCommandRepository["save"]>>;
 }> {
@@ -498,7 +514,7 @@ async function createClaimedDeploymentCommand(): Promise<{
     correlationId: `corr_${commandId}`,
     issuedAt: now,
     claimedAt: now,
-    leaseExpiresAt: new Date(Date.now() + 60_000).toISOString(),
+    leaseExpiresAt: leaseExpiresAt.toISOString(),
     completedAt: null,
     failureReason: null
   });
