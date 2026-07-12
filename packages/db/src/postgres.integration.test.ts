@@ -2,11 +2,13 @@ import { randomUUID } from "node:crypto";
 import { readdir, readFile } from "node:fs/promises";
 
 import pg from "pg";
+import type { Deployment } from "@deploylite/contracts";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 
 import { createDbClient, createDbPool, closeDbPool, type DeployLiteDb } from "./client.js";
 import { assertEnvMetadataHasNoValueColumns, toEnvVariableMetadataInsert } from "./env-metadata.js";
 import { DbAuthUserRepository, DbRoleRepository, DbSessionRepository } from "./repositories/auth.js";
+import { DbDeploymentCommandRepository } from "./repositories/deployment-commands.js";
 import { DbAgentRepository, DbDeploymentRepository, DbProjectRepository } from "./repositories/deployment-data.js";
 
 const { Client } = pg;
@@ -238,12 +240,14 @@ describeIntegration("PostgreSQL auth foundation integration", () => {
       endpoint: "https://agent.integration.test",
       status: "online"
     });
-    await expect(requireDbProjectRepository().list()).resolves.toContainEqual({
-      id: projectId,
-      name: "Integration project",
-      repoUrl: "https://github.com/example/deploylite-integration",
-      defaultBranch: "main"
-    });
+    await expect(requireDbProjectRepository().list()).resolves.toEqual(expect.arrayContaining([
+      expect.objectContaining({
+        id: projectId,
+        name: "Integration project",
+        repoUrl: "https://github.com/example/deploylite-integration",
+        defaultBranch: "main"
+      })
+    ]));
     await expect(requireDbDeploymentRepository().findById(deploymentId)).resolves.toMatchObject({
       id: deploymentId,
       projectId,
@@ -310,7 +314,56 @@ describeIntegration("PostgreSQL auth foundation integration", () => {
       } as Parameters<typeof toEnvVariableMetadataInsert>[0])
     ).toThrow("Environment variable metadata cannot include secret value field");
   });
+
+  it("projects running, terminal success/failure, cancellation, expiry, and reconciled logs atomically", async () => {
+    const running = await createClaimedDeploymentCommand({ status: "queued" });
+    const commands = new DbDeploymentCommandRepository(requireDb());
+    const deployments = requireDbDeploymentRepository();
+
+    await expect(commands.projectRunning(running.command.id, running.command.agentId, lifecycleProjection(running.deployment, "queued", "running"))).resolves.toMatchObject({ applied: true, command: { state: "claimed" } });
+    await expect(commands.projectTerminal(running.command.id, running.command.agentId, lifecycleProjection({ ...running.deployment, status: "running" }, "running", "succeeded", "completed"))).resolves.toMatchObject({ applied: true, command: { state: "completed" } });
+    await expect(deployments.findById(running.deployment.id)).resolves.toMatchObject({ status: "succeeded" });
+
+    const failed = await createClaimedDeploymentCommand({ status: "queued" });
+    await expect(commands.projectTerminal(failed.command.id, failed.command.agentId, lifecycleProjection(failed.deployment, "queued", "failed", "failed", "required environment unavailable"))).resolves.toMatchObject({ applied: true, command: { state: "failed", failureReason: "required environment unavailable" } });
+    await expect(deployments.findById(failed.deployment.id)).resolves.toMatchObject({ status: "failed" });
+
+    const cancelled = await createClaimedDeploymentCommand({ status: "queued" });
+    await expect(commands.cancel(cancelled.command.id, null, new Date().toISOString())).resolves.toMatchObject({ applied: true, command: { state: "cancelled" } });
+    await expect(commands.projectTerminal(cancelled.command.id, cancelled.command.agentId, lifecycleProjection(cancelled.deployment, "queued", "failed", "failed", "must not overwrite cancellation"))).resolves.toMatchObject({ applied: false, command: { state: "cancelled" } });
+    await expect(deployments.findById(cancelled.deployment.id)).resolves.toMatchObject({ status: "canceled" });
+    await expect(deployments.listLogs(cancelled.deployment.id)).resolves.toEqual([expect.objectContaining({ message: "Deployment command cancelled; deployment was canceled." })]);
+    await expect(requirePool().query("SELECT action FROM audit_events WHERE target_id = $1", [cancelled.command.id])).resolves.toMatchObject({ rows: [expect.objectContaining({ action: "deployment.command.cancelled" })] });
+
+    const expired = await createClaimedDeploymentCommand({ status: "queued", leaseExpiresAt: new Date("2000-01-01T00:00:00.000Z") });
+    await expect(commands.projectRunning(expired.command.id, expired.command.agentId, lifecycleProjection(expired.deployment, "queued", "running"))).resolves.toMatchObject({ applied: false, command: { state: "claimed" } });
+    await expect(deployments.findById(expired.deployment.id)).resolves.toEqual(expired.deployment);
+    await expect(deployments.listLogs(expired.deployment.id)).resolves.toEqual([]);
+
+    const reconciled = await createClaimedDeploymentCommand({ status: "queued" });
+    await requirePool().query("INSERT INTO deployment_logs (id, deployment_id, sequence, level, message, redaction_applied, request_id, correlation_id) VALUES ($1, $2, 41, 'info', 'legacy', true, 'req_legacy', 'corr_legacy')", [randomUUID(), reconciled.deployment.id]);
+    await requirePool().query("DELETE FROM deployment_log_sequences WHERE deployment_id = $1", [reconciled.deployment.id]);
+    await requirePool().query(await readFile(new URL("../migrations/0008_reconcile_deployment_log_sequences.sql", import.meta.url), "utf8"));
+    await expect(deployments.appendAllocatedLog({ ...lifecycleProjection(reconciled.deployment, "queued", "running").log, id: randomUUID() })).resolves.toMatchObject({ sequence: 42 });
+  }, 30_000);
 });
+
+async function createClaimedDeploymentCommand(options: { status: "queued" | "running"; leaseExpiresAt?: Date }) {
+  const projectId = randomUUID();
+  const agentId = randomUUID();
+  const deploymentId = randomUUID();
+  const now = new Date().toISOString();
+  const deployment = { id: deploymentId, projectId, agentId, status: options.status, commitSha: "abcdef1234567890", startedAt: now, finishedAt: null } as const;
+  await requireDbProjectRepository().save({ id: projectId, name: "Projection project", repoUrl: "https://github.com/example/projection", defaultBranch: "main", buildCommand: null, runCommand: "node server.js", port: 3000, description: null, imageTag: null });
+  await requireDbAgentRepository().save({ id: agentId, name: "Projection agent", endpoint: "https://agent.projection.test", status: "online", lastHeartbeatAt: now, resourceSnapshot: null });
+  await requireDbDeploymentRepository().save(deployment);
+  const command = await new DbDeploymentCommandRepository(requireDb()).save({ id: randomUUID(), deploymentId, agentId, kind: "start", state: "claimed", payload: {}, requestedBy: null, requestId: `req_${deploymentId}`, correlationId: `corr_${deploymentId}`, issuedAt: now, claimedAt: now, leaseExpiresAt: (options.leaseExpiresAt ?? new Date(Date.now() + 60_000)).toISOString(), completedAt: null, failureReason: null });
+  return { deployment, command };
+}
+
+function lifecycleProjection(deployment: Deployment, expectedDeploymentStatus: "queued" | "running", status: "running" | "succeeded" | "failed", terminalState?: "completed" | "failed", failureReason?: string) {
+  return { deployment: { ...deployment, status, finishedAt: status === "running" ? null : new Date().toISOString() }, expectedDeploymentStatus, terminalState, failureReason: failureReason ?? null, log: { id: randomUUID(), deploymentId: deployment.id, level: status === "failed" ? "error" as const : "info" as const, message: failureReason ?? status, timestamp: new Date().toISOString(), redactionApplied: true, requestId: `req_${deployment.id}`, correlationId: `corr_${deployment.id}` } };
+}
 
 function requirePool(): pg.Pool {
   if (!pool) {

@@ -88,7 +88,18 @@ describeIntegration("DeployLite API PostgreSQL integration", () => {
       headers: { ...contentHeaders, cookie },
       payload: { name: "API-created PostgreSQL agent", endpoint: "https://api-agent.postgres.test" }
     });
+    expect(registeredAgent.statusCode).toBe(200);
     const apiAgentId = registeredAgent.json().data.agent.id as string;
+    const heartbeat = await firstApp.inject({
+      method: "POST",
+      url: `/api/v1/agents/${apiAgentId}/heartbeat`,
+      headers: { ...contentHeaders, cookie },
+      payload: {
+        observedAt: new Date().toISOString(),
+        resourceSnapshot: { cpuLoad: 0.1, memoryUsedBytes: 1, memoryTotalBytes: 2, diskUsedBytes: 1, diskTotalBytes: 2 }
+      }
+    });
+    expect(heartbeat.statusCode).toBe(200);
     const createdProject = await firstApp.inject({
       method: "POST",
       url: "/api/v1/projects",
@@ -105,7 +116,6 @@ describeIntegration("DeployLite API PostgreSQL integration", () => {
     const apiDeploymentId = triggeredDeployment.json().data.deployment.id as string;
     const [apiCommand] = await new DbDeploymentCommandRepository(requireDb()).list();
 
-    expect(registeredAgent.statusCode).toBe(200);
     expect(createdProject.statusCode).toBe(200);
     expect(triggeredDeployment.statusCode).toBe(200);
     expect(apiAgentId).toMatch(UUID_PATTERN);

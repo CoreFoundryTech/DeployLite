@@ -152,4 +152,26 @@ describe("domain foundation", () => {
 
     expect(events.map((event) => event.sequence).sort((left, right) => left - right)).toEqual(Array.from({ length: 128 }, (_, index) => index + 1));
   });
+
+  it("keeps in-memory running and terminal projections unchanged when cancellation or lease expiry wins", async () => {
+    let clock = now;
+    const deployments = new InMemoryDeploymentRepository();
+    const commands = new InMemoryDeploymentCommandRepository(deployments, () => clock);
+    const deployment = { id: "dep_projection", projectId: "project_1", agentId: "agent_1", status: "queued" as const, commitSha: "abcdef1", startedAt: now.toISOString(), finishedAt: null };
+    const command = { id: "cmd_projection", deploymentId: deployment.id, agentId: deployment.agentId, kind: "start" as const, state: "claimed" as const, payload: {}, requestedBy: null, requestId: "req_1", correlationId: "corr_1", issuedAt: now.toISOString(), claimedAt: now.toISOString(), leaseExpiresAt: "2026-01-01T00:00:30.000Z", completedAt: null, failureReason: null };
+    const projection = (status: "running" | "succeeded") => ({ deployment: { ...deployment, status, finishedAt: status === "succeeded" ? now.toISOString() : null }, expectedDeploymentStatus: "queued" as const, terminalState: status === "succeeded" ? "completed" as const : undefined, log: { id: `log_${status}`, deploymentId: deployment.id, level: "info" as const, message: status, timestamp: now.toISOString(), redactionApplied: true, requestId: command.requestId, correlationId: command.correlationId } });
+    await deployments.save(deployment);
+    await commands.save(command);
+
+    await commands.cancel(command.id, "user_1", now.toISOString());
+    await expect(commands.projectRunning(command.id, command.agentId, projection("running"))).resolves.toMatchObject({ applied: false, command: { state: "cancelled" } });
+    await expect(deployments.findById(deployment.id)).resolves.toMatchObject({ status: "canceled" });
+    await expect(deployments.listLogs(deployment.id)).resolves.toEqual([expect.objectContaining({ message: "Deployment command cancelled; deployment was canceled." })]);
+
+    await commands.save(command);
+    clock = new Date("2026-01-01T00:00:30.000Z");
+    await expect(commands.projectTerminal(command.id, command.agentId, projection("succeeded"))).resolves.toMatchObject({ applied: false, command: { state: "claimed" } });
+    await expect(deployments.findById(deployment.id)).resolves.toMatchObject({ status: "canceled" });
+    await expect(deployments.listLogs(deployment.id)).resolves.toEqual([expect.objectContaining({ message: "Deployment command cancelled; deployment was canceled." })]);
+  });
 });

@@ -140,6 +140,16 @@ export type DeploymentRepository = {
 
 export type DeploymentCommandRecord = DeploymentCommand;
 
+/** A single lifecycle write: command fence, deployment projection and log. */
+export type DeploymentLifecycleProjection = {
+  deployment: Deployment;
+  expectedDeploymentStatus: Deployment["status"];
+  log: Omit<LogEvent, "sequence">;
+  terminalState?: "completed" | "failed";
+  failureReason?: string | null;
+  output?: Record<string, unknown>;
+};
+
 export type DeploymentCommandEventType =
   | "deployment.command.submitted"
   | "deployment.command.claimed"
@@ -169,6 +179,8 @@ export type DeploymentCommandBus = {
   submit(input: DeploymentCommandBusSubmitInput): Promise<DeploymentCommandRecord>;
   claim(commandId: string, agentId: string): Promise<DeploymentCommandRecord | null>;
   renewLease(commandId: string, agentId: string): Promise<DeploymentCommandRecord | null>;
+  projectRunning(commandId: string, agentId: string, projection: DeploymentLifecycleProjection): Promise<DeploymentCommandRecord | null>;
+  projectTerminal(commandId: string, agentId: string, projection: DeploymentLifecycleProjection): Promise<DeploymentCommandRecord | null>;
   complete(commandId: string, output?: Record<string, unknown>): Promise<DeploymentCommandRecord | null>;
   fail(commandId: string, reason: string): Promise<DeploymentCommandRecord | null>;
   failSystem(commandId: string, reason: string): Promise<DeploymentCommandRecord | null>;
@@ -205,6 +217,9 @@ export type DeploymentCommandRepository = {
     next: Pick<DeploymentCommandRecord, "state" | "completedAt" | "leaseExpiresAt" | "failureReason" | "payload">,
     condition?: { leaseExpiresAtNotAfterNow: () => string } | { leaseExpiresAtAfterNow: () => string }
   ): Promise<{ command: DeploymentCommandRecord; applied: boolean } | null>;
+  projectRunning?(commandId: string, agentId: string, projection: DeploymentLifecycleProjection): Promise<{ command: DeploymentCommandRecord; applied: boolean } | null>;
+  projectTerminal?(commandId: string, agentId: string, projection: DeploymentLifecycleProjection): Promise<{ command: DeploymentCommandRecord; applied: boolean } | null>;
+  cancel?(commandId: string, requestedBy: string | null, now: string): Promise<{ command: DeploymentCommandRecord; applied: boolean } | null>;
   findById(id: string): Promise<DeploymentCommandRecord | null>;
   findActiveForDeployment(deploymentId: string): Promise<DeploymentCommandRecord | null>;
   list(): Promise<DeploymentCommandRecord[]>;
@@ -505,6 +520,19 @@ export class InMemoryDeploymentRepository implements DeploymentRepository {
     return this.appendLog({ ...event, sequence });
   }
 
+  /** Synchronous internal transaction used by the lifecycle command boundary. */
+  project(deployment: Deployment, expectedStatus: Deployment["status"], event: Omit<LogEvent, "sequence">): boolean {
+    const existing = this.#deployments.get(deployment.id);
+    if (!existing || existing.status !== expectedStatus) return false;
+    const sequence = this.#nextLogSequence.get(deployment.id) ?? 1;
+    const events = this.#logs.get(deployment.id) ?? [];
+    if (events.some((log) => log.sequence === sequence)) return false;
+    this.#deployments.set(deployment.id, structuredClone(deployment));
+    this.#logs.set(deployment.id, [...events, { ...event, sequence, message: redactLogMessage(event.message), redactionApplied: true }]);
+    this.#nextLogSequence.set(deployment.id, sequence + 1);
+    return true;
+  }
+
   async listLogs(deploymentId: string, afterSequence = -1): Promise<LogEvent[]> {
     return (this.#logs.get(deploymentId) ?? []).filter((event) => event.sequence > afterSequence);
   }
@@ -512,6 +540,12 @@ export class InMemoryDeploymentRepository implements DeploymentRepository {
 
 export class InMemoryDeploymentCommandRepository implements DeploymentCommandRepository {
   readonly #commands = new Map<string, DeploymentCommandRecord>();
+  #deployments: InMemoryDeploymentRepository | undefined;
+  constructor(
+    deployments?: InMemoryDeploymentRepository,
+    private readonly now: () => Date = () => new Date()
+  ) { this.#deployments = deployments; }
+  bindDeployments(deployments: InMemoryDeploymentRepository): void { this.#deployments = deployments; }
 
   async save(command: DeploymentCommandRecord): Promise<DeploymentCommandRecord> {
     const clone = structuredClone(command);
@@ -550,6 +584,40 @@ export class InMemoryDeploymentCommandRepository implements DeploymentCommandRep
       }
     }
     const command = structuredClone({ ...existing, ...next });
+    this.#commands.set(command.id, command);
+    return { command: structuredClone(command), applied: true };
+  }
+
+  async projectRunning(commandId: string, agentId: string, projection: DeploymentLifecycleProjection): Promise<{ command: DeploymentCommandRecord; applied: boolean } | null> {
+    return this.#project(commandId, agentId, projection, false);
+  }
+
+  async projectTerminal(commandId: string, agentId: string, projection: DeploymentLifecycleProjection): Promise<{ command: DeploymentCommandRecord; applied: boolean } | null> {
+    return this.#project(commandId, agentId, projection, true);
+  }
+
+  async cancel(commandId: string, requestedBy: string | null, now: string): Promise<{ command: DeploymentCommandRecord; applied: boolean } | null> {
+    const existing = this.#commands.get(commandId);
+    if (!existing) return null;
+    if (existing.state === "cancelled" || existing.state === "completed" || existing.state === "failed") return { command: structuredClone(existing), applied: false };
+    const deployment = this.#deployments ? await this.#deployments.findById(existing.deploymentId) : null;
+    if (this.#deployments && !deployment) return { command: structuredClone(existing), applied: false };
+    if (deployment && !this.#deployments!.project(
+      { ...deployment, status: "canceled", finishedAt: now },
+      deployment.status,
+      { id: `cancel_${existing.id}`, deploymentId: deployment.id, level: "error", message: "Deployment command cancelled; deployment was canceled.", timestamp: now, redactionApplied: true, requestId: existing.requestId, correlationId: existing.correlationId }
+    )) return { command: structuredClone(existing), applied: false };
+    const command = structuredClone({ ...existing, state: "cancelled" as const, completedAt: now, leaseExpiresAt: null, payload: requestedBy ? { ...existing.payload, cancelledBy: requestedBy } : existing.payload });
+    this.#commands.set(command.id, command);
+    return { command: structuredClone(command), applied: true };
+  }
+
+  async #project(commandId: string, agentId: string, projection: DeploymentLifecycleProjection, terminal: boolean): Promise<{ command: DeploymentCommandRecord; applied: boolean } | null> {
+    const existing = this.#commands.get(commandId);
+    if (!existing || existing.agentId !== agentId) return null;
+    if (existing.state !== "claimed" || !existing.leaseExpiresAt || existing.leaseExpiresAt <= this.now().toISOString()) return { command: structuredClone(existing), applied: false };
+    if (!this.#deployments || !this.#deployments.project(projection.deployment, projection.expectedDeploymentStatus, projection.log)) return { command: structuredClone(existing), applied: false };
+    const command = terminal ? structuredClone({ ...existing, state: projection.terminalState!, completedAt: this.now().toISOString(), leaseExpiresAt: null, failureReason: projection.failureReason ?? null, payload: projection.output ? { ...existing.payload, output: projection.output } : existing.payload }) : structuredClone(existing);
     this.#commands.set(command.id, command);
     return { command: structuredClone(command), applied: true };
   }

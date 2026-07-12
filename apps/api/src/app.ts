@@ -483,7 +483,8 @@ function createApiState(env: EnvSecretKeySource, overrides: Partial<PlatformRepo
   const agents = overrides.agents ?? new InMemoryAgentRepository();
   const deployments = overrides.deployments ?? new InMemoryDeploymentRepository();
   const projects = overrides.projects ?? new InMemoryProjectRepository();
-  const deploymentCommands = overrides.deploymentCommands ?? new InMemoryDeploymentCommandRepository();
+  const deploymentCommands = overrides.deploymentCommands ?? new InMemoryDeploymentCommandRepository(deployments as InMemoryDeploymentRepository);
+  if (deploymentCommands instanceof InMemoryDeploymentCommandRepository && deployments instanceof InMemoryDeploymentRepository) deploymentCommands.bindDeployments(deployments);
   const envMetadata = overrides.envMetadata ?? new InMemoryEnvVariableMetadataRepository();
   const envSecretValues = overrides.envSecretValues ?? new InMemoryEnvSecretValueRepository();
   const envSecretMaterialization = overrides.envSecretMaterialization ?? asEnvSecretMaterializationRepository(envSecretValues);
@@ -527,9 +528,6 @@ function createApiState(env: EnvSecretKeySource, overrides: Partial<PlatformRepo
     externalAgentIdentity: agentId && agentToken ? { agentId, token: agentToken } : null,
     now
   };
-  deploymentCommandBus.onEvent(async (event) => {
-    if (event.type === "deployment.command.cancelled") await projectAuthoritativeTerminalCommand(state, event.command);
-  });
   return state;
 }
 

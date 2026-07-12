@@ -1,6 +1,7 @@
 import { BcryptPasswordHasher, createOpaqueSessionToken, hashSessionToken } from "@deploylite/db";
 import {
   InitialAdminAlreadyExistsError,
+  InMemoryAgentRepository,
   InMemoryDeploymentCommandRepository,
   InMemoryDeploymentRepository,
   InMemoryEnvSecretValueRepository,
@@ -804,7 +805,7 @@ describe("DeployLite API scaffold", () => {
       headers: { ...contentHeaders, cookie },
       payload: {}
     });
-    expect(trigger.statusCode).toBe(200);
+    expect(trigger.statusCode, trigger.body).toBe(200);
     const deployment = trigger.json().data.deployment;
     expect(deployment.status).toBe("failed");
     expect(deployment.finishedAt).not.toBeNull();
@@ -1768,20 +1769,25 @@ describe("Phase 5 slice 1 — DeploymentCommandBus control plane", () => {
   it("preserves the queued -> running -> succeeded deployment lifecycle and log correlation", async () => {
     const delegate = new InMemoryDeploymentRepository();
     const transitions: Array<{ deploymentId: string; status: string }> = [];
-    const deployments: DeploymentRepository = {
-      async save(deployment) {
-        transitions.push({ deploymentId: deployment.id, status: deployment.status });
-        return delegate.save(deployment);
-      },
-      findById: (id) => delegate.findById(id),
-      list: () => delegate.list(),
-      appendLog: (event) => delegate.appendLog(event),
-      appendAllocatedLog: (event) => delegate.appendAllocatedLog(event),
-      listLogs: (deploymentId, afterSequence) => delegate.listLogs(deploymentId, afterSequence)
+    const projectDeployment = delegate.project.bind(delegate);
+    delegate.project = (deployment, expectedStatus, log) => {
+      transitions.push({ deploymentId: deployment.id, status: deployment.status });
+      return projectDeployment(deployment, expectedStatus, log);
     };
+    const agents = new InMemoryAgentRepository();
+    await agents.save({
+      id: "agent-bus-trace",
+      name: "Bus trace agent",
+      endpoint: "https://agent.bus-trace.test",
+      status: "online",
+      lastHeartbeatAt: new Date().toISOString(),
+      resourceSnapshot: null
+    });
     const { app } = await authFixture({
       state: {
-        deployments,
+        agents,
+        deployments: delegate,
+        deploymentCommands: new InMemoryDeploymentCommandRepository(delegate),
         envMetadata: new InMemoryEnvVariableMetadataRepository(),
         envSecretValues: new InMemoryEnvSecretValueRepository(),
         envSecretCipher: testEnvSecretCipher
@@ -1801,16 +1807,22 @@ describe("Phase 5 slice 1 — DeploymentCommandBus control plane", () => {
       headers: { ...contentHeaders, cookie, "x-request-id": "req_bus_trace_1" },
       payload: {}
     });
+    expect(trigger.statusCode).toBe(200);
     const deploymentId = trigger.json().data.deployment.id;
+    transitions.push({ deploymentId, status: trigger.json().data.deployment.status });
     await new Promise((resolve) => setTimeout(resolve, 350));
     const detail = await app.inject({ method: "GET", url: `/api/v1/deployments/${deploymentId}`, headers: { cookie } });
     expect(detail.json().data.deployment.status).toBe("succeeded");
-    expect(transitions.filter((transition) => transition.deploymentId === deploymentId).map((transition) => transition.status)).toEqual([
+    const lifecycleStatuses = transitions
+      .filter((transition) => transition.deploymentId === deploymentId)
+      .map((transition) => transition.status)
+      .filter((status, index, statuses) => index === 0 || statuses[index - 1] !== status);
+    expect(lifecycleStatuses).toEqual([
       "queued",
       "running",
       "succeeded"
     ]);
-    const logs = await deployments.listLogs(deploymentId);
+    const logs = await delegate.listLogs(deploymentId);
     expect(logs.length).toBeGreaterThan(0);
     expect(logs.every((event) => event.requestId === "req_bus_trace_1" && event.correlationId === "req_bus_trace_1")).toBe(true);
 

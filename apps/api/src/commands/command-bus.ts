@@ -10,6 +10,7 @@ import {
   type DeploymentCommandEventType,
   type DeploymentCommandRecord,
   type DeploymentCommandRepository,
+  type DeploymentLifecycleProjection,
   type DeploymentExecutor
 } from "@deploylite/domain";
 import { DEPLOYMENT_COMMAND_LEASE_MS } from "@deploylite/domain";
@@ -106,6 +107,19 @@ export class DeploymentCommandBusService implements DeploymentCommandBus {
   async renewLease(commandId: string, agentId: string): Promise<DeploymentCommandRecord | null> {
     const now = this.now();
     return this.#repository.renewLease(commandId, agentId, now.toISOString(), new Date(now.getTime() + DEPLOYMENT_COMMAND_LEASE_MS).toISOString());
+  }
+
+  async projectRunning(commandId: string, agentId: string, projection: DeploymentLifecycleProjection): Promise<DeploymentCommandRecord | null> {
+    if (!this.#repository.projectRunning) return this.#repository.findById(commandId);
+    const result = await this.#repository.projectRunning(commandId, agentId, projection);
+    return result?.command ?? null;
+  }
+
+  async projectTerminal(commandId: string, agentId: string, projection: DeploymentLifecycleProjection): Promise<DeploymentCommandRecord | null> {
+    if (!this.#repository.projectTerminal) return this.#repository.findById(commandId);
+    const result = await this.#repository.projectTerminal(commandId, agentId, projection);
+    if (result?.applied) await this.#emit(result.command.state === "completed" ? "deployment.command.completed" : "deployment.command.failed", result.command);
+    return result?.command ?? null;
   }
 
   async complete(commandId: string, output?: Record<string, unknown>): Promise<DeploymentCommandRecord | null> {
@@ -209,14 +223,9 @@ export class DeploymentCommandBusService implements DeploymentCommandBus {
       return existing;
     }
     if (existing.state !== "pending" && existing.state !== "claimed") return existing;
-    const next: DeploymentCommandRecord = {
-      ...existing,
-      state: "cancelled",
-      completedAt: this.now().toISOString(),
-      leaseExpiresAt: null,
-      payload: requestedBy ? { ...existing.payload, cancelledBy: redactSecrets(requestedBy) } : existing.payload
-    };
-    const result = await this.#repository.transitionTerminal(existing.id, existing.agentId, existing.state, next);
+    const result = this.#repository.cancel
+      ? await this.#repository.cancel(existing.id, requestedBy, this.now().toISOString())
+      : await this.#repository.transitionTerminal(existing.id, existing.agentId, existing.state, { ...existing, state: "cancelled", completedAt: this.now().toISOString(), leaseExpiresAt: null, payload: requestedBy ? { ...existing.payload, cancelledBy: redactSecrets(requestedBy) } : existing.payload });
     if (result?.applied) await this.#emit("deployment.command.cancelled", result.command);
     return result?.command ?? null;
   }

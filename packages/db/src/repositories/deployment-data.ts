@@ -162,19 +162,13 @@ export class DbDeploymentRepository implements DeploymentRepository {
   }
 
   async appendLog(event: LogEvent): Promise<LogEvent> {
-    const [row] = await this.db
-      .insert(deploymentLogs)
-      .values({
-        id: event.id,
-        deploymentId: event.deploymentId,
-        sequence: event.sequence,
-        level: event.level,
-        message: redactLogMessage(event.message),
-        redactionApplied: true,
-        requestId: event.requestId,
-        correlationId: event.correlationId
-      })
-      .returning();
+    const [row] = await this.db.transaction(async (tx) => {
+      await tx.insert(deploymentLogSequences).values({ deploymentId: event.deploymentId, nextSequence: event.sequence + 1 }).onConflictDoUpdate({
+        target: deploymentLogSequences.deploymentId,
+        set: { nextSequence: sql`GREATEST(${deploymentLogSequences.nextSequence}, ${event.sequence + 1})` }
+      });
+      return tx.insert(deploymentLogs).values({ id: event.id, deploymentId: event.deploymentId, sequence: event.sequence, level: event.level, message: redactLogMessage(event.message), redactionApplied: true, requestId: event.requestId, correlationId: event.correlationId }).returning();
+    });
 
     if (!row) throw new Error("Failed to append deployment log");
     return toLogEvent(row);

@@ -49,7 +49,6 @@ export type DeploymentExecutorDeps = {
  * the executor run inside that process.
  */
 export class MockDeploymentExecutor implements DeploymentExecutor {
-  readonly #sequenceByDeployment = new Map<string, number>();
   readonly #timers = new Map<string, NodeJS.Timeout>();
   readonly #bus: DeploymentCommandBus;
   readonly #deployments: DeploymentRepository;
@@ -83,7 +82,7 @@ export class MockDeploymentExecutor implements DeploymentExecutor {
       return;
     }
     if (command.kind !== "start") {
-      await this.#bus.fail(command.id, `Deployment executor for kind '${command.kind}' is not yet implemented (slice 1)`);
+      await this.#failStart(command, deployment, `Deployment executor for kind '${command.kind}' is not yet implemented (slice 1)`);
       return;
     }
     await this.#runStartCommand(command, deployment);
@@ -103,31 +102,28 @@ export class MockDeploymentExecutor implements DeploymentExecutor {
     const logs = await this.#envMetadata.listByProject(project.id);
     const missingRequired = logs.filter((record) => record.required && !record.valuePresent);
 
-    await this.#appendLog(deployment, "info", `Queued deploy for project ${project.name} (${project.repoUrl}@${project.defaultBranch}).`, command.requestId, command.correlationId);
-    await this.#appendLog(deployment, "info", `Resolved ${logs.length} env metadata record(s); ${missingRequired.length} required-without-value.`, command.requestId, command.correlationId);
+    await this.#logCurrent(command, deployment, "info", `Queued deploy for project ${project.name} (${project.repoUrl}@${project.defaultBranch}).`);
+    await this.#logCurrent(command, deployment, "info", `Resolved ${logs.length} env metadata record(s); ${missingRequired.length} required-without-value.`);
 
     if (missingRequired.length > 0) {
-      await this.#appendLog(deployment, "error", `Refusing to advance: required env metadata missing for ${missingRequired.map((m) => m.key).join(", ")}.`, command.requestId, command.correlationId);
-      const failed: Deployment = { ...deployment, status: "failed", finishedAt: new Date().toISOString() };
-      await this.#deployments.save(failed);
-      await this.#bus.fail(command.id, "Refusing to advance: required env metadata missing");
+      await this.#failStart(command, deployment, `Refusing to advance: required env metadata missing for ${missingRequired.map((m) => m.key).join(", ")}.`);
       return;
     }
 
     const projection = await this.#materializeDryRun(project);
     if (projection) {
-      await this.#appendLog(deployment, "info", `Materialized env (mock, redacted):\n${projection}`, command.requestId, command.correlationId);
+      await this.#logCurrent(command, deployment, "info", `Materialized env (mock, redacted):\n${projection}`);
     }
 
     if (!project.buildCommand) {
-      await this.#appendLog(deployment, "warn", "No build command configured; skipping build step.", command.requestId, command.correlationId);
+      await this.#logCurrent(command, deployment, "warn", "No build command configured; skipping build step.");
     } else {
-      await this.#appendLog(deployment, "info", `Build command: ${project.buildCommand}`, command.requestId, command.correlationId);
+      await this.#logCurrent(command, deployment, "info", `Build command: ${project.buildCommand}`);
     }
     if (!project.runCommand) {
-      await this.#appendLog(deployment, "warn", "No run command configured; deploy will stay in queued state.", command.requestId, command.correlationId);
+      await this.#logCurrent(command, deployment, "warn", "No run command configured; deploy will stay in queued state.");
     } else {
-      await this.#appendLog(deployment, "info", `Run command: ${project.runCommand} (port ${project.port ?? "default"})`, command.requestId, command.correlationId);
+      await this.#logCurrent(command, deployment, "info", `Run command: ${project.runCommand} (port ${project.port ?? "default"})`);
     }
 
     this.#scheduleAdvance(command.id, deployment.id, "running", 50, command.requestId, command.correlationId);
@@ -140,9 +136,11 @@ export class MockDeploymentExecutor implements DeploymentExecutor {
 
   async #failStart(command: DeploymentCommandRecord, deployment: Deployment, reason: string): Promise<void> {
     const failed: Deployment = { ...deployment, status: "failed", finishedAt: new Date().toISOString() };
-    await this.#deployments.save(failed);
-    await this.#appendLog(deployment, "error", reason, command.requestId, command.correlationId);
-    await this.#bus.fail(command.id, reason);
+    await this.#bus.projectTerminal(command.id, command.agentId, this.#projection(failed, deployment.status, "failed", "error", reason, command, reason));
+  }
+
+  async #logCurrent(command: DeploymentCommandRecord, deployment: Deployment, level: "debug" | "info" | "warn" | "error", message: string): Promise<void> {
+    await this.#bus.projectRunning(command.id, command.agentId, this.#projection(deployment, deployment.status, undefined, level, message, command));
   }
 
   /**
@@ -179,20 +177,8 @@ export class MockDeploymentExecutor implements DeploymentExecutor {
     }
   }
 
-  async #appendLog(deployment: Deployment, level: "debug" | "info" | "warn" | "error", message: string, requestId: string, correlationId: string): Promise<void> {
-    const next = (this.#sequenceByDeployment.get(deployment.id) ?? 0) + 1;
-    this.#sequenceByDeployment.set(deployment.id, next);
-    await this.#deployments.appendLog({
-      id: createRequestId(),
-      deploymentId: deployment.id,
-      sequence: next,
-      level,
-      message,
-      timestamp: new Date().toISOString(),
-      redactionApplied: true,
-      requestId,
-      correlationId
-    });
+  #projection(deployment: Deployment, expectedDeploymentStatus: Deployment["status"], terminalState: "completed" | "failed" | undefined, level: "debug" | "info" | "warn" | "error", message: string, command: DeploymentCommandRecord, failureReason?: string) {
+    return { deployment, expectedDeploymentStatus, terminalState, failureReason: failureReason ?? null, log: { id: createRequestId(), deploymentId: deployment.id, level, message, timestamp: new Date().toISOString(), redactionApplied: true, requestId: command.requestId, correlationId: command.correlationId } };
   }
 
   #scheduleAdvance(
@@ -211,25 +197,24 @@ export class MockDeploymentExecutor implements DeploymentExecutor {
       this.#timers.delete(deploymentId);
       const existing = await this.#deployments.findById(deploymentId);
       if (!existing) return;
-      if (existing.status === "failed" || existing.status === "succeeded" || existing.status === "canceled") return;
       const finishedAt = status === "running" ? null : new Date().toISOString();
       const next: Deployment = { ...existing, status, finishedAt };
-      await this.#deployments.save(next);
       const message =
         status === "running"
           ? "Simulated agent picked up the deployment. Real Docker execution is intentionally deferred."
           : status === "succeeded"
             ? "Simulated agent marked the deployment succeeded. Real container execution is intentionally deferred."
             : "Simulated agent marked the deployment failed.";
-      await this.#appendLog(next, status === "succeeded" ? "info" : status === "failed" ? "error" : "info", message, requestId, correlationId);
+      const command = await this.#bus.findById(commandId);
+      if (!command) return;
+      const projected = status === "running"
+        ? await this.#bus.projectRunning(commandId, command.agentId, this.#projection(next, existing.status, undefined, "info", message, command))
+        : await this.#bus.projectTerminal(commandId, command.agentId, this.#projection(next, existing.status, status === "succeeded" ? "completed" : "failed", status === "succeeded" ? "info" : "error", message, command, status === "failed" ? message : undefined));
+      if (!projected || projected.state === "cancelled") return;
       if (status === "running") {
         this.#scheduleAdvance(commandId, deploymentId, "succeeded", 200, requestId, correlationId);
       }
-      if (status === "succeeded") {
-        await this.#bus.complete(commandId, { deploymentId });
-      } else if (status === "failed") {
-        await this.#bus.fail(commandId, "Simulated agent marked the deployment failed");
-      }
+      void requestId; void correlationId;
       void this.#agentStatus;
     }, delayMs);
     this.#timers.set(deploymentId, timer);

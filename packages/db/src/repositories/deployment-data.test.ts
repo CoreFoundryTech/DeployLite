@@ -74,7 +74,10 @@ describe("PostgreSQL deployment log allocation", () => {
             }
           }
     }));
-    const db = { insert } as never;
+    const db = {
+      insert,
+      transaction: async <T>(callback: (tx: { insert: typeof insert }) => Promise<T>) => callback({ insert })
+    } as never;
     const repository = new DbDeploymentRepository(db);
 
     const events = await Promise.all(Array.from({ length: 128 }, (_, index) => repository.appendAllocatedLog({
@@ -89,7 +92,10 @@ describe("PostgreSQL deployment log allocation", () => {
     })));
 
     expect(events.map((event) => event.sequence).sort((left, right) => left - right)).toEqual(Array.from({ length: 128 }, (_, index) => index + 1));
-    expect(insert).toHaveBeenCalledTimes(256);
+    // Each allocated write reserves a sequence, then its explicit append
+    // advances/reconciles the counter in the same transaction before writing
+    // the immutable log row.
+    expect(insert).toHaveBeenCalledTimes(384);
     expect(insertedLogs.every((row) => row.message?.includes("[REDACTED]") === true)).toBe(true);
   });
 });

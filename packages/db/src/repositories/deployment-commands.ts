@@ -1,6 +1,8 @@
 import { and, asc, desc, eq, gt, inArray, lte, sql } from "drizzle-orm";
+import { randomUUID } from "node:crypto";
 import type { DeploymentCommandKind, DeploymentCommandState } from "@deploylite/contracts";
 import type {
+  DeploymentLifecycleProjection,
   DeploymentCommandBusSubmitInput,
   DeploymentCommandEventType,
   DeploymentCommandRecord,
@@ -8,7 +10,8 @@ import type {
 } from "@deploylite/domain";
 
 import type { DeployLiteDb } from "../client.js";
-import { deploymentCommands, deployments, agents, type DeploymentCommandRow, type NewDeploymentCommandRow } from "../schema.js";
+import { auditEvents, deploymentCommands, deploymentLogs, deploymentLogSequences, deployments, agents, type DeploymentCommandRow, type NewDeploymentCommandRow } from "../schema.js";
+import { redactLogMessage } from "@deploylite/config";
 
 const TERMINAL_STATES: ReadonlyArray<DeploymentCommandState> = ["completed", "cancelled", "failed"];
 
@@ -127,6 +130,51 @@ export class DbDeploymentCommandRepository implements DeploymentCommandRepositor
     if (row) return { command: toDeploymentCommand(row), applied: true };
     const authoritative = await this.findById(commandId);
     return authoritative?.agentId === agentId ? { command: authoritative, applied: false } : null;
+  }
+
+  async projectRunning(commandId: string, agentId: string, projection: DeploymentLifecycleProjection): Promise<{ command: DeploymentCommandRecord; applied: boolean } | null> {
+    return this.#project(commandId, agentId, projection, false);
+  }
+
+  async projectTerminal(commandId: string, agentId: string, projection: DeploymentLifecycleProjection): Promise<{ command: DeploymentCommandRecord; applied: boolean } | null> {
+    return this.#project(commandId, agentId, projection, true);
+  }
+
+  async cancel(commandId: string, requestedBy: string | null, now: string): Promise<{ command: DeploymentCommandRecord; applied: boolean } | null> {
+    return this.db.transaction(async (tx) => {
+      const payload = requestedBy === null
+        ? deploymentCommands.payload
+        : sql`${deploymentCommands.payload} || jsonb_build_object('cancelledBy', ${requestedBy})`;
+      const [row] = await tx.update(deploymentCommands).set({ state: "cancelled", completedAt: new Date(now), leaseExpiresAt: null, payload, updatedAt: new Date() }).where(and(eq(deploymentCommands.id, commandId), inArray(deploymentCommands.state, ["pending", "claimed"]))).returning();
+      if (!row) {
+        const authoritative = await tx.select().from(deploymentCommands).where(eq(deploymentCommands.id, commandId)).limit(1);
+        return authoritative[0] ? { command: toDeploymentCommand(authoritative[0]), applied: false } : null;
+      }
+      const [deployment] = await tx.update(deployments).set({ status: "canceled", finishedAt: new Date(now), updatedAt: new Date() }).where(eq(deployments.id, row.deploymentId)).returning();
+      if (!deployment) throw new Error("Cancellation projection deployment is missing");
+      const [allocation] = await tx.insert(deploymentLogSequences).values({ deploymentId: row.deploymentId, nextSequence: 2 }).onConflictDoUpdate({ target: deploymentLogSequences.deploymentId, set: { nextSequence: sql`${deploymentLogSequences.nextSequence} + 1` } }).returning({ sequence: sql<number>`${deploymentLogSequences.nextSequence} - 1` });
+      if (!allocation) throw new Error("Cancellation projection could not allocate log sequence");
+      await tx.insert(deploymentLogs).values({ id: randomUUID(), deploymentId: row.deploymentId, sequence: allocation.sequence, level: "error", message: "Deployment command cancelled; deployment was canceled.", redactionApplied: true, requestId: row.requestId, correlationId: row.correlationId });
+      await tx.insert(auditEvents).values({ action: "deployment.command.cancelled", targetType: "deployment-command", targetId: row.id, requestId: row.requestId, correlationId: row.correlationId, metadata: { deploymentId: row.deploymentId } });
+      return { command: toDeploymentCommand(row), applied: true };
+    });
+  }
+
+  async #project(commandId: string, agentId: string, projection: DeploymentLifecycleProjection, terminal: boolean): Promise<{ command: DeploymentCommandRecord; applied: boolean } | null> {
+    return this.db.transaction(async (tx) => {
+      const commandSet = terminal ? { state: projection.terminalState!, completedAt: new Date(), leaseExpiresAt: null, failureReason: projection.failureReason ?? null, payload: projection.output ? sql`${deploymentCommands.payload} || ${JSON.stringify({ output: projection.output })}::jsonb` : deploymentCommands.payload, updatedAt: new Date() } : { updatedAt: new Date() };
+      const [command] = await tx.update(deploymentCommands).set(commandSet).where(and(eq(deploymentCommands.id, commandId), eq(deploymentCommands.agentId, agentId), eq(deploymentCommands.state, "claimed"), gt(deploymentCommands.leaseExpiresAt, sql`clock_timestamp()`))).returning();
+      if (!command) {
+        const authoritative = await tx.select().from(deploymentCommands).where(eq(deploymentCommands.id, commandId)).limit(1);
+        return authoritative[0] ? { command: toDeploymentCommand(authoritative[0]), applied: false } : null;
+      }
+      const [deployment] = await tx.update(deployments).set({ status: projection.deployment.status, finishedAt: projection.deployment.finishedAt ? new Date(projection.deployment.finishedAt) : null, updatedAt: new Date() }).where(and(eq(deployments.id, projection.deployment.id), eq(deployments.status, projection.expectedDeploymentStatus))).returning();
+      if (!deployment) throw new Error("Lifecycle projection deployment state changed");
+      const [allocation] = await tx.insert(deploymentLogSequences).values({ deploymentId: projection.deployment.id, nextSequence: 2 }).onConflictDoUpdate({ target: deploymentLogSequences.deploymentId, set: { nextSequence: sql`${deploymentLogSequences.nextSequence} + 1` } }).returning({ sequence: sql<number>`${deploymentLogSequences.nextSequence} - 1` });
+      if (!allocation) throw new Error("Lifecycle projection could not allocate log sequence");
+      await tx.insert(deploymentLogs).values({ ...projection.log, sequence: allocation.sequence, message: redactLogMessage(projection.log.message), redactionApplied: true });
+      return { command: toDeploymentCommand(command), applied: true };
+    });
   }
 
   async findActiveForDeployment(deploymentId: string): Promise<DeploymentCommandRecord | null> {
