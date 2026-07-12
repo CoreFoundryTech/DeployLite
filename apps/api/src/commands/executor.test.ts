@@ -84,8 +84,9 @@ describe("MockDeploymentExecutor", () => {
     await expect(bus.findById(command.id)).resolves.toMatchObject({ state: "cancelled" });
   });
 
-  it("does not overwrite cancellation when failure reaches its terminal projection", async () => {
-    const { command, deployment, deployments, executor, bus } = await createExecutorFixture({ projectId: undefined });
+  it("does not project a required-env failure when cancellation wins", async () => {
+    const { command, deployment, deployments, envMetadata, executor, bus } = await createExecutorFixture();
+    await envMetadata.upsert(requiredEnvMetadata(deployment.projectId));
     const conditionalSave = deployments.saveWithLogIfStatus.bind(deployments);
     let release!: () => void;
     let reachedTerminalProjection!: () => void;
@@ -106,14 +107,26 @@ describe("MockDeploymentExecutor", () => {
     await execution;
 
     await expect(deployments.findById(deployment.id)).resolves.toMatchObject({ status: "queued" });
-    await expect(deployments.listLogs(deployment.id)).resolves.not.toContainEqual(expect.objectContaining({ message: expect.stringContaining("Project id is missing") }));
+    await expect(deployments.listLogs(deployment.id)).resolves.not.toContainEqual(expect.objectContaining({ message: expect.stringContaining("Refusing to advance") }));
     await expect(bus.findById(command.id)).resolves.toMatchObject({ state: "cancelled" });
+  });
+
+  it("projects and logs a required-env failure when cancellation does not win", async () => {
+    const { command, deployment, deployments, envMetadata, executor, bus } = await createExecutorFixture();
+    await envMetadata.upsert(requiredEnvMetadata(deployment.projectId));
+
+    await executor.execute(command);
+
+    await expect(deployments.findById(deployment.id)).resolves.toMatchObject({ status: "failed" });
+    await expect(deployments.listLogs(deployment.id)).resolves.toContainEqual(expect.objectContaining({ level: "error", message: "Refusing to advance: required env metadata missing for REQUIRED_TOKEN." }));
+    await expect(bus.findById(command.id)).resolves.toMatchObject({ state: "failed", failureReason: "Refusing to advance: required env metadata missing for REQUIRED_TOKEN." });
   });
 });
 
 async function createExecutorFixture(options: { projectId?: string } = {}) {
   const deployments = new InMemoryDeploymentRepository();
   const commands = new InMemoryDeploymentCommandRepository(() => now);
+  const envMetadata = new InMemoryEnvVariableMetadataRepository();
   const bus = new DeploymentCommandBusService(commands, () => now, deployments);
   const deployment = { id: "dep_1", projectId: "project_1", agentId: "agent_1", status: "queued" as const, commitSha: "abcdef1", startedAt: now.toISOString(), finishedAt: null };
   const command: DeploymentCommandRecord = { id: "cmd_1", deploymentId: deployment.id, agentId: deployment.agentId, kind: "start", state: "claimed", payload: options.projectId === undefined && Object.hasOwn(options, "projectId") ? {} : { projectId: deployment.projectId }, requestedBy: null, requestId: "req_1", correlationId: "corr_1", issuedAt: now.toISOString(), claimedAt: now.toISOString(), leaseExpiresAt: "2026-01-01T00:00:30.000Z", completedAt: null, failureReason: null };
@@ -121,10 +134,14 @@ async function createExecutorFixture(options: { projectId?: string } = {}) {
     bus,
     deployments,
     agentStatus: {} as AgentStatusService,
-    envMetadata: new InMemoryEnvVariableMetadataRepository(),
+    envMetadata,
     projectResolver: async () => ({ id: deployment.projectId, name: "Project", repoUrl: "https://example.test/project.git", defaultBranch: "main", buildCommand: "pnpm build", runCommand: "pnpm start", port: null, description: null, imageTag: null })
   });
   await deployments.save(deployment);
   await commands.save(command);
-  return { command, deployment, deployments, executor, bus, commands };
+  return { command, deployment, deployments, envMetadata, executor, bus, commands };
+}
+
+function requiredEnvMetadata(projectId: string) {
+  return { id: "env_1", projectId, key: "REQUIRED_TOKEN", scope: "project" as const, valuePresent: false, valueFingerprint: null, required: true, description: null, updatedAt: now.toISOString() };
 }

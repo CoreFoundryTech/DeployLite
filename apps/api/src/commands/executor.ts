@@ -106,10 +106,12 @@ export class MockDeploymentExecutor implements DeploymentExecutor {
     await this.#appendLog(deployment, "info", `Resolved ${logs.length} env metadata record(s); ${missingRequired.length} required-without-value.`, command.requestId, command.correlationId);
 
     if (missingRequired.length > 0) {
-      await this.#appendLog(deployment, "error", `Refusing to advance: required env metadata missing for ${missingRequired.map((m) => m.key).join(", ")}.`, command.requestId, command.correlationId);
+      const message = redactEnvFileForLog(`Refusing to advance: required env metadata missing for ${missingRequired.map((m) => m.key).join(", ")}.`);
       const failed: Deployment = { ...deployment, status: "failed", finishedAt: new Date().toISOString() };
-      await this.#deployments.save(failed);
-      await this.#bus.fail(command.id, "Refusing to advance: required env metadata missing");
+      await this.#bus.projectTerminal(command.id, "failed", failed, deployment.status, {
+        id: createRequestId(), deploymentId: deployment.id, level: "error", message,
+        timestamp: new Date().toISOString(), redactionApplied: true, requestId: command.requestId, correlationId: command.correlationId
+      });
       return;
     }
 
