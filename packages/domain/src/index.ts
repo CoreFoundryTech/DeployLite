@@ -313,6 +313,11 @@ export type SessionRepository = {
 
 export type AuditRepository = {
   append(input: AuditEventInput): Promise<AuditEvent>;
+  /**
+   * Persist an audit event under a caller-provided durable idempotency key.
+   * Repeated calls with the same id return the originally persisted event.
+   */
+  appendOnce(input: AuditEventInput, id: string): Promise<AuditEvent>;
   list(filter?: AuditEventListFilter): Promise<AuditEventListPage>;
 };
 

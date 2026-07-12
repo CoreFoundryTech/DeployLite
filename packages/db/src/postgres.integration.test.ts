@@ -6,7 +6,7 @@ import { afterAll, beforeAll, describe, expect, it } from "vitest";
 
 import { createDbClient, createDbPool, closeDbPool, type DeployLiteDb } from "./client.js";
 import { assertEnvMetadataHasNoValueColumns, toEnvVariableMetadataInsert } from "./env-metadata.js";
-import { DbAuthUserRepository, DbRoleRepository, DbSessionRepository } from "./repositories/auth.js";
+import { DbAuditRepository, DbAuthUserRepository, DbRoleRepository, DbSessionRepository } from "./repositories/auth.js";
 import { DbAgentRepository, DbDeploymentRepository, DbProjectRepository } from "./repositories/deployment-data.js";
 
 const { Client } = pg;
@@ -121,6 +121,28 @@ describeIntegration("PostgreSQL auth foundation integration", () => {
       userId: createdUser.id,
       tokenHash: "sha256:integration-token-hash"
     });
+  });
+
+  it("matches the mock audit adapter by returning one redacted event for concurrent retries", async () => {
+    const audit = new DbAuditRepository(requireDb());
+    const id = randomUUID();
+    const input = {
+      action: "deployment.cancel",
+      targetType: "deployment",
+      targetId: "deployment-integration",
+      requestId: "req_audit_once",
+      correlationId: "corr_audit_once",
+      metadata: { authorization: "Bearer dl_1234567890", safe: "visible" }
+    };
+
+    const events = await Promise.all(Array.from({ length: 16 }, () => audit.appendOnce(input, id)));
+    const page = await audit.list({ action: input.action });
+    const stored = await requirePool().query<{ metadata: Record<string, unknown> }>("SELECT metadata FROM audit_events WHERE id = $1", [id]);
+
+    expect(events).toEqual(Array.from({ length: 16 }, () => events[0]));
+    expect(page.events.filter((event) => event.id === id)).toHaveLength(1);
+    expect(stored.rows).toEqual([{ metadata: { authorization: "[REDACTED]", safe: "visible" } }]);
+    await expect(audit.appendOnce({ ...input, action: "ignored.retry" }, id)).resolves.toEqual(events[0]);
   });
 
   it("persists deployment metadata foundations across a new PostgreSQL client lifecycle", async () => {

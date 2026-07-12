@@ -148,15 +148,7 @@ export class DbAuditRepository implements AuditRepository {
   async append(input: AuditEventInput): Promise<AuditEvent> {
     const [created] = await this.db
       .insert(auditEvents)
-      .values({
-        actorUserId: input.actorUserId ?? null,
-        action: input.action,
-        targetType: input.targetType,
-        targetId: input.targetId,
-        requestId: input.requestId,
-        correlationId: input.correlationId,
-        metadata: redactAuditMetadata(input.metadata ?? {})
-      })
+      .values(toAuditEventInsert(input))
       .returning();
 
     if (!created) {
@@ -164,6 +156,26 @@ export class DbAuditRepository implements AuditRepository {
     }
 
     return toAuditEvent(created);
+  }
+
+  async appendOnce(input: AuditEventInput, id: string): Promise<AuditEvent> {
+    const [created] = await this.db
+      .insert(auditEvents)
+      .values({ id, ...toAuditEventInsert(input) })
+      .onConflictDoNothing()
+      .returning();
+
+    if (created) return toAuditEvent(created);
+
+    // `audit_events.id` is the primary key, so ON CONFLICT means another
+    // writer already durably owns this idempotency key. Return that event
+    // rather than reporting a duplicate as a failed audit write.
+    const [existing] = await this.db.select().from(auditEvents).where(eq(auditEvents.id, id)).limit(1);
+    if (existing) {
+      return toAuditEvent(existing);
+    }
+
+    throw new Error("Failed to append idempotent audit event");
   }
 
   async list(filter: AuditEventListFilter = {}): Promise<AuditEventListPage> {
@@ -249,6 +261,18 @@ export function normalizeEmail(email: string): string {
 
 export function redactAuditMetadata(metadata: Record<string, unknown>): Record<string, unknown> {
   return redactSecrets(metadata);
+}
+
+function toAuditEventInsert(input: AuditEventInput) {
+  return {
+    actorUserId: input.actorUserId ?? null,
+    action: input.action,
+    targetType: input.targetType,
+    targetId: input.targetId,
+    requestId: input.requestId,
+    correlationId: input.correlationId,
+    metadata: redactAuditMetadata(input.metadata ?? {})
+  };
 }
 
 function toAuthRole(role: Role): AuthRole {

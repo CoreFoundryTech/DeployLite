@@ -233,6 +233,12 @@ class InMemoryAuditRepository implements AuditRepository {
   readonly inputs: AuditEventInput[] = [];
 
   async append(input: AuditEventInput): Promise<AuditEvent> {
+    return this.appendOnce(input, `audit_${createRequestId()}`);
+  }
+
+  async appendOnce(input: AuditEventInput, id: string): Promise<AuditEvent> {
+    const existing = this.events.find((event) => event.id === id);
+    if (existing) return existing;
     const safe = createAuditLogRecord({
       actorId: input.actorUserId === null ? "anonymous" : input.actorUserId ?? "system",
       action: input.action,
@@ -243,7 +249,7 @@ class InMemoryAuditRepository implements AuditRepository {
       metadata: input.metadata
     });
     const event: AuditEvent = {
-      id: `audit_${createRequestId()}`,
+      id,
       actorId: safe.actorId,
       action: safe.action,
       targetType: safe.targetType,

@@ -125,6 +125,10 @@ function metadataRepositories() {
       calls.push("deployments.saveWithLogIfStatus");
       throw new Error("metadata read routes must not create deployments");
     },
+    async rollbackTerminalProjection() {
+      calls.push("deployments.rollbackTerminalProjection");
+      throw new Error("metadata read routes must not alter deployments");
+    },
     async findById(id) {
       calls.push("deployments.findById");
       return id === "dep-1" ? { id, projectId: "project-1", agentId: "agent-1", status: "running", commitSha: "abcdef1", startedAt: "2026-01-01T00:00:00.000Z", finishedAt: null } : null;
@@ -156,6 +160,26 @@ async function loginCookie(app: Awaited<ReturnType<typeof buildApiApp>>, email =
 }
 
 describe("DeployLite API scaffold", () => {
+  it("keeps mock audit appends idempotent and redacted under concurrent retries", async () => {
+    const audit = new InMemoryAuditRepository();
+    const id = "e4c9a6a7-4967-47f8-8119-b0f7634c9925";
+    const input = {
+      action: "deployment.cancel",
+      targetType: "deployment",
+      targetId: "deployment_1",
+      requestId: "req_audit_once",
+      correlationId: "corr_audit_once",
+      metadata: { authorization: "Bearer dl_1234567890", safe: "visible" }
+    };
+
+    const events = await Promise.all(Array.from({ length: 32 }, () => audit.appendOnce(input, id)));
+
+    expect(events).toEqual(Array.from({ length: 32 }, () => events[0]));
+    expect(audit.events).toHaveLength(1);
+    expect(audit.inputs).toEqual([expect.objectContaining({ metadata: { authorization: "[REDACTED]", safe: "visible" } })]);
+    await expect(audit.appendOnce({ ...input, action: "ignored.retry" }, id)).resolves.toEqual(events[0]);
+  });
+
   it("generates request IDs and returns health in the standard envelope", async () => {
     const app = await buildApiApp();
     const response = await app.inject({ method: "GET", url: "/api/v1/health" });
@@ -1782,6 +1806,7 @@ describe("Phase 5 slice 1 — DeploymentCommandBus control plane", () => {
         if (saved) transitions.push({ deploymentId: deployment.id, status: deployment.status });
         return saved;
       },
+      rollbackTerminalProjection: (previous, projected, eventId) => delegate.rollbackTerminalProjection(previous, projected, eventId),
       findById: (id) => delegate.findById(id),
       list: () => delegate.list(),
       appendLog: (event) => delegate.appendLog(event),
