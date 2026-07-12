@@ -593,7 +593,8 @@ export class InMemoryDeploymentCommandRepository implements DeploymentCommandRep
     if (!previousDeployment) return { command, applied: false };
     if (!(await deployments.saveWithLogIfStatus(deployment, expectedStatus, event))) return { command: this.#commands.get(commandId) ?? command, applied: false };
     const authoritative = this.#commands.get(commandId);
-    if (!authoritative || authoritative.agentId !== agentId || authoritative.state !== "claimed") {
+    const authoritativeLeaseExpiresAt = authoritative?.leaseExpiresAt ? Date.parse(authoritative.leaseExpiresAt) : Number.NaN;
+    if (!authoritative || authoritative.agentId !== agentId || authoritative.state !== "claimed" || !Number.isFinite(authoritativeLeaseExpiresAt) || authoritativeLeaseExpiresAt <= this.now().getTime()) {
       await deployments.rollbackTerminalProjection(previousDeployment, deployment, event.id);
       return { command: authoritative ?? command, applied: false };
     }
