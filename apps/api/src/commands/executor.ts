@@ -215,8 +215,21 @@ export class MockDeploymentExecutor implements DeploymentExecutor {
             ? "Simulated agent marked the deployment succeeded. Real container execution is intentionally deferred."
             : "Simulated agent marked the deployment failed.";
       if (status === "running") {
-        await this.#appendLog(next, "info", message, requestId, correlationId);
-        await this.#deployments.save(next);
+        const authoritativeCommand = await this.#bus.findById(commandId);
+        const authoritativeDeployment = await this.#deployments.findById(deploymentId);
+        if (
+          authoritativeCommand?.state !== "claimed" ||
+          !authoritativeDeployment ||
+          authoritativeDeployment.status === "failed" ||
+          authoritativeDeployment.status === "succeeded" ||
+          authoritativeDeployment.status === "canceled"
+        ) return;
+        const running = { ...authoritativeDeployment, status: "running" as const, finishedAt: null };
+        const projected = await this.#deployments.saveWithLogIfStatus(running, authoritativeDeployment.status, {
+          id: createRequestId(), deploymentId, level: "info", message,
+          timestamp: new Date().toISOString(), redactionApplied: true, requestId, correlationId
+        });
+        if (!projected) return;
         this.#scheduleAdvance(commandId, deploymentId, "succeeded", 200, requestId, correlationId);
         return;
       }
