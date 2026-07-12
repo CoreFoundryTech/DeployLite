@@ -195,13 +195,56 @@ describeIntegration("DeployLite API PostgreSQL integration", () => {
 
     await restartedApp.close();
   }, 30_000);
+
+  it("atomically projects real-agent terminal acknowledgements and preserves retry/cancel authority", async () => {
+    const projectId = randomUUID();
+    const agentId = randomUUID();
+    const deploymentId = randomUUID();
+    const commandId = randomUUID();
+    const token = "postgres-real-agent-token-with-at-least-32-characters";
+    const db = requireDb();
+    const projects = new DbProjectRepository(db);
+    const agents = new DbAgentRepository(db);
+    const deployments = new DbDeploymentRepository(db);
+    const commands = new DbDeploymentCommandRepository(db);
+    const now = new Date();
+    await projects.save({ id: projectId, name: "Agent terminal project", repoUrl: "https://github.com/example/agent-terminal", defaultBranch: "main", buildCommand: null, runCommand: "node server.js", port: 3000, description: null, imageTag: null });
+    await agents.save({ id: agentId, name: "Agent terminal", endpoint: "https://agent.example.test", status: "online", lastHeartbeatAt: now.toISOString(), resourceSnapshot: null });
+    await deployments.save({ id: deploymentId, projectId, agentId, status: "running", commitSha: "abcdef1", startedAt: now.toISOString(), finishedAt: null });
+    await commands.save({ id: commandId, deploymentId, agentId, kind: "start", state: "pending", payload: {}, requestedBy: null, requestId: "req_pg_agent", correlationId: "corr_pg_agent", issuedAt: now.toISOString(), claimedAt: null, leaseExpiresAt: null, completedAt: null, failureReason: null });
+    await commands.claim(commandId, agentId, now.toISOString(), new Date(now.getTime() + 60_000).toISOString());
+    const app = await createPostgresApp({ agentId, token });
+    const headers = { ...contentHeaders, authorization: `Bearer ${token}` };
+    const first = await app.inject({ method: "POST", url: `/api/v1/agent/commands/${commandId}/complete`, headers, payload: { output: { secret: "sk_1234567890secret" } } });
+    const retry = await app.inject({ method: "POST", url: `/api/v1/agent/commands/${commandId}/complete`, headers, payload: {} });
+    expect(first.statusCode).toBe(200);
+    expect(retry.statusCode).toBe(200);
+    expect(await commands.findById(commandId)).toMatchObject({ state: "completed" });
+    expect(await deployments.findById(deploymentId)).toMatchObject({ status: "succeeded" });
+    expect(await deployments.listLogs(deploymentId)).toEqual([expect.objectContaining({ message: "Agent completed deployment command; deployment succeeded.", requestId: "req_pg_agent" })]);
+    expect(await requirePool().query("SELECT action FROM audit_events WHERE target_id = $1", [commandId])).toMatchObject({ rows: [expect.objectContaining({ action: "deployment.command.completed" })] });
+    await commands.cancel(commandId, null, new Date().toISOString());
+    expect((await commands.findById(commandId))?.state).toBe("completed");
+    const failedDeploymentId = randomUUID();
+    const failedCommandId = randomUUID();
+    await deployments.save({ id: failedDeploymentId, projectId, agentId, status: "running", commitSha: "abcdef2", startedAt: now.toISOString(), finishedAt: null });
+    await commands.save({ id: failedCommandId, deploymentId: failedDeploymentId, agentId, kind: "start", state: "pending", payload: {}, requestedBy: null, requestId: "req_pg_agent_fail", correlationId: "corr_pg_agent_fail", issuedAt: now.toISOString(), claimedAt: null, leaseExpiresAt: null, completedAt: null, failureReason: null });
+    await commands.claim(failedCommandId, agentId, now.toISOString(), new Date(now.getTime() + 60_000).toISOString());
+    const failure = await app.inject({ method: "POST", url: `/api/v1/agent/commands/${failedCommandId}/fail`, headers, payload: { reason: "agent build failed" } });
+    expect(failure.statusCode).toBe(200);
+    expect(await commands.findById(failedCommandId)).toMatchObject({ state: "failed", failureReason: "agent build failed" });
+    expect(await deployments.findById(failedDeploymentId)).toMatchObject({ status: "failed" });
+    expect(await deployments.listLogs(failedDeploymentId)).toEqual([expect.objectContaining({ message: "Agent reported deployment failure: agent build failed", requestId: "req_pg_agent_fail" })]);
+    expect(await requirePool().query("SELECT action FROM audit_events WHERE target_id = $1", [failedCommandId])).toMatchObject({ rows: [expect.objectContaining({ action: "deployment.command.failed" })] });
+    await app.close();
+  }, 30_000);
 });
 
-async function createPostgresApp(): Promise<FastifyInstance> {
+async function createPostgresApp(agent?: { agentId: string; token: string }): Promise<FastifyInstance> {
   return buildApiApp({
     authConfig: { cookieName: "dl_pg_session", cookieSecure: false, sessionTtlSeconds: 3600 },
     db: { pool: requirePool(), client: requireDb() },
-    env: { ...process.env, NODE_ENV: "test", DATABASE_URL: databaseUrl, DEPLOYLITE_BCRYPT_COST: "10" }
+    env: { ...process.env, NODE_ENV: "test", DATABASE_URL: databaseUrl, DEPLOYLITE_BCRYPT_COST: "10", ...(agent ? { DEPLOYLITE_AGENT_ID: agent.agentId, DEPLOYLITE_AGENT_TOKEN: agent.token } : {}) }
   });
 }
 

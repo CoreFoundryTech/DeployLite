@@ -11,7 +11,7 @@ import {
   type ProjectRepository
 } from "@deploylite/domain";
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { buildApiApp } from "./app.js";
+import { buildApiApp, InMemoryAuditRepository } from "./app.js";
 
 const agentId = "11111111-1111-4111-8111-111111111111";
 const otherAgentId = "22222222-2222-4222-8222-222222222222";
@@ -74,6 +74,7 @@ async function fixture(commandOverrides: Partial<DeploymentCommand> = {}, regist
   const commands = commandRepository ?? new InMemoryDeploymentCommandRepository();
   const metadata = new InMemoryEnvVariableMetadataRepository();
   const secrets = new InMemoryEnvSecretValueRepository();
+  const audit = new InMemoryAuditRepository();
   const cipher = createEnvSecretCipher(loadEnvSecretKey(secretKey));
   const agent: Agent = { id: agentId, name: "Agent", endpoint: "http://agent.test", status: "online", lastHeartbeatAt: null, resourceSnapshot: null };
   const project: Project = { id: projectId, name: "Service", repoUrl: "https://github.com/acme/service.git", defaultBranch: "main", buildCommand: null, runCommand: null, port: 3000, description: null, imageTag: null };
@@ -87,6 +88,7 @@ async function fixture(commandOverrides: Partial<DeploymentCommand> = {}, regist
   const app = await buildApiApp({
     db: { pool: {} as never, client: {} as never },
     env: { NODE_ENV: "test", DATABASE_URL: "postgres://user:pass@localhost:5432/deploylite", DEPLOYLITE_AGENT_ID: agentId, DEPLOYLITE_AGENT_TOKEN: token, DEPLOYLITE_SECRET_KEY: secretKey },
+    auth: { audit },
     state: { agents, deployments, projects, deploymentCommands: commands, envMetadata: metadata, envSecretValues: secrets, envSecretMaterialization: secrets, envSecretCipher: cipher },
     now,
     commandReconciliationIntervalMs
@@ -102,7 +104,7 @@ async function fixture(commandOverrides: Partial<DeploymentCommand> = {}, regist
     return new Response(response.statusCode === 204 ? null : response.body, { status: response.statusCode, headers: response.headers as Record<string, string> });
   });
   const transport = new TestAgentTransport(fetch);
-  return { app, agents, commands, deployments, projects, metadata, secrets, transport };
+  return { app, agents, commands, deployments, projects, metadata, secrets, audit, transport };
 }
 
 afterEach(() => { vi.useRealTimers(); vi.restoreAllMocks(); });
@@ -300,23 +302,14 @@ describe("agent command HTTP transport integration", () => {
     let entered!: () => void;
     const gate = new Promise<void>((resolve) => { release = resolve; });
     const arrival = new Promise<void>((resolve) => { entered = resolve; });
-    const repository: DeploymentCommandRepository = {
-      save: (record) => inner.save(record),
-      claim: (...args) => inner.claim(...args),
-      renewLease: (...args) => inner.renewLease(...args),
-      findById: (id) => inner.findById(id),
-      findActiveForDeployment: (id) => inner.findActiveForDeployment(id),
-      list: () => inner.list(),
-      async transitionTerminal(...args) {
-        if (args[3].state === "completed") {
-          entered();
-          await gate;
-        }
-        return inner.transitionTerminal(...args);
-      }
-    };
+    const projectTerminal = inner.projectTerminal.bind(inner);
+    vi.spyOn(inner, "projectTerminal").mockImplementation(async (...args) => {
+      entered();
+      await gate;
+      return projectTerminal(...args);
+    });
     let now = new Date("2026-07-10T00:00:29.000Z");
-    const test = await fixture({ state: "claimed", claimedAt: "2026-07-10T00:00:00.000Z", leaseExpiresAt: "2026-07-10T00:00:30.000Z" }, true, () => now, undefined, repository);
+    const test = await fixture({ state: "claimed", claimedAt: "2026-07-10T00:00:00.000Z", leaseExpiresAt: "2026-07-10T00:00:30.000Z" }, true, () => now, undefined, inner);
     const headers = { authorization: `Bearer ${token}`, "content-type": "application/json" };
 
     const completion = test.app.inject({ method: "POST", url: `/api/v1/agent/commands/${commandId}/complete`, headers, payload: {} });
@@ -329,7 +322,7 @@ describe("agent command HTTP transport integration", () => {
     expect(response.json()).toMatchObject({ data: { authoritativeCommand: { state: "failed", failureReason: expect.stringContaining("lease expired") }, attemptedState: "completed" } });
     expect(await test.commands.findById(commandId)).toMatchObject({ state: "failed" });
     expect(await test.deployments.findById(deploymentId)).toMatchObject({ status: "failed", finishedAt: "2026-07-10T00:00:30.000Z" });
-    expect((await test.deployments.listLogs(deploymentId)).filter((log) => log.message.startsWith("Agent command failed"))).toHaveLength(1);
+    expect((await test.deployments.listLogs(deploymentId)).filter((log) => log.message.startsWith("Agent command lease expired"))).toHaveLength(1);
   });
 
   it("returns cancelled as the authoritative conflict for late complete and fail without changing its projection", async () => {

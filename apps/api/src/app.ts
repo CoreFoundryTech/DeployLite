@@ -484,7 +484,10 @@ function createApiState(env: EnvSecretKeySource, overrides: Partial<PlatformRepo
   const deployments = overrides.deployments ?? new InMemoryDeploymentRepository();
   const projects = overrides.projects ?? new InMemoryProjectRepository();
   const deploymentCommands = overrides.deploymentCommands ?? new InMemoryDeploymentCommandRepository(deployments as InMemoryDeploymentRepository);
-  if (deploymentCommands instanceof InMemoryDeploymentCommandRepository && deployments instanceof InMemoryDeploymentRepository) deploymentCommands.bindDeployments(deployments);
+  if (deploymentCommands instanceof InMemoryDeploymentCommandRepository && deployments instanceof InMemoryDeploymentRepository) {
+    deploymentCommands.bindDeployments(deployments);
+    deploymentCommands.bindNow(now);
+  }
   const envMetadata = overrides.envMetadata ?? new InMemoryEnvVariableMetadataRepository();
   const envSecretValues = overrides.envSecretValues ?? new InMemoryEnvSecretValueRepository();
   const envSecretMaterialization = overrides.envSecretMaterialization ?? asEnvSecretMaterializationRepository(envSecretValues);
@@ -793,6 +796,31 @@ async function projectAuthoritativeTerminalCommand(
       message: "Deployment command cancelled; deployment was canceled."
     });
   }
+}
+
+async function projectLiveAgentTerminalCommand(
+  state: PlatformRepositories,
+  command: DeploymentCommand,
+  terminalState: "completed" | "failed",
+  message: string,
+  output?: Record<string, unknown>,
+  failureReason?: string,
+  leaseCondition?: "live" | "expired"
+): Promise<DeploymentCommand | null> {
+  const deployment = await state.deployments.findById(command.deploymentId);
+  if (!deployment || deployment.agentId !== command.agentId) throw new Error("Linked deployment is unavailable for agent lifecycle update");
+  const failed = terminalState === "failed";
+  const finishedAt = state.now().toISOString();
+  return state.deploymentCommandBus.projectTerminal(command.id, command.agentId, {
+    deployment: { ...deployment, status: failed ? "failed" : "succeeded", finishedAt },
+    expectedDeploymentStatus: deployment.status,
+    terminalState,
+    leaseCondition,
+    failureReason: failureReason ?? null,
+    output,
+    log: { id: createRequestId(), deploymentId: deployment.id, level: failed ? "error" : "info", message, timestamp: finishedAt, redactionApplied: true, requestId: command.requestId, correlationId: command.correlationId },
+    audit: { action: failed ? "deployment.command.failed" : "deployment.command.completed", targetType: "deployment-command", targetId: command.id, requestId: command.requestId, correlationId: command.correlationId, metadata: { deploymentId: deployment.id } }
+  });
 }
 
 async function terminallyFailAgentCommand(state: PlatformRepositories, command: DeploymentCommand, reason: string, marker = "Agent command rejected"): Promise<DeploymentCommand | null> {
@@ -1121,9 +1149,20 @@ function registerRoutes(app: FastifyInstance, state: PlatformRepositories, adapt
       if (authoritative && authoritative.state !== "claimed") return reply.code(409).send(terminalConflictResponse(request, authoritative, "completed"));
       if (!authoritative) return reply.code(404).send(errorEnvelope(request, "NOT_FOUND", "Command not found."));
     }
-    const completed = await state.deploymentCommandBus.complete(existing.id, body.data.output ? redactSecrets(body.data.output) : undefined);
+    const completed = await projectLiveAgentTerminalCommand(state, existing, "completed", "Agent completed deployment command; deployment succeeded.", body.data.output ? redactSecrets(body.data.output) : undefined);
     if (!completed) return reply.code(404).send(errorEnvelope(request, "NOT_FOUND", "Command not found."));
-    await projectAuthoritativeTerminalCommand(state, completed);
+    if (completed.state === "claimed") {
+      const expired = await projectLiveAgentTerminalCommand(
+        state,
+        existing,
+        "failed",
+        "Agent command lease expired; completion was rejected.",
+        undefined,
+        "Agent command lease expired; completion was rejected.",
+        "expired"
+      );
+      if (expired) return reply.code(409).send(terminalConflictResponse(request, expired, "completed"));
+    }
     if (completed.state !== "completed") return reply.code(409).send(terminalConflictResponse(request, completed, "completed"));
     return reply.send(completed);
   });
@@ -1148,14 +1187,13 @@ function registerRoutes(app: FastifyInstance, state: PlatformRepositories, adapt
       return reply.code(409).send(terminalConflictResponse(request, existing, "failed"));
     }
     if (existing.state !== "claimed") return reply.code(409).send(errorEnvelope(request, "COMMAND_STATE_CONFLICT", "Command cannot fail in its current state."));
-    const failed = await state.deploymentCommandBus.fail(existing.id, safeReason);
+    const failed = await projectLiveAgentTerminalCommand(state, existing, "failed", `Agent reported deployment failure: ${safeReason}`, undefined, safeReason);
     if (!failed) return reply.code(404).send(errorEnvelope(request, "NOT_FOUND", "Command not found."));
     if (failed.state === "claimed") {
       const authoritative = await state.deploymentCommandBus.findById(existing.id);
       if (!authoritative) return reply.code(404).send(errorEnvelope(request, "NOT_FOUND", "Command not found."));
       return reply.code(409).send(leaseConflictResponse(request, authoritative, "failed"));
     }
-    await projectAuthoritativeTerminalCommand(state, failed, { marker: "Agent reported deployment failure", message: `Agent reported deployment failure: ${safeReason}` });
     if (failed.state !== "failed") return reply.code(409).send(terminalConflictResponse(request, failed, "failed"));
     return reply.send(failed);
   });
@@ -1627,6 +1665,9 @@ export async function buildApiApp(options: BuildApiAppOptions = {}): Promise<Fas
     ...options.authConfig
   };
   const repositories = await createRuntimeRepositories(env, options);
+  if (repositories.state.deploymentCommands instanceof InMemoryDeploymentCommandRepository) {
+    repositories.state.deploymentCommands.bindAudit(repositories.auth.audit);
+  }
   if (repositories.close) {
     app.addHook("onClose", repositories.close);
   }

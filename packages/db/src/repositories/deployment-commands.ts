@@ -163,7 +163,10 @@ export class DbDeploymentCommandRepository implements DeploymentCommandRepositor
   async #project(commandId: string, agentId: string, projection: DeploymentLifecycleProjection, terminal: boolean): Promise<{ command: DeploymentCommandRecord; applied: boolean } | null> {
     return this.db.transaction(async (tx) => {
       const commandSet = terminal ? { state: projection.terminalState!, completedAt: new Date(), leaseExpiresAt: null, failureReason: projection.failureReason ?? null, payload: projection.output ? sql`${deploymentCommands.payload} || ${JSON.stringify({ output: projection.output })}::jsonb` : deploymentCommands.payload, updatedAt: new Date() } : { updatedAt: new Date() };
-      const [command] = await tx.update(deploymentCommands).set(commandSet).where(and(eq(deploymentCommands.id, commandId), eq(deploymentCommands.agentId, agentId), eq(deploymentCommands.state, "claimed"), gt(deploymentCommands.leaseExpiresAt, sql`clock_timestamp()`))).returning();
+      const leaseMatches = projection.leaseCondition === "expired"
+        ? lte(deploymentCommands.leaseExpiresAt, sql`clock_timestamp()`)
+        : gt(deploymentCommands.leaseExpiresAt, sql`clock_timestamp()`);
+      const [command] = await tx.update(deploymentCommands).set(commandSet).where(and(eq(deploymentCommands.id, commandId), eq(deploymentCommands.agentId, agentId), eq(deploymentCommands.state, "claimed"), leaseMatches)).returning();
       if (!command) {
         const authoritative = await tx.select().from(deploymentCommands).where(eq(deploymentCommands.id, commandId)).limit(1);
         return authoritative[0] ? { command: toDeploymentCommand(authoritative[0]), applied: false } : null;
@@ -173,6 +176,17 @@ export class DbDeploymentCommandRepository implements DeploymentCommandRepositor
       const [allocation] = await tx.insert(deploymentLogSequences).values({ deploymentId: projection.deployment.id, nextSequence: 2 }).onConflictDoUpdate({ target: deploymentLogSequences.deploymentId, set: { nextSequence: sql`${deploymentLogSequences.nextSequence} + 1` } }).returning({ sequence: sql<number>`${deploymentLogSequences.nextSequence} - 1` });
       if (!allocation) throw new Error("Lifecycle projection could not allocate log sequence");
       await tx.insert(deploymentLogs).values({ ...projection.log, sequence: allocation.sequence, message: redactLogMessage(projection.log.message), redactionApplied: true });
+      if (projection.audit) {
+        await tx.insert(auditEvents).values({
+          actorUserId: projection.audit.actorUserId ?? null,
+          action: projection.audit.action,
+          targetType: projection.audit.targetType,
+          targetId: projection.audit.targetId,
+          requestId: projection.audit.requestId,
+          correlationId: projection.audit.correlationId,
+          metadata: projection.audit.metadata ?? {}
+        });
+      }
       return { command: toDeploymentCommand(command), applied: true };
     });
   }

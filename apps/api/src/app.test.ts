@@ -18,6 +18,7 @@ import {
 } from "@deploylite/domain";
 import { createEnvSecretCipher, loadEnvSecretKey } from "@deploylite/config";
 import { readFile } from "node:fs/promises";
+import { randomUUID } from "node:crypto";
 import { describe, expect, it } from "vitest";
 import { buildApiApp, createRuntimeRepositories, InMemoryAuditRepository, InMemoryAuthUserRepository, InMemorySessionRepository } from "./app.js";
 
@@ -150,6 +151,27 @@ function metadataRepositories() {
 async function loginCookie(app: Awaited<ReturnType<typeof buildApiApp>>, email = "admin@example.test") {
   const response = await app.inject({ method: "POST", url: "/api/v1/auth/login", headers: contentHeaders, payload: { email, password } });
   return response.headers["set-cookie"] as string;
+}
+
+async function realAgentLifecycleFixture() {
+  const agentId = randomUUID();
+  const deploymentId = randomUUID();
+  const commandId = randomUUID();
+  const now = new Date("2026-01-01T00:00:00.000Z");
+  const agents = new InMemoryAgentRepository();
+  const deployments = new InMemoryDeploymentRepository();
+  const commands = new InMemoryDeploymentCommandRepository(deployments, () => now);
+  await agents.save({ id: agentId, name: "Real agent", endpoint: "https://agent.example.test", status: "online", lastHeartbeatAt: now.toISOString(), resourceSnapshot: null });
+  await deployments.save({ id: deploymentId, projectId: randomUUID(), agentId, status: "running", commitSha: "abcdef1", startedAt: now.toISOString(), finishedAt: null });
+  await commands.save({ id: commandId, deploymentId, agentId, kind: "start", state: "pending", payload: {}, requestedBy: null, requestId: "req_real_agent", correlationId: "corr_real_agent", issuedAt: now.toISOString(), claimedAt: null, leaseExpiresAt: null, completedAt: null, failureReason: null });
+  await commands.claim(commandId, agentId, now.toISOString(), new Date(now.getTime() + 60_000).toISOString());
+  const token = "agent-test-token-with-at-least-32-characters";
+  const fixture = await authFixture({
+    env: { ...testEnv, DEPLOYLITE_AGENT_ID: agentId, DEPLOYLITE_AGENT_TOKEN: token },
+    now: () => now,
+    state: { agents, deployments, deploymentCommands: commands }
+  });
+  return { ...fixture, agentId, commandId, commands, deploymentId, deployments, token };
 }
 
 describe("DeployLite API scaffold", () => {
@@ -1614,6 +1636,42 @@ describe("DeployLite API scaffold", () => {
 });
 
 describe("Phase 5 slice 1 — DeploymentCommandBus control plane", () => {
+  it("atomically projects real-agent completion with one correlated log and audit event across retries", async () => {
+    const fixture = await realAgentLifecycleFixture();
+    const headers = { ...contentHeaders, authorization: `Bearer ${fixture.token}` };
+
+    const first = await fixture.app.inject({ method: "POST", url: `/api/v1/agent/commands/${fixture.commandId}/complete`, headers, payload: { output: { token: "sk_1234567890secret" } } });
+    const retry = await fixture.app.inject({ method: "POST", url: `/api/v1/agent/commands/${fixture.commandId}/complete`, headers, payload: { output: { token: "sk_1234567890secret" } } });
+
+    expect(first.statusCode).toBe(200);
+    expect(retry.statusCode).toBe(200);
+    expect(await fixture.commands.findById(fixture.commandId)).toMatchObject({ state: "completed" });
+    expect(await fixture.deployments.findById(fixture.deploymentId)).toMatchObject({ status: "succeeded" });
+    expect(await fixture.deployments.listLogs(fixture.deploymentId)).toEqual([expect.objectContaining({ requestId: "req_real_agent", correlationId: "corr_real_agent", message: "Agent completed deployment command; deployment succeeded." })]);
+    expect(fixture.audit.inputs).toEqual([expect.objectContaining({ action: "deployment.command.completed", targetId: fixture.commandId })]);
+    await fixture.app.close();
+  });
+
+  it("keeps cancellation and expired leases authoritative over real-agent terminal acknowledgements", async () => {
+    const cancelled = await realAgentLifecycleFixture();
+    await cancelled.commands.cancel(cancelled.commandId, "operator", "2026-01-01T00:00:00.000Z");
+    const cancelledAck = await cancelled.app.inject({ method: "POST", url: `/api/v1/agent/commands/${cancelled.commandId}/fail`, headers: { ...contentHeaders, authorization: `Bearer ${cancelled.token}` }, payload: { reason: "secret sk_1234567890secret" } });
+    expect(cancelledAck.statusCode).toBe(409);
+    expect(await cancelled.commands.findById(cancelled.commandId)).toMatchObject({ state: "cancelled" });
+    expect(await cancelled.deployments.findById(cancelled.deploymentId)).toMatchObject({ status: "canceled" });
+    expect(cancelled.audit.inputs).toEqual([expect.objectContaining({ action: "deployment.command.cancelled", targetId: cancelled.commandId })]);
+    await cancelled.app.close();
+
+    const expired = await realAgentLifecycleFixture();
+    const expiredCommand = await expired.commands.findById(expired.commandId);
+    await expired.commands.save({ ...expiredCommand!, leaseExpiresAt: "2025-12-31T23:59:59.000Z" });
+    const expiredAck = await expired.app.inject({ method: "POST", url: `/api/v1/agent/commands/${expired.commandId}/complete`, headers: { ...contentHeaders, authorization: `Bearer ${expired.token}` }, payload: {} });
+    expect(expiredAck.statusCode).toBe(409);
+    expect(await expired.commands.findById(expired.commandId)).toMatchObject({ state: "failed" });
+    expect(await expired.deployments.findById(expired.deploymentId)).toMatchObject({ status: "failed" });
+    await expired.app.close();
+  });
+
   it("creates UUID-backed agent, project, and deployment records with command-compatible foreign keys", async () => {
     const deploymentCommands = new InMemoryDeploymentCommandRepository();
     const { app } = await authFixture({ state: { deploymentCommands } });

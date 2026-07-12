@@ -145,6 +145,8 @@ export type DeploymentLifecycleProjection = {
   deployment: Deployment;
   expectedDeploymentStatus: Deployment["status"];
   log: Omit<LogEvent, "sequence">;
+  audit?: AuditEventInput;
+  leaseCondition?: "live" | "expired";
   terminalState?: "completed" | "failed";
   failureReason?: string | null;
   output?: Record<string, unknown>;
@@ -541,11 +543,15 @@ export class InMemoryDeploymentRepository implements DeploymentRepository {
 export class InMemoryDeploymentCommandRepository implements DeploymentCommandRepository {
   readonly #commands = new Map<string, DeploymentCommandRecord>();
   #deployments: InMemoryDeploymentRepository | undefined;
+  #audit: AuditRepository | undefined;
+  #now: () => Date;
   constructor(
     deployments?: InMemoryDeploymentRepository,
-    private readonly now: () => Date = () => new Date()
-  ) { this.#deployments = deployments; }
+    now: () => Date = () => new Date()
+  ) { this.#deployments = deployments; this.#now = now; }
   bindDeployments(deployments: InMemoryDeploymentRepository): void { this.#deployments = deployments; }
+  bindAudit(audit: AuditRepository): void { this.#audit = audit; }
+  bindNow(now: () => Date): void { this.#now = now; }
 
   async save(command: DeploymentCommandRecord): Promise<DeploymentCommandRecord> {
     const clone = structuredClone(command);
@@ -607,6 +613,7 @@ export class InMemoryDeploymentCommandRepository implements DeploymentCommandRep
       deployment.status,
       { id: `cancel_${existing.id}`, deploymentId: deployment.id, level: "error", message: "Deployment command cancelled; deployment was canceled.", timestamp: now, redactionApplied: true, requestId: existing.requestId, correlationId: existing.correlationId }
     )) return { command: structuredClone(existing), applied: false };
+    if (this.#audit) await this.#audit.append({ action: "deployment.command.cancelled", targetType: "deployment-command", targetId: existing.id, requestId: existing.requestId, correlationId: existing.correlationId, metadata: { deploymentId: existing.deploymentId } });
     const command = structuredClone({ ...existing, state: "cancelled" as const, completedAt: now, leaseExpiresAt: null, payload: requestedBy ? { ...existing.payload, cancelledBy: requestedBy } : existing.payload });
     this.#commands.set(command.id, command);
     return { command: structuredClone(command), applied: true };
@@ -615,9 +622,14 @@ export class InMemoryDeploymentCommandRepository implements DeploymentCommandRep
   async #project(commandId: string, agentId: string, projection: DeploymentLifecycleProjection, terminal: boolean): Promise<{ command: DeploymentCommandRecord; applied: boolean } | null> {
     const existing = this.#commands.get(commandId);
     if (!existing || existing.agentId !== agentId) return null;
-    if (existing.state !== "claimed" || !existing.leaseExpiresAt || existing.leaseExpiresAt <= this.now().toISOString()) return { command: structuredClone(existing), applied: false };
+    const leaseCondition = projection.leaseCondition ?? "live";
+    const leaseMatches = leaseCondition === "expired"
+      ? Boolean(existing.leaseExpiresAt && existing.leaseExpiresAt <= this.#now().toISOString())
+      : Boolean(existing.leaseExpiresAt && existing.leaseExpiresAt > this.#now().toISOString());
+    if (existing.state !== "claimed" || !leaseMatches) return { command: structuredClone(existing), applied: false };
     if (!this.#deployments || !this.#deployments.project(projection.deployment, projection.expectedDeploymentStatus, projection.log)) return { command: structuredClone(existing), applied: false };
-    const command = terminal ? structuredClone({ ...existing, state: projection.terminalState!, completedAt: this.now().toISOString(), leaseExpiresAt: null, failureReason: projection.failureReason ?? null, payload: projection.output ? { ...existing.payload, output: projection.output } : existing.payload }) : structuredClone(existing);
+    if (projection.audit && this.#audit) await this.#audit.append(projection.audit);
+    const command = terminal ? structuredClone({ ...existing, state: projection.terminalState!, completedAt: this.#now().toISOString(), leaseExpiresAt: null, failureReason: projection.failureReason ?? null, payload: projection.output ? { ...existing.payload, output: projection.output } : existing.payload }) : structuredClone(existing);
     this.#commands.set(command.id, command);
     return { command: structuredClone(command), applied: true };
   }
