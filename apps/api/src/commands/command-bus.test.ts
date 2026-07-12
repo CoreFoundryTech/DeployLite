@@ -111,7 +111,8 @@ describe("DeploymentCommandBusService", () => {
         if (arrivals === 2) release();
         await barrier;
         return inner.transitionTerminal(...args);
-      }
+      },
+      projectTerminal: (...args) => inner.projectTerminal(...args)
     };
     const completeBus = new DeploymentCommandBusService(repository, () => new Date(NOW));
     const expiryBus = new DeploymentCommandBusService(repository, () => new Date(NOW));
@@ -169,7 +170,8 @@ describe("DeploymentCommandBusService", () => {
           await competingGate.promise;
         }
         return inner.transitionTerminal(...args);
-      }
+      },
+      projectTerminal: (...args) => inner.projectTerminal(...args)
     };
     const cancelBus = new DeploymentCommandBusService(repository, () => new Date(NOW));
     const competingBus = new DeploymentCommandBusService(repository, () => new Date(NOW));
@@ -231,7 +233,8 @@ describe("DeploymentCommandBusService", () => {
         expiryEntered.resolve();
         await expiryGate.promise;
         return inner.transitionTerminal(...args);
-      }
+      },
+      projectTerminal: (...args) => inner.projectTerminal(...args)
     };
     const claimBus = new DeploymentCommandBusService(repository, () => new Date(NOW));
     const renewalBus = new DeploymentCommandBusService(repository, () => new Date("2026-01-01T00:00:20.000Z"));
@@ -271,7 +274,8 @@ describe("DeploymentCommandBusService", () => {
         expiryEntered.resolve();
         await expiryGate.promise;
         return inner.transitionTerminal(...args);
-      }
+      },
+      projectTerminal: (...args) => inner.projectTerminal(...args)
     };
     const claimBus = new DeploymentCommandBusService(repository, () => new Date(NOW));
     const renewalBus = new DeploymentCommandBusService(repository, () => new Date("2026-01-01T00:00:20.000Z"));
@@ -309,7 +313,8 @@ describe("DeploymentCommandBusService", () => {
           await release.promise;
         }
         return inner.transitionTerminal(...args);
-      }
+      },
+      projectTerminal: (...args) => inner.projectTerminal(...args)
     };
     const bus = new DeploymentCommandBusService(repository, () => now);
     const command = await bus.submit(baseInput);
@@ -378,7 +383,8 @@ describe("DeploymentCommandBusService", () => {
       save: (value) => inner.save(value), claim: (...args) => inner.claim(...args), findById: (id) => inner.findById(id),
       findActiveForDeployment: (id) => inner.findActiveForDeployment(id), list: () => inner.list(),
       async renewLease(...args) { renewEntered.resolve(); await renewGate.promise; return inner.renewLease(...args); },
-      async transitionTerminal(...args) { failEntered.resolve(); await failGate.promise; return inner.transitionTerminal(...args); }
+      async transitionTerminal(...args) { failEntered.resolve(); await failGate.promise; return inner.transitionTerminal(...args); },
+      projectTerminal: (...args) => inner.projectTerminal(...args)
     };
     const claimBus = new DeploymentCommandBusService(repository, () => new Date(NOW));
     const raceBus = new DeploymentCommandBusService(repository, () => new Date("2026-01-01T00:00:20.000Z"));

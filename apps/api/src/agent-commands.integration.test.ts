@@ -313,7 +313,8 @@ describe("agent command HTTP transport integration", () => {
           await gate;
         }
         return inner.transitionTerminal(...args);
-      }
+      },
+      projectTerminal: (...args) => inner.projectTerminal(...args)
     };
     let now = new Date("2026-07-10T00:00:29.000Z");
     const test = await fixture({ state: "claimed", claimedAt: "2026-07-10T00:00:00.000Z", leaseExpiresAt: "2026-07-10T00:00:30.000Z" }, true, () => now, undefined, repository);

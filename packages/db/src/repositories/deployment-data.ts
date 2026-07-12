@@ -1,4 +1,4 @@
-import { asc, eq, isNotNull, sql } from "drizzle-orm";
+import { and, asc, eq, isNotNull, sql } from "drizzle-orm";
 import { redactLogMessage } from "@deploylite/config";
 import type { Agent, Deployment, LogEvent, Project } from "@deploylite/contracts";
 import type { AgentRepository, DeploymentRepository, ProjectRepository } from "@deploylite/domain";
@@ -149,6 +149,23 @@ export class DbDeploymentRepository implements DeploymentRepository {
     const saved = toDeployment(row);
     if (!saved) throw new Error("Failed to save attached deployment");
     return saved;
+  }
+
+  async saveWithLogIfStatus(deployment: Deployment, expectedStatus: Deployment["status"], event: Omit<LogEvent, "sequence">): Promise<Deployment | null> {
+    return this.db.transaction(async (tx) => {
+      const [row] = await tx.update(deployments).set({ status: deployment.status, finishedAt: deployment.finishedAt ? new Date(deployment.finishedAt) : null, updatedAt: new Date() })
+        .where(and(eq(deployments.id, deployment.id), eq(deployments.status, expectedStatus))).returning();
+      if (!row) return null;
+      const [allocation] = await tx.insert(deploymentLogSequences).values({ deploymentId: event.deploymentId, nextSequence: 2 })
+        .onConflictDoUpdate({ target: deploymentLogSequences.deploymentId, set: { nextSequence: sql`${deploymentLogSequences.nextSequence} + 1` } })
+        .returning({ sequence: sql<number>`${deploymentLogSequences.nextSequence} - 1` });
+      if (!allocation) throw new Error("Failed to allocate deployment log sequence");
+      const [log] = await tx.insert(deploymentLogs).values({ ...event, sequence: allocation.sequence, message: redactLogMessage(event.message), redactionApplied: true }).returning();
+      if (!log) throw new Error("Failed to append deployment log");
+      const saved = toDeployment(row);
+      if (!saved) throw new Error("Failed to save attached deployment");
+      return saved;
+    });
   }
 
   async findById(id: string): Promise<Deployment | null> {

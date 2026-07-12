@@ -118,6 +118,7 @@ export type { Deployment, Project } from "@deploylite/contracts";
 
 export type DeploymentRepository = {
   save(deployment: Deployment): Promise<Deployment>;
+  saveWithLogIfStatus(deployment: Deployment, expectedStatus: Deployment["status"], event: Omit<LogEvent, "sequence">): Promise<Deployment | null>;
   findById(id: string): Promise<Deployment | null>;
   list(): Promise<Deployment[]>;
   appendLog(event: LogEvent): Promise<LogEvent>;
@@ -174,6 +175,7 @@ export type DeploymentCommandBus = {
   failSystem(commandId: string, reason: string): Promise<DeploymentCommandRecord | null>;
   failExpiredClaim(commandId: string, reason: string): Promise<DeploymentCommandRecord | null>;
   cancel(commandId: string, requestedBy: string | null): Promise<DeploymentCommandRecord | null>;
+  projectTerminal(commandId: string, state: "completed" | "failed", deployment: Deployment, expectedStatus: Deployment["status"], event: Omit<LogEvent, "sequence">): Promise<DeploymentCommandRecord | null>;
   list(): Promise<DeploymentCommandRecord[]>;
   findById(commandId: string): Promise<DeploymentCommandRecord | null>;
   findActiveForDeployment(deploymentId: string): Promise<DeploymentCommandRecord | null>;
@@ -205,6 +207,7 @@ export type DeploymentCommandRepository = {
     next: Pick<DeploymentCommandRecord, "state" | "completedAt" | "leaseExpiresAt" | "failureReason" | "payload">,
     condition?: { leaseExpiresAtNotAfterNow: () => string } | { leaseExpiresAtAfterNow: () => string }
   ): Promise<{ command: DeploymentCommandRecord; applied: boolean } | null>;
+  projectTerminal(commandId: string, agentId: string, state: "completed" | "failed", deployment: Deployment, expectedStatus: Deployment["status"], event: Omit<LogEvent, "sequence">, deployments: DeploymentRepository): Promise<{ command: DeploymentCommandRecord; applied: boolean } | null>;
   findById(id: string): Promise<DeploymentCommandRecord | null>;
   findActiveForDeployment(deploymentId: string): Promise<DeploymentCommandRecord | null>;
   list(): Promise<DeploymentCommandRecord[]>;
@@ -480,6 +483,16 @@ export class InMemoryDeploymentRepository implements DeploymentRepository {
     return deployment;
   }
 
+  async saveWithLogIfStatus(deployment: Deployment, expectedStatus: Deployment["status"], event: Omit<LogEvent, "sequence">): Promise<Deployment | null> {
+    if (this.#deployments.get(deployment.id)?.status !== expectedStatus) return null;
+    const sequence = this.#nextLogSequence.get(deployment.id) ?? 1;
+    const log = { ...event, sequence, message: redactLogMessage(event.message), redactionApplied: true };
+    this.#logs.set(deployment.id, [...(this.#logs.get(deployment.id) ?? []), log]);
+    this.#nextLogSequence.set(deployment.id, sequence + 1);
+    this.#deployments.set(deployment.id, structuredClone(deployment));
+    return deployment;
+  }
+
   async findById(id: string): Promise<Deployment | null> {
     return this.#deployments.get(id) ?? null;
   }
@@ -552,6 +565,16 @@ export class InMemoryDeploymentCommandRepository implements DeploymentCommandRep
     const command = structuredClone({ ...existing, ...next });
     this.#commands.set(command.id, command);
     return { command: structuredClone(command), applied: true };
+  }
+
+  async projectTerminal(commandId: string, agentId: string, state: "completed" | "failed", deployment: Deployment, expectedStatus: Deployment["status"], event: Omit<LogEvent, "sequence">, deployments: DeploymentRepository): Promise<{ command: DeploymentCommandRecord; applied: boolean } | null> {
+    const command = this.#commands.get(commandId);
+    if (!command || command.agentId !== agentId) return null;
+    if (command.state !== "claimed") return { command, applied: false };
+    if (!(await deployments.saveWithLogIfStatus(deployment, expectedStatus, event))) return { command: this.#commands.get(commandId) ?? command, applied: false };
+    const next = { ...command, state, completedAt: new Date().toISOString(), leaseExpiresAt: null, failureReason: state === "failed" ? "Simulated agent marked the deployment failed" : null } as DeploymentCommandRecord;
+    this.#commands.set(commandId, next);
+    return { command: next, applied: true };
   }
 
   async findById(id: string): Promise<DeploymentCommandRecord | null> {

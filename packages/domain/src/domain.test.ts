@@ -152,4 +152,29 @@ describe("domain foundation", () => {
 
     expect(events.map((event) => event.sequence).sort((left, right) => left - right)).toEqual(Array.from({ length: 128 }, (_, index) => index + 1));
   });
+
+  it("keeps cancellation authoritative when it wins after the terminal command read and before projection", async () => {
+    const deployments = new InMemoryDeploymentRepository();
+    const commands = new InMemoryDeploymentCommandRepository();
+    const deployment = { id: "dep_1", projectId: "project_1", agentId: "agent_1", status: "running" as const, commitSha: "abcdef1", startedAt: now.toISOString(), finishedAt: null };
+    const command = { id: "cmd_1", deploymentId: deployment.id, agentId: deployment.agentId, kind: "start" as const, state: "claimed" as const, payload: {}, requestedBy: null, requestId: "req_1", correlationId: "req_1", issuedAt: now.toISOString(), claimedAt: now.toISOString(), leaseExpiresAt: "2026-01-01T00:00:30.000Z", completedAt: null, failureReason: null };
+    await deployments.save(deployment);
+    await commands.save(command);
+    const conditionalSave = deployments.saveWithLogIfStatus.bind(deployments);
+    let release!: () => void;
+    let reachedProjection!: () => void;
+    const projectionStarted = new Promise<void>((resolve) => { reachedProjection = resolve; });
+    const projectionRelease = new Promise<void>((resolve) => { release = resolve; });
+    deployments.saveWithLogIfStatus = async (...args) => { reachedProjection(); await projectionRelease; return conditionalSave(...args); };
+
+    const terminal = commands.projectTerminal(command.id, command.agentId, "completed", { ...deployment, status: "succeeded", finishedAt: now.toISOString() }, "running", { id: "log_1", deploymentId: deployment.id, level: "info", message: "Simulated agent marked the deployment succeeded", timestamp: now.toISOString(), redactionApplied: true, requestId: command.requestId, correlationId: command.correlationId }, deployments);
+    await projectionStarted;
+    await deployments.save({ ...deployment, status: "canceled", finishedAt: now.toISOString() });
+    await commands.transitionTerminal(command.id, command.agentId, "claimed", { state: "cancelled", completedAt: now.toISOString(), leaseExpiresAt: null, failureReason: null, payload: { cancelledBy: "user_1" } });
+    release();
+
+    await expect(terminal).resolves.toMatchObject({ applied: false, command: { state: "cancelled" } });
+    await expect(deployments.findById(deployment.id)).resolves.toMatchObject({ status: "canceled" });
+    await expect(deployments.listLogs(deployment.id)).resolves.toEqual([]);
+  });
 });

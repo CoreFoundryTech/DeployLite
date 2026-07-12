@@ -121,6 +121,10 @@ function metadataRepositories() {
       calls.push("deployments.save");
       throw new Error("metadata read routes must not create deployments");
     },
+    async saveWithLogIfStatus() {
+      calls.push("deployments.saveWithLogIfStatus");
+      throw new Error("metadata read routes must not create deployments");
+    },
     async findById(id) {
       calls.push("deployments.findById");
       return id === "dep-1" ? { id, projectId: "project-1", agentId: "agent-1", status: "running", commitSha: "abcdef1", startedAt: "2026-01-01T00:00:00.000Z", finishedAt: null } : null;
@@ -1773,6 +1777,11 @@ describe("Phase 5 slice 1 — DeploymentCommandBus control plane", () => {
         transitions.push({ deploymentId: deployment.id, status: deployment.status });
         return delegate.save(deployment);
       },
+      async saveWithLogIfStatus(deployment, expectedStatus, event) {
+        const saved = await delegate.saveWithLogIfStatus(deployment, expectedStatus, event);
+        if (saved) transitions.push({ deploymentId: deployment.id, status: deployment.status });
+        return saved;
+      },
       findById: (id) => delegate.findById(id),
       list: () => delegate.list(),
       appendLog: (event) => delegate.appendLog(event),
@@ -1816,8 +1825,7 @@ describe("Phase 5 slice 1 — DeploymentCommandBus control plane", () => {
 
     await app.close();
   });
-
-  it("marks the deployment failed when command submission fails", async () => {
+   it("marks the deployment failed when command submission fails", async () => {
     const deployments = new InMemoryDeploymentRepository();
     const deploymentCommands: DeploymentCommandRepository = {
       async save() {
@@ -1830,6 +1838,9 @@ describe("Phase 5 slice 1 — DeploymentCommandBus control plane", () => {
         throw new Error("command store unavailable");
       },
       async transitionTerminal() {
+        throw new Error("command store unavailable");
+      },
+      async projectTerminal() {
         throw new Error("command store unavailable");
       },
       async findById() {

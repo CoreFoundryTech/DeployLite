@@ -214,22 +214,22 @@ export class MockDeploymentExecutor implements DeploymentExecutor {
       if (existing.status === "failed" || existing.status === "succeeded" || existing.status === "canceled") return;
       const finishedAt = status === "running" ? null : new Date().toISOString();
       const next: Deployment = { ...existing, status, finishedAt };
-      await this.#deployments.save(next);
       const message =
         status === "running"
           ? "Simulated agent picked up the deployment. Real Docker execution is intentionally deferred."
           : status === "succeeded"
             ? "Simulated agent marked the deployment succeeded. Real container execution is intentionally deferred."
             : "Simulated agent marked the deployment failed.";
-      await this.#appendLog(next, status === "succeeded" ? "info" : status === "failed" ? "error" : "info", message, requestId, correlationId);
       if (status === "running") {
+        await this.#appendLog(next, "info", message, requestId, correlationId);
+        await this.#deployments.save(next);
         this.#scheduleAdvance(commandId, deploymentId, "succeeded", 200, requestId, correlationId);
+        return;
       }
-      if (status === "succeeded") {
-        await this.#bus.complete(commandId, { deploymentId });
-      } else if (status === "failed") {
-        await this.#bus.fail(commandId, "Simulated agent marked the deployment failed");
-      }
+      await this.#bus.projectTerminal(commandId, status === "succeeded" ? "completed" : "failed", next, existing.status, {
+        id: createRequestId(), deploymentId, level: status === "succeeded" ? "info" : "error", message,
+        timestamp: new Date().toISOString(), redactionApplied: true, requestId, correlationId
+      });
       void this.#agentStatus;
     }, delayMs);
     this.#timers.set(deploymentId, timer);
