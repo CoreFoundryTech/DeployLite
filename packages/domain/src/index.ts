@@ -588,12 +588,12 @@ export class InMemoryDeploymentCommandRepository implements DeploymentCommandRep
   async projectRunning(commandId: string, agentId: string, deployment: Deployment, expectedStatus: Deployment["status"], event: Omit<LogEvent, "sequence">, deployments: DeploymentRepository): Promise<{ command: DeploymentCommandRecord; applied: boolean } | null> {
     const command = this.#commands.get(commandId); if (!command || command.agentId !== agentId) return null;
     if (command.state !== "claimed") return { command, applied: false };
+    const leaseExpiresAt = command.leaseExpiresAt ? Date.parse(command.leaseExpiresAt) : Number.NaN; if (!Number.isFinite(leaseExpiresAt) || leaseExpiresAt <= this.now().getTime()) return { command, applied: false };
+    const previousDeployment = await deployments.findById(deployment.id); if (!previousDeployment) return { command, applied: false };
     const projected = await deployments.saveWithLogIfStatus(deployment, expectedStatus, event);
     const authoritative = this.#commands.get(commandId);
-    if (!projected || !authoritative || authoritative.state !== "claimed") {
-      if (projected) await deployments.rollbackTerminalProjection({ ...deployment, status: expectedStatus }, deployment, event.id);
-      return { command: authoritative ?? command, applied: false };
-    }
+    const authoritativeLeaseExpiresAt = authoritative?.leaseExpiresAt ? Date.parse(authoritative.leaseExpiresAt) : Number.NaN;
+    if (!projected || !authoritative || authoritative.state !== "claimed" || !Number.isFinite(authoritativeLeaseExpiresAt) || authoritativeLeaseExpiresAt <= this.now().getTime()) { if (projected) await deployments.rollbackTerminalProjection(previousDeployment, deployment, event.id); return { command: authoritative ?? command, applied: false }; }
     return { command: authoritative, applied: true };
   }
 

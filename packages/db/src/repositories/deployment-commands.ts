@@ -1,4 +1,4 @@
-import { and, asc, desc, eq, gt, inArray, lte, sql } from "drizzle-orm";
+import { and, asc, desc, eq, exists, gt, inArray, lte, sql } from "drizzle-orm";
 import { redactLogMessage } from "@deploylite/config";
 import type { Deployment, DeploymentCommandKind, DeploymentCommandState, LogEvent } from "@deploylite/contracts";
 import type {
@@ -132,10 +132,10 @@ export class DbDeploymentCommandRepository implements DeploymentCommandRepositor
 
   async projectRunning(commandId: string, agentId: string, deployment: Deployment, expectedStatus: Deployment["status"], event: Omit<LogEvent, "sequence">, _deployments: DeploymentRepository): Promise<{ command: DeploymentCommandRecord; applied: boolean } | null> {
     return this.db.transaction(async (tx) => {
-      const [current] = await tx.select().from(deploymentCommands).where(and(eq(deploymentCommands.id, commandId), eq(deploymentCommands.agentId, agentId))).for("update").limit(1);
-      if (!current) return null;
-      const command = toDeploymentCommand(current); if (command.state !== "claimed") return { command, applied: false };
-      const [projected] = await tx.update(deployments).set({ status: deployment.status, finishedAt: null, updatedAt: new Date() }).where(and(eq(deployments.id, deployment.id), eq(deployments.status, expectedStatus))).returning();
+      const [current] = await tx.select().from(deploymentCommands).where(and(eq(deploymentCommands.id, commandId), eq(deploymentCommands.agentId, agentId), eq(deploymentCommands.state, "claimed"), gt(deploymentCommands.leaseExpiresAt, sql`clock_timestamp()`))).for("update").limit(1);
+      if (!current) { const [authoritative] = await tx.select().from(deploymentCommands).where(and(eq(deploymentCommands.id, commandId), eq(deploymentCommands.agentId, agentId))).limit(1); return authoritative ? { command: toDeploymentCommand(authoritative), applied: false } : null; }
+      const command = toDeploymentCommand(current);
+      const [projected] = await tx.update(deployments).set({ status: deployment.status, finishedAt: null, updatedAt: new Date() }).where(and(eq(deployments.id, deployment.id), eq(deployments.status, expectedStatus), exists(tx.select({ id: deploymentCommands.id }).from(deploymentCommands).where(and(eq(deploymentCommands.id, commandId), eq(deploymentCommands.agentId, agentId), eq(deploymentCommands.state, "claimed"), gt(deploymentCommands.leaseExpiresAt, sql`clock_timestamp()`)))))).returning();
       if (!projected) return { command, applied: false };
       const [allocation] = await tx.insert(deploymentLogSequences).values({ deploymentId: event.deploymentId, nextSequence: sql<number>`COALESCE((SELECT MAX(${deploymentLogs.sequence}) + 2 FROM ${deploymentLogs} WHERE ${deploymentLogs.deploymentId} = ${event.deploymentId}), 2)` }).onConflictDoUpdate({ target: deploymentLogSequences.deploymentId, set: { nextSequence: sql`GREATEST(${deploymentLogSequences.nextSequence}, COALESCE((SELECT MAX(${deploymentLogs.sequence}) + 1 FROM ${deploymentLogs} WHERE ${deploymentLogs.deploymentId} = ${event.deploymentId}), 1)) + 1` } }).returning({ sequence: sql<number>`${deploymentLogSequences.nextSequence} - 1` });
       if (!allocation) throw new Error("Failed to allocate deployment log sequence");

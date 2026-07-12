@@ -410,6 +410,12 @@ describeIntegration("PostgreSQL auth foundation integration", () => {
     await expect(requireDbDeploymentRepository().listLogs(expired.deployment.id)).resolves.toEqual([]);
   });
 
+  it("rejects expired claimed running projections without changing deployment logs", async () => {
+    const expired = await createClaimedDeploymentCommand(new Date("2000-01-01T00:00:00.000Z"));
+    await expect(requireDbDeploymentCommandRepository().projectRunning(expired.command.id, expired.command.agentId, expired.deployment, "running", terminalLog(expired.deployment.id, "expired lease must not start"), requireDbDeploymentRepository())).resolves.toMatchObject({ applied: false, command: { id: expired.command.id, state: "claimed" } });
+    await expect(requireDbDeploymentRepository().listLogs(expired.deployment.id)).resolves.toEqual([]);
+  });
+
   it("rejects a claimed terminal projection when its lease equals the authoritative database clock", async () => {
     const controlledClock = "2042-02-03T04:05:06.000Z";
     const boundary = await createClaimedDeploymentCommand(new Date(controlledClock));

@@ -222,7 +222,7 @@ export class DeploymentCommandBusService implements DeploymentCommandBus {
     return result?.command ?? null;
   }
 
-  async projectRunning(commandId: string, deployment: Deployment, expectedStatus: Deployment["status"], event: Omit<LogEvent, "sequence">, deployments: DeploymentRepository): Promise<DeploymentCommandRecord | null> { const command = await this.#repository.findById(commandId); if (!command) return command; if (!this.#repository.projectRunning) return null; return (await this.#repository.projectRunning(commandId, command.agentId, deployment, expectedStatus, event, this.deployments ?? deployments))?.command ?? null; }
+  async projectRunning(commandId: string, deployment: Deployment, expectedStatus: Deployment["status"], event: Omit<LogEvent, "sequence">, deployments: DeploymentRepository): Promise<DeploymentCommandRecord | null> { const command = await this.#repository.findById(commandId); if (!command || !this.#repository.projectRunning) return null; const result = await this.#repository.projectRunning(commandId, command.agentId, deployment, expectedStatus, event, this.deployments ?? deployments); return result?.applied ? result.command : null; }
 
   async projectTerminal(commandId: string, state: "completed" | "failed", deployment: Deployment, expectedStatus: Deployment["status"], event: Omit<LogEvent, "sequence">): Promise<DeploymentCommandRecord | null> {
     const command = await this.#repository.findById(commandId);
