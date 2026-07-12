@@ -500,7 +500,7 @@ function createApiState(env: EnvSecretKeySource, overrides: Partial<PlatformRepo
   // the executor in the API process so the route surface stays
   // socket-free; a later slice will replace the in-process executor
   // with a real agent that runs in a Docker-socket-mounted container.
-  const deploymentCommandBus = new DeploymentCommandBusService(deploymentCommands, now);
+  const deploymentCommandBus = new DeploymentCommandBusService(deploymentCommands, now, deployments);
   const deploymentExecutor = new MockDeploymentExecutor({
     bus: deploymentCommandBus,
     deployments,

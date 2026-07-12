@@ -1773,6 +1773,12 @@ describe("Phase 5 slice 1 — DeploymentCommandBus control plane", () => {
         transitions.push({ deploymentId: deployment.id, status: deployment.status });
         return delegate.save(deployment);
       },
+      async saveWithLogIfStatus(deployment, expectedStatus, event) {
+        const saved = await delegate.saveWithLogIfStatus(deployment, expectedStatus, event);
+        if (saved) transitions.push({ deploymentId: deployment.id, status: deployment.status });
+        return saved;
+      },
+      rollbackProjection: (previous, projected, eventId) => delegate.rollbackProjection(previous, projected, eventId),
       findById: (id) => delegate.findById(id),
       list: () => delegate.list(),
       appendLog: (event) => delegate.appendLog(event),

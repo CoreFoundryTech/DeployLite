@@ -1,14 +1,15 @@
-import { and, asc, desc, eq, gt, inArray, lte, sql } from "drizzle-orm";
-import type { DeploymentCommandKind, DeploymentCommandState } from "@deploylite/contracts";
+import { and, asc, desc, eq, exists, gt, inArray, lte, sql } from "drizzle-orm";
+import { redactLogMessage } from "@deploylite/config";
+import type { Deployment, DeploymentCommandKind, DeploymentCommandState, LogEvent } from "@deploylite/contracts";
 import type {
   DeploymentCommandBusSubmitInput,
   DeploymentCommandEventType,
   DeploymentCommandRecord,
-  DeploymentCommandRepository
+  DeploymentCommandRepository, DeploymentRepository
 } from "@deploylite/domain";
 
 import type { DeployLiteDb } from "../client.js";
-import { deploymentCommands, deployments, agents, type DeploymentCommandRow, type NewDeploymentCommandRow } from "../schema.js";
+import { deploymentCommands, deploymentLogSequences, deploymentLogs, deployments, agents, type DeploymentCommandRow, type NewDeploymentCommandRow } from "../schema.js";
 
 const TERMINAL_STATES: ReadonlyArray<DeploymentCommandState> = ["completed", "cancelled", "failed"];
 
@@ -129,6 +130,36 @@ export class DbDeploymentCommandRepository implements DeploymentCommandRepositor
     return authoritative?.agentId === agentId ? { command: authoritative, applied: false } : null;
   }
 
+  async projectRunning(commandId: string, agentId: string, deployment: Deployment, expectedStatus: Deployment["status"], event: Omit<LogEvent, "sequence">, _deployments: DeploymentRepository): Promise<{ command: DeploymentCommandRecord; applied: boolean } | null> {
+    return this.#project(commandId, agentId, undefined, deployment, expectedStatus, event);
+  }
+
+  async projectTerminal(commandId: string, agentId: string, state: "completed" | "failed", deployment: Deployment, expectedStatus: Deployment["status"], event: Omit<LogEvent, "sequence">, _deployments: DeploymentRepository): Promise<{ command: DeploymentCommandRecord; applied: boolean } | null> {
+    return this.#project(commandId, agentId, state, deployment, expectedStatus, event);
+  }
+
+  async #project(commandId: string, agentId: string, terminalState: "completed" | "failed" | undefined, deployment: Deployment, expectedStatus: Deployment["status"], event: Omit<LogEvent, "sequence">): Promise<{ command: DeploymentCommandRecord; applied: boolean } | null> {
+    return this.db.transaction(async (tx) => {
+      const [current] = await tx.select().from(deploymentCommands).where(and(eq(deploymentCommands.id, commandId), eq(deploymentCommands.agentId, agentId))).for("update").limit(1);
+      if (!current) return null;
+      const command = toDeploymentCommand(current);
+      if (command.state !== "claimed" || !command.leaseExpiresAt || new Date(command.leaseExpiresAt) <= new Date()) return { command, applied: false };
+      const [projected] = await tx.update(deployments).set({ status: deployment.status, finishedAt: deployment.finishedAt ? new Date(deployment.finishedAt) : null, updatedAt: new Date() })
+        .where(and(eq(deployments.id, deployment.id), eq(deployments.status, expectedStatus), exists(tx.select({ id: deploymentCommands.id }).from(deploymentCommands).where(and(eq(deploymentCommands.id, commandId), eq(deploymentCommands.agentId, agentId), eq(deploymentCommands.state, "claimed"), gt(deploymentCommands.leaseExpiresAt, sql`clock_timestamp()`)))))).returning();
+      if (!projected) return { command, applied: false };
+      await appendAllocatedLog(tx, event);
+      if (!terminalState) return { command, applied: true };
+      const [terminal] = await tx.update(deploymentCommands).set({ state: terminalState, completedAt: new Date(), leaseExpiresAt: null, failureReason: terminalState === "failed" ? redactLogMessage(event.message) : null, updatedAt: new Date() })
+        .where(and(eq(deploymentCommands.id, commandId), eq(deploymentCommands.agentId, agentId), eq(deploymentCommands.state, "claimed"), gt(deploymentCommands.leaseExpiresAt, sql`clock_timestamp()`))).returning();
+      if (!terminal) throw new TerminalProjectionConflict();
+      return { command: toDeploymentCommand(terminal), applied: true };
+    }).catch(async (error) => {
+      if (!(error instanceof TerminalProjectionConflict)) throw error;
+      const command = await this.findById(commandId);
+      return command?.agentId === agentId ? { command, applied: false } : null;
+    });
+  }
+
   async findActiveForDeployment(deploymentId: string): Promise<DeploymentCommandRecord | null> {
     const [row] = await this.db
       .select()
@@ -143,6 +174,20 @@ export class DbDeploymentCommandRepository implements DeploymentCommandRepositor
     const rows = await this.db.select().from(deploymentCommands).orderBy(asc(deploymentCommands.issuedAt));
     return rows.map(toDeploymentCommand);
   }
+}
+
+class TerminalProjectionConflict extends Error {}
+
+async function appendAllocatedLog(tx: Parameters<DeployLiteDb["transaction"]>[0] extends (tx: infer Transaction) => unknown ? Transaction : never, event: Omit<LogEvent, "sequence">): Promise<void> {
+  const [allocation] = await tx.insert(deploymentLogSequences).values({
+    deploymentId: event.deploymentId,
+    nextSequence: sql<number>`COALESCE((SELECT MAX(${deploymentLogs.sequence}) + 2 FROM ${deploymentLogs} WHERE ${deploymentLogs.deploymentId} = ${event.deploymentId}), 2)`
+  }).onConflictDoUpdate({
+    target: deploymentLogSequences.deploymentId,
+    set: { nextSequence: sql`GREATEST(${deploymentLogSequences.nextSequence}, COALESCE((SELECT MAX(${deploymentLogs.sequence}) + 1 FROM ${deploymentLogs} WHERE ${deploymentLogs.deploymentId} = ${event.deploymentId}), 1)) + 1` }
+  }).returning({ sequence: sql<number>`${deploymentLogSequences.nextSequence} - 1` });
+  if (!allocation) throw new Error("Failed to allocate deployment log sequence");
+  await tx.insert(deploymentLogs).values({ ...event, sequence: allocation.sequence, message: redactLogMessage(event.message), redactionApplied: true });
 }
 
 export const DB_DEPLOYMENT_COMMAND_KINDS: ReadonlyArray<DeploymentCommandKind> = ["start", "cancel", "restart", "rollback"];

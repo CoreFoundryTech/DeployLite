@@ -1,5 +1,5 @@
 import { createRequestId, redactSecrets } from "@deploylite/config";
-import type { DeploymentCommandKind, DeploymentCommandState } from "@deploylite/contracts";
+import type { Deployment, DeploymentCommandKind, DeploymentCommandState, LogEvent } from "@deploylite/contracts";
 import {
   IllegalDeploymentCommandTransitionError,
   isDeploymentCommandTransitionAllowed,
@@ -10,6 +10,7 @@ import {
   type DeploymentCommandEventType,
   type DeploymentCommandRecord,
   type DeploymentCommandRepository,
+  type DeploymentRepository,
   type DeploymentExecutor
 } from "@deploylite/domain";
 import { DEPLOYMENT_COMMAND_LEASE_MS } from "@deploylite/domain";
@@ -42,7 +43,7 @@ export class DeploymentCommandBusService implements DeploymentCommandBus {
   readonly #listeners = new Set<DeploymentCommandEventListener>();
   #executor: DeploymentExecutor | null = null;
 
-  constructor(repository: DeploymentCommandRepository, private readonly now: () => Date = () => new Date()) {
+  constructor(repository: DeploymentCommandRepository, private readonly now: () => Date = () => new Date(), private readonly deployments?: DeploymentRepository) {
     this.#repository = repository;
   }
 
@@ -218,6 +219,21 @@ export class DeploymentCommandBusService implements DeploymentCommandBus {
     };
     const result = await this.#repository.transitionTerminal(existing.id, existing.agentId, existing.state, next);
     if (result?.applied) await this.#emit("deployment.command.cancelled", result.command);
+    return result?.command ?? null;
+  }
+
+  async projectRunning(commandId: string, deployment: Deployment, expectedStatus: Deployment["status"], event: Omit<LogEvent, "sequence">, deployments: DeploymentRepository): Promise<DeploymentCommandRecord | null> {
+    const command = await this.#repository.findById(commandId);
+    if (!command || !this.#repository.projectRunning) return null;
+    const result = await this.#repository.projectRunning(commandId, command.agentId, deployment, expectedStatus, event, this.deployments ?? deployments);
+    return result?.applied ? result.command : null;
+  }
+
+  async projectTerminal(commandId: string, state: "completed" | "failed", deployment: Deployment, expectedStatus: Deployment["status"], event: Omit<LogEvent, "sequence">): Promise<DeploymentCommandRecord | null> {
+    const command = await this.#repository.findById(commandId);
+    if (!command || !this.deployments || !this.#repository.projectTerminal) return command;
+    const result = await this.#repository.projectTerminal(commandId, command.agentId, state, deployment, expectedStatus, event, this.deployments);
+    if (result?.applied) await this.#emit(`deployment.command.${state}` as DeploymentCommandEventType, result.command);
     return result?.command ?? null;
   }
 
