@@ -172,6 +172,21 @@ describe("domain foundation", () => {
     await expect(deployments.listLogs(deployment.id)).resolves.toEqual([]);
   });
 
+  it("rejects running projections for expired and equal leases without a projection or log", async () => {
+    for (const leaseExpiresAt of ["2025-12-31T23:59:59.999Z", now.toISOString()]) {
+      const deployments = new InMemoryDeploymentRepository();
+      const commands = new InMemoryDeploymentCommandRepository(() => now);
+      const deployment = { id: `dep_${leaseExpiresAt}`, projectId: "project_1", agentId: "agent_1", status: "queued" as const, commitSha: "abcdef1", startedAt: now.toISOString(), finishedAt: null };
+      const command = { id: `cmd_${leaseExpiresAt}`, deploymentId: deployment.id, agentId: deployment.agentId, kind: "start" as const, state: "claimed" as const, payload: {}, requestedBy: null, requestId: "req_1", correlationId: "req_1", issuedAt: now.toISOString(), claimedAt: now.toISOString(), leaseExpiresAt, completedAt: null, failureReason: null };
+      await deployments.save(deployment);
+      await commands.save(command);
+
+      await expect(commands.projectRunning(command.id, command.agentId, { ...deployment, status: "running" }, "queued", { id: `log_${leaseExpiresAt}`, deploymentId: deployment.id, level: "info", message: "expired lease must not project running", timestamp: now.toISOString(), redactionApplied: true, requestId: command.requestId, correlationId: command.correlationId }, deployments)).resolves.toMatchObject({ applied: false, command: { state: "claimed" } });
+      await expect(deployments.findById(deployment.id)).resolves.toEqual(deployment);
+      await expect(deployments.listLogs(deployment.id)).resolves.toEqual([]);
+    }
+  });
+
   it("rolls back a terminal projection when its lease expires while projection is paused", async () => {
     const deployments = new InMemoryDeploymentRepository();
     let clock = now;

@@ -387,6 +387,86 @@ describeIntegration("PostgreSQL auth foundation integration", () => {
     await expect(requireDbDeploymentRepository().listLogs(boundary.deployment.id)).resolves.toEqual([]);
   }, 30_000);
 
+  it("keeps expired and equal-lease running projections from mutating deployments or logs", async () => {
+    const expired = await createClaimedDeploymentCommand(new Date("2000-01-01T00:00:00.000Z"));
+    const expiredQueuedDeployment = { ...expired.deployment, status: "queued" as const };
+    await requireDbDeploymentRepository().save(expiredQueuedDeployment);
+    await expect(requireDbDeploymentCommandRepository().projectRunning(
+      expired.command.id,
+      expired.command.agentId,
+      { ...expiredQueuedDeployment, status: "running" },
+      "queued",
+      terminalLog(expired.deployment.id, "expired lease must not project running"),
+      requireDbDeploymentRepository()
+    )).resolves.toMatchObject({ applied: false, command: { state: "claimed" } });
+    await expect(requireDbDeploymentRepository().findById(expired.deployment.id)).resolves.toEqual(expiredQueuedDeployment);
+    await expect(requireDbDeploymentRepository().listLogs(expired.deployment.id)).resolves.toEqual([]);
+
+    const boundary = await createClaimedDeploymentCommand(new Date("2042-02-03T04:05:06.000Z"));
+    const boundaryQueuedDeployment = { ...boundary.deployment, status: "queued" as const };
+    await requireDbDeploymentRepository().save(boundaryQueuedDeployment);
+    const client = requirePool();
+    await client.query("CREATE SCHEMA running_projection_clock");
+    await client.query("CREATE FUNCTION running_projection_clock.clock_timestamp() RETURNS timestamptz LANGUAGE SQL IMMUTABLE AS $$ SELECT TIMESTAMPTZ '2042-02-03T04:05:06.000Z' $$");
+    await client.query("SET search_path TO running_projection_clock, public, pg_catalog");
+    try {
+      await client.query("UPDATE deployment_commands SET lease_expires_at = clock_timestamp() WHERE id = $1", [boundary.command.id]);
+      await expect(requireDbDeploymentCommandRepository().projectRunning(
+        boundary.command.id,
+        boundary.command.agentId,
+        { ...boundaryQueuedDeployment, status: "running" },
+        "queued",
+        terminalLog(boundary.deployment.id, "equal lease must not project running"),
+        requireDbDeploymentRepository()
+      )).resolves.toMatchObject({ applied: false, command: { state: "claimed" } });
+    } finally {
+      await client.query("RESET search_path");
+      await client.query("DROP SCHEMA running_projection_clock CASCADE");
+    }
+    await expect(requireDbDeploymentRepository().findById(boundary.deployment.id)).resolves.toEqual(boundaryQueuedDeployment);
+    await expect(requireDbDeploymentRepository().listLogs(boundary.deployment.id)).resolves.toEqual([]);
+  }, 30_000);
+
+  it("rules out the running projection when cancellation wins the command lock", async () => {
+    const cancelled = await createClaimedDeploymentCommand();
+    const cancelledQueuedDeployment = { ...cancelled.deployment, status: "queued" as const };
+    await requireDbDeploymentRepository().save(cancelledQueuedDeployment);
+    const lockClient = new Client({ connectionString: databaseUrl });
+    const cancelPool = createDbPool(databaseUrl, { max: 1 });
+    const cancelCommands = new DbDeploymentCommandRepository(createDbClient(cancelPool));
+    await lockClient.connect();
+    await lockClient.query("BEGIN");
+    await lockClient.query("SELECT 1 FROM deployment_commands WHERE id = $1 FOR UPDATE", [cancelled.command.id]);
+
+    try {
+      const cancellation = cancelCommands.transitionTerminal(
+        cancelled.command.id,
+        cancelled.command.agentId,
+        "claimed",
+        { state: "cancelled", completedAt: new Date().toISOString(), leaseExpiresAt: null, failureReason: null, payload: cancelled.command.payload }
+      );
+      await waitForBlockedCommandUpdate();
+      const projection = requireDbDeploymentCommandRepository().projectRunning(
+        cancelled.command.id,
+        cancelled.command.agentId,
+        { ...cancelledQueuedDeployment, status: "running" },
+        "queued",
+        terminalLog(cancelled.deployment.id, "cancel must prevent running projection"),
+        requireDbDeploymentRepository()
+      );
+      await lockClient.query("COMMIT");
+      await expect(cancellation).resolves.toMatchObject({ applied: true, command: { state: "cancelled" } });
+      await expect(projection).resolves.toMatchObject({ applied: false, command: { state: "cancelled" } });
+    } finally {
+      await lockClient.query("ROLLBACK").catch(() => undefined);
+      await lockClient.end();
+      await closeDbPool(cancelPool);
+    }
+
+    await expect(requireDbDeploymentRepository().findById(cancelled.deployment.id)).resolves.toEqual(cancelledQueuedDeployment);
+    await expect(requireDbDeploymentRepository().listLogs(cancelled.deployment.id)).resolves.toEqual([]);
+  }, 30_000);
+
   it("reconciles legacy counters and allocates explicit and projected logs without collisions", async () => {
     const fixture = await createClaimedDeploymentCommand();
     const deployments = requireDbDeploymentRepository();
