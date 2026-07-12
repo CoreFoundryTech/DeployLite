@@ -410,6 +410,39 @@ describeIntegration("PostgreSQL auth foundation integration", () => {
     await expect(requireDbDeploymentRepository().listLogs(expired.deployment.id)).resolves.toEqual([]);
   });
 
+  it("rejects a claimed terminal projection when its lease equals the authoritative database clock", async () => {
+    const controlledClock = "2042-02-03T04:05:06.000Z";
+    const boundary = await createClaimedDeploymentCommand(new Date(controlledClock));
+    const client = requirePool();
+
+    await client.query("CREATE SCHEMA terminal_projection_clock");
+    await client.query(`CREATE FUNCTION terminal_projection_clock.clock_timestamp() RETURNS timestamptz LANGUAGE SQL IMMUTABLE AS $$ SELECT TIMESTAMPTZ '${controlledClock}' $$`);
+    await client.query("SET search_path TO terminal_projection_clock, public, pg_catalog");
+
+    try {
+      await expect(client.query<{ clock: Date }>("SELECT clock_timestamp() AS clock")).resolves.toMatchObject({
+        rows: [{ clock: new Date(controlledClock) }]
+      });
+      await client.query("UPDATE deployment_commands SET lease_expires_at = clock_timestamp() WHERE id = $1", [boundary.command.id]);
+
+      await expect(requireDbDeploymentCommandRepository().projectTerminal(
+        boundary.command.id,
+        boundary.command.agentId,
+        "completed",
+        { ...boundary.deployment, status: "succeeded", finishedAt: new Date().toISOString() },
+        "running",
+        terminalLog(boundary.deployment.id, "equal lease must not project"),
+        requireDbDeploymentRepository()
+      )).resolves.toMatchObject({ applied: false, command: { id: boundary.command.id, state: "claimed" } });
+    } finally {
+      await client.query("RESET search_path");
+      await client.query("DROP SCHEMA terminal_projection_clock CASCADE");
+    }
+
+    await expect(requireDbDeploymentRepository().findById(boundary.deployment.id)).resolves.toEqual(boundary.deployment);
+    await expect(requireDbDeploymentRepository().listLogs(boundary.deployment.id)).resolves.toEqual([]);
+  });
+
   it("allocates terminal and restarted executor logs after explicit sequences without collisions", async () => {
     const terminal = await createClaimedDeploymentCommand();
     const deployments = requireDbDeploymentRepository();
