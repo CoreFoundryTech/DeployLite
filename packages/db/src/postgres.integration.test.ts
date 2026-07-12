@@ -7,6 +7,7 @@ import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import { createDbClient, createDbPool, closeDbPool, type DeployLiteDb } from "./client.js";
 import { assertEnvMetadataHasNoValueColumns, toEnvVariableMetadataInsert } from "./env-metadata.js";
 import { DbAuditRepository, DbAuthUserRepository, DbRoleRepository, DbSessionRepository } from "./repositories/auth.js";
+import { DbDeploymentCommandRepository } from "./repositories/deployment-commands.js";
 import { DbAgentRepository, DbDeploymentRepository, DbProjectRepository } from "./repositories/deployment-data.js";
 
 const { Client } = pg;
@@ -260,12 +261,12 @@ describeIntegration("PostgreSQL auth foundation integration", () => {
       endpoint: "https://agent.integration.test",
       status: "online"
     });
-    await expect(requireDbProjectRepository().list()).resolves.toContainEqual({
+    await expect(requireDbProjectRepository().list()).resolves.toContainEqual(expect.objectContaining({
       id: projectId,
       name: "Integration project",
       repoUrl: "https://github.com/example/deploylite-integration",
       defaultBranch: "main"
-    });
+    }));
     await expect(requireDbDeploymentRepository().findById(deploymentId)).resolves.toMatchObject({
       id: deploymentId,
       projectId,
@@ -332,6 +333,66 @@ describeIntegration("PostgreSQL auth foundation integration", () => {
       } as Parameters<typeof toEnvVariableMetadataInsert>[0])
     ).toThrow("Environment variable metadata cannot include secret value field");
   });
+
+  it("keeps terminal deployment, command, and log projections atomic when cancellation interleaves", async () => {
+    const cancelled = await createClaimedDeploymentCommand();
+    const lockClient = new Client({ connectionString: databaseUrl });
+    const cancellationPool = createDbPool(databaseUrl, { max: 1 });
+    const cancellationCommands = new DbDeploymentCommandRepository(createDbClient(cancellationPool));
+    await lockClient.connect();
+    await lockClient.query("BEGIN");
+    await lockClient.query("SELECT 1 FROM deployments WHERE id = $1 FOR UPDATE", [cancelled.deployment.id]);
+
+    try {
+      const terminal = requireDbDeploymentCommandRepository().projectTerminal(
+        cancelled.command.id,
+        cancelled.command.agentId,
+        "completed",
+        { ...cancelled.deployment, status: "succeeded", finishedAt: new Date().toISOString() },
+        "running",
+        terminalLog(cancelled.deployment.id, "terminal token dl_1234567890 must not persist"),
+        requireDbDeploymentRepository()
+      );
+      await waitForDeploymentUpdateToBlock();
+
+      const cancelledCommand = await cancellationCommands.transitionTerminal(
+        cancelled.command.id,
+        cancelled.command.agentId,
+        "claimed",
+        { state: "cancelled", completedAt: new Date().toISOString(), leaseExpiresAt: null, failureReason: null, payload: cancelled.command.payload }
+      );
+      expect(cancelledCommand).toMatchObject({ applied: true, command: { state: "cancelled" } });
+
+      await lockClient.query("COMMIT");
+      const result = await terminal;
+      expect(result).toMatchObject({ applied: false, command: { id: cancelled.command.id, state: "cancelled" } });
+    } finally {
+      await lockClient.query("ROLLBACK").catch(() => undefined);
+      await lockClient.end();
+      await closeDbPool(cancellationPool);
+    }
+
+    await expect(requireDbDeploymentRepository().findById(cancelled.deployment.id)).resolves.toMatchObject({ status: "running", finishedAt: null });
+    await expect(requireDbDeploymentRepository().listLogs(cancelled.deployment.id)).resolves.toEqual([]);
+    await expect(requireDbDeploymentCommandRepository().findById(cancelled.command.id)).resolves.toMatchObject({ state: "cancelled" });
+
+    const completed = await createClaimedDeploymentCommand();
+    const result = await requireDbDeploymentCommandRepository().projectTerminal(
+      completed.command.id,
+      completed.command.agentId,
+      "completed",
+      { ...completed.deployment, status: "succeeded", finishedAt: new Date().toISOString() },
+      "running",
+      terminalLog(completed.deployment.id, "terminal token dl_1234567890 must be redacted"),
+      requireDbDeploymentRepository()
+    );
+
+    expect(result).toMatchObject({ applied: true, command: { id: completed.command.id, state: "completed" } });
+    await expect(requireDbDeploymentRepository().findById(completed.deployment.id)).resolves.toMatchObject({ status: "succeeded" });
+    await expect(requireDbDeploymentRepository().listLogs(completed.deployment.id)).resolves.toEqual([
+      expect.objectContaining({ deploymentId: completed.deployment.id, sequence: 1, message: expect.stringContaining("[REDACTED]"), redactionApplied: true })
+    ]);
+  }, 30_000);
 });
 
 function requirePool(): pg.Pool {
@@ -372,6 +433,83 @@ function requireDbProjectRepository(): DbProjectRepository {
 
 function requireDbDeploymentRepository(): DbDeploymentRepository {
   return new DbDeploymentRepository(requireDb());
+}
+
+function requireDbDeploymentCommandRepository(): DbDeploymentCommandRepository {
+  return new DbDeploymentCommandRepository(requireDb());
+}
+
+async function createClaimedDeploymentCommand(): Promise<{
+  deployment: { id: string; projectId: string; agentId: string; status: "running"; commitSha: string; startedAt: string; finishedAt: null };
+  command: Awaited<ReturnType<DbDeploymentCommandRepository["save"]>>;
+}> {
+  const projectId = randomUUID();
+  const agentId = randomUUID();
+  const deploymentId = randomUUID();
+  const commandId = randomUUID();
+  const now = new Date().toISOString();
+  const deployment = { id: deploymentId, projectId, agentId, status: "running" as const, commitSha: "abcdef1234567890", startedAt: now, finishedAt: null };
+
+  await requireDbProjectRepository().save({
+    id: projectId,
+    name: "Terminal projection project",
+    repoUrl: "https://github.com/example/terminal-projection",
+    defaultBranch: "main",
+    buildCommand: null,
+    runCommand: "node server.js",
+    port: 3000,
+    description: null,
+    imageTag: null
+  });
+  await requireDbAgentRepository().save({ id: agentId, name: "Terminal projection agent", endpoint: "https://agent.terminal.test", status: "online", lastHeartbeatAt: now, resourceSnapshot: null });
+  await requireDbDeploymentRepository().save(deployment);
+  const command = await requireDbDeploymentCommandRepository().save({
+    id: commandId,
+    deploymentId,
+    agentId,
+    kind: "start",
+    state: "claimed",
+    payload: {},
+    requestedBy: null,
+    requestId: `req_${commandId}`,
+    correlationId: `corr_${commandId}`,
+    issuedAt: now,
+    claimedAt: now,
+    leaseExpiresAt: new Date(Date.now() + 60_000).toISOString(),
+    completedAt: null,
+    failureReason: null
+  });
+  return { deployment, command };
+}
+
+function terminalLog(deploymentId: string, message: string) {
+  return {
+    id: randomUUID(),
+    deploymentId,
+    level: "info" as const,
+    message,
+    timestamp: new Date().toISOString(),
+    redactionApplied: false,
+    requestId: "req_terminal_projection",
+    correlationId: "corr_terminal_projection"
+  };
+}
+
+async function waitForDeploymentUpdateToBlock(): Promise<void> {
+  const observer = new Client({ connectionString: databaseUrl });
+  await observer.connect();
+  try {
+    for (let attempt = 0; attempt < 50; attempt += 1) {
+      const result = await observer.query<{ waiting: boolean }>(
+        "SELECT EXISTS (SELECT 1 FROM pg_stat_activity WHERE datname = current_database() AND wait_event_type = 'Lock' AND query LIKE '%update \"deployments\"%') AS waiting"
+      );
+      if (result.rows[0]?.waiting) return;
+      await new Promise((resolve) => setTimeout(resolve, 10));
+    }
+    throw new Error("Terminal projection did not block on the deployment lock");
+  } finally {
+    await observer.end();
+  }
 }
 
 async function applyMigrations(connectionString: string): Promise<void> {
