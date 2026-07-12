@@ -1,4 +1,4 @@
-import { and, asc, eq, isNotNull, sql } from "drizzle-orm";
+import { and, asc, eq, isNotNull, isNull, sql } from "drizzle-orm";
 import { redactLogMessage } from "@deploylite/config";
 import type { Agent, Deployment, LogEvent, Project } from "@deploylite/contracts";
 import type { AgentRepository, DeploymentRepository, ProjectRepository } from "@deploylite/domain";
@@ -165,6 +165,23 @@ export class DbDeploymentRepository implements DeploymentRepository {
       const saved = toDeployment(row);
       if (!saved) throw new Error("Failed to save attached deployment");
       return saved;
+    });
+  }
+
+  async rollbackTerminalProjection(previous: Deployment, projected: Deployment, eventId: string): Promise<boolean> {
+    return this.db.transaction(async (tx) => {
+      await tx.delete(deploymentLogs).where(and(eq(deploymentLogs.id, eventId), eq(deploymentLogs.deploymentId, projected.id)));
+      const [restored] = await tx.update(deployments).set({
+        status: previous.status,
+        finishedAt: previous.finishedAt ? new Date(previous.finishedAt) : null,
+        updatedAt: new Date()
+      }).where(and(
+        eq(deployments.id, projected.id),
+        eq(deployments.status, projected.status),
+        projected.finishedAt ? eq(deployments.finishedAt, new Date(projected.finishedAt)) : isNull(deployments.finishedAt)
+      )).returning({ id: deployments.id });
+      if (!restored) return false;
+      return true;
     });
   }
 

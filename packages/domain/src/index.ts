@@ -119,6 +119,7 @@ export type { Deployment, Project } from "@deploylite/contracts";
 export type DeploymentRepository = {
   save(deployment: Deployment): Promise<Deployment>;
   saveWithLogIfStatus(deployment: Deployment, expectedStatus: Deployment["status"], event: Omit<LogEvent, "sequence">): Promise<Deployment | null>;
+  rollbackTerminalProjection(previous: Deployment, projected: Deployment, eventId: string): Promise<boolean>;
   findById(id: string): Promise<Deployment | null>;
   list(): Promise<Deployment[]>;
   appendLog(event: LogEvent): Promise<LogEvent>;
@@ -493,6 +494,14 @@ export class InMemoryDeploymentRepository implements DeploymentRepository {
     return deployment;
   }
 
+  async rollbackTerminalProjection(previous: Deployment, projected: Deployment, eventId: string): Promise<boolean> {
+    const current = this.#deployments.get(projected.id);
+    this.#logs.set(projected.id, (this.#logs.get(projected.id) ?? []).filter((event) => event.id !== eventId));
+    if (!current || current.status !== projected.status || current.finishedAt !== projected.finishedAt) return false;
+    this.#deployments.set(previous.id, structuredClone(previous));
+    return true;
+  }
+
   async findById(id: string): Promise<Deployment | null> {
     return this.#deployments.get(id) ?? null;
   }
@@ -571,8 +580,15 @@ export class InMemoryDeploymentCommandRepository implements DeploymentCommandRep
     const command = this.#commands.get(commandId);
     if (!command || command.agentId !== agentId) return null;
     if (command.state !== "claimed") return { command, applied: false };
+    const previousDeployment = await deployments.findById(deployment.id);
+    if (!previousDeployment) return { command, applied: false };
     if (!(await deployments.saveWithLogIfStatus(deployment, expectedStatus, event))) return { command: this.#commands.get(commandId) ?? command, applied: false };
-    const next = { ...command, state, completedAt: new Date().toISOString(), leaseExpiresAt: null, failureReason: state === "failed" ? "Simulated agent marked the deployment failed" : null } as DeploymentCommandRecord;
+    const authoritative = this.#commands.get(commandId);
+    if (!authoritative || authoritative.agentId !== agentId || authoritative.state !== "claimed") {
+      await deployments.rollbackTerminalProjection(previousDeployment, deployment, event.id);
+      return { command: authoritative ?? command, applied: false };
+    }
+    const next = { ...authoritative, state, completedAt: new Date().toISOString(), leaseExpiresAt: null, failureReason: state === "failed" ? "Simulated agent marked the deployment failed" : null } as DeploymentCommandRecord;
     this.#commands.set(commandId, next);
     return { command: next, applied: true };
   }
