@@ -49,7 +49,6 @@ export type DeploymentExecutorDeps = {
  * the executor run inside that process.
  */
 export class MockDeploymentExecutor implements DeploymentExecutor {
-  readonly #sequenceByDeployment = new Map<string, number>();
   readonly #timers = new Map<string, NodeJS.Timeout>();
   readonly #bus: DeploymentCommandBus;
   readonly #deployments: DeploymentRepository;
@@ -107,10 +106,7 @@ export class MockDeploymentExecutor implements DeploymentExecutor {
     await this.#appendLog(deployment, "info", `Resolved ${logs.length} env metadata record(s); ${missingRequired.length} required-without-value.`, command.requestId, command.correlationId);
 
     if (missingRequired.length > 0) {
-      await this.#appendLog(deployment, "error", `Refusing to advance: required env metadata missing for ${missingRequired.map((m) => m.key).join(", ")}.`, command.requestId, command.correlationId);
-      const failed: Deployment = { ...deployment, status: "failed", finishedAt: new Date().toISOString() };
-      await this.#deployments.save(failed);
-      await this.#bus.fail(command.id, "Refusing to advance: required env metadata missing");
+      await this.#failStart(command, deployment, `Refusing to advance: required env metadata missing for ${missingRequired.map((m) => m.key).join(", ")}.`);
       return;
     }
 
@@ -140,9 +136,10 @@ export class MockDeploymentExecutor implements DeploymentExecutor {
 
   async #failStart(command: DeploymentCommandRecord, deployment: Deployment, reason: string): Promise<void> {
     const failed: Deployment = { ...deployment, status: "failed", finishedAt: new Date().toISOString() };
-    await this.#deployments.save(failed);
-    await this.#appendLog(deployment, "error", reason, command.requestId, command.correlationId);
-    await this.#bus.fail(command.id, reason);
+    await this.#bus.projectTerminal(command.id, "failed", failed, deployment.status, {
+      id: createRequestId(), deploymentId: deployment.id, level: "error", message: reason,
+      timestamp: new Date().toISOString(), redactionApplied: true, requestId: command.requestId, correlationId: command.correlationId
+    });
   }
 
   /**
@@ -180,12 +177,9 @@ export class MockDeploymentExecutor implements DeploymentExecutor {
   }
 
   async #appendLog(deployment: Deployment, level: "debug" | "info" | "warn" | "error", message: string, requestId: string, correlationId: string): Promise<void> {
-    const next = (this.#sequenceByDeployment.get(deployment.id) ?? 0) + 1;
-    this.#sequenceByDeployment.set(deployment.id, next);
-    await this.#deployments.appendLog({
+    await this.#deployments.appendAllocatedLog({
       id: createRequestId(),
       deploymentId: deployment.id,
-      sequence: next,
       level,
       message,
       timestamp: new Date().toISOString(),

@@ -593,7 +593,7 @@ export class InMemoryDeploymentCommandRepository implements DeploymentCommandRep
       await deployments.rollbackTerminalProjection(previousDeployment, deployment, event.id);
       return { command: authoritative ?? command, applied: false };
     }
-    const next = { ...authoritative, state, completedAt: new Date().toISOString(), leaseExpiresAt: null, failureReason: state === "failed" ? "Simulated agent marked the deployment failed" : null } as DeploymentCommandRecord;
+    const next = { ...authoritative, state, completedAt: new Date().toISOString(), leaseExpiresAt: null, failureReason: state === "failed" ? event.message : null } as DeploymentCommandRecord;
     this.#commands.set(commandId, next);
     return { command: next, applied: true };
   }

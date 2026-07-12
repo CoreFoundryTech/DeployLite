@@ -393,6 +393,29 @@ describeIntegration("PostgreSQL auth foundation integration", () => {
       expect.objectContaining({ deploymentId: completed.deployment.id, sequence: 1, message: expect.stringContaining("[REDACTED]"), redactionApplied: true })
     ]);
   }, 30_000);
+
+  it("allocates terminal and restarted executor logs after explicit sequences without collisions", async () => {
+    const terminal = await createClaimedDeploymentCommand();
+    const deployments = requireDbDeploymentRepository();
+    await deployments.appendLog({
+      ...terminalLog(terminal.deployment.id, "explicit token dl_1234567890 must be redacted"), sequence: 41
+    });
+
+    await expect(requireDbDeploymentCommandRepository().projectTerminal(
+      terminal.command.id, terminal.command.agentId, "completed",
+      { ...terminal.deployment, status: "succeeded", finishedAt: new Date().toISOString() }, "running",
+      terminalLog(terminal.deployment.id, "terminal token dl_1234567890 must be redacted"), deployments
+    )).resolves.toMatchObject({ applied: true, command: { state: "completed" } });
+
+    const restarted = await Promise.all(Array.from({ length: 16 }, (_, index) => deployments.appendAllocatedLog({
+      ...terminalLog(terminal.deployment.id, `restart ${index}`), id: randomUUID()
+    })));
+    expect(restarted.map((event) => event.sequence).sort((left, right) => left - right)).toEqual(Array.from({ length: 16 }, (_, index) => index + 43));
+    await expect(deployments.listLogs(terminal.deployment.id)).resolves.toEqual(expect.arrayContaining([
+      expect.objectContaining({ sequence: 41, message: expect.stringContaining("[REDACTED]") }),
+      expect.objectContaining({ sequence: 42, message: expect.stringContaining("[REDACTED]") })
+    ]));
+  }, 30_000);
 });
 
 function requirePool(): pg.Pool {

@@ -156,8 +156,13 @@ export class DbDeploymentRepository implements DeploymentRepository {
       const [row] = await tx.update(deployments).set({ status: deployment.status, finishedAt: deployment.finishedAt ? new Date(deployment.finishedAt) : null, updatedAt: new Date() })
         .where(and(eq(deployments.id, deployment.id), eq(deployments.status, expectedStatus))).returning();
       if (!row) return null;
-      const [allocation] = await tx.insert(deploymentLogSequences).values({ deploymentId: event.deploymentId, nextSequence: 2 })
-        .onConflictDoUpdate({ target: deploymentLogSequences.deploymentId, set: { nextSequence: sql`${deploymentLogSequences.nextSequence} + 1` } })
+      const [allocation] = await tx.insert(deploymentLogSequences).values({
+        deploymentId: event.deploymentId,
+        nextSequence: sql<number>`COALESCE((SELECT MAX(${deploymentLogs.sequence}) + 2 FROM ${deploymentLogs} WHERE ${deploymentLogs.deploymentId} = ${event.deploymentId}), 2)`
+      }).onConflictDoUpdate({
+        target: deploymentLogSequences.deploymentId,
+        set: { nextSequence: sql`GREATEST(${deploymentLogSequences.nextSequence}, COALESCE((SELECT MAX(${deploymentLogs.sequence}) + 1 FROM ${deploymentLogs} WHERE ${deploymentLogs.deploymentId} = ${event.deploymentId}), 1)) + 1` }
+      })
         .returning({ sequence: sql<number>`${deploymentLogSequences.nextSequence} - 1` });
       if (!allocation) throw new Error("Failed to allocate deployment log sequence");
       const [log] = await tx.insert(deploymentLogs).values({ ...event, sequence: allocation.sequence, message: redactLogMessage(event.message), redactionApplied: true }).returning();
@@ -196,38 +201,36 @@ export class DbDeploymentRepository implements DeploymentRepository {
   }
 
   async appendLog(event: LogEvent): Promise<LogEvent> {
-    const [row] = await this.db
-      .insert(deploymentLogs)
-      .values({
-        id: event.id,
-        deploymentId: event.deploymentId,
-        sequence: event.sequence,
-        level: event.level,
-        message: redactLogMessage(event.message),
-        redactionApplied: true,
-        requestId: event.requestId,
-        correlationId: event.correlationId
-      })
-      .returning();
-
-    if (!row) throw new Error("Failed to append deployment log");
-    return toLogEvent(row);
+    return this.db.transaction(async (tx) => {
+      await tx.insert(deploymentLogSequences).values({ deploymentId: event.deploymentId, nextSequence: event.sequence + 1 })
+        .onConflictDoUpdate({ target: deploymentLogSequences.deploymentId, set: { nextSequence: sql`GREATEST(${deploymentLogSequences.nextSequence}, ${event.sequence + 1})` } });
+      const [row] = await tx.insert(deploymentLogs).values({
+        id: event.id, deploymentId: event.deploymentId, sequence: event.sequence, level: event.level,
+        message: redactLogMessage(event.message), redactionApplied: true, requestId: event.requestId, correlationId: event.correlationId
+      }).returning();
+      if (!row) throw new Error("Failed to append deployment log");
+      return toLogEvent(row);
+    });
   }
 
   async appendAllocatedLog(event: Omit<LogEvent, "sequence">): Promise<LogEvent> {
     // PostgreSQL serializes conflicting UPSERTs on this one counter row. This
     // avoids MAX(sequence)+1 and its bounded-retry failure mode under load.
-    const [allocation] = await this.db
-      .insert(deploymentLogSequences)
-      .values({ deploymentId: event.deploymentId, nextSequence: 2 })
-      .onConflictDoUpdate({
+    return this.db.transaction(async (tx) => {
+      const [allocation] = await tx.insert(deploymentLogSequences).values({
+        deploymentId: event.deploymentId,
+        nextSequence: sql<number>`COALESCE((SELECT MAX(${deploymentLogs.sequence}) + 2 FROM ${deploymentLogs} WHERE ${deploymentLogs.deploymentId} = ${event.deploymentId}), 2)`
+      }).onConflictDoUpdate({
         target: deploymentLogSequences.deploymentId,
-        set: { nextSequence: sql`${deploymentLogSequences.nextSequence} + 1` }
-      })
-      .returning({ sequence: sql<number>`${deploymentLogSequences.nextSequence} - 1` });
-
-    if (!allocation) throw new Error("Failed to allocate deployment log sequence");
-    return this.appendLog({ ...event, sequence: allocation.sequence });
+        set: { nextSequence: sql`GREATEST(${deploymentLogSequences.nextSequence}, COALESCE((SELECT MAX(${deploymentLogs.sequence}) + 1 FROM ${deploymentLogs} WHERE ${deploymentLogs.deploymentId} = ${event.deploymentId}), 1)) + 1` }
+      }).returning({ sequence: sql<number>`${deploymentLogSequences.nextSequence} - 1` });
+      if (!allocation) throw new Error("Failed to allocate deployment log sequence");
+      const [row] = await tx.insert(deploymentLogs).values({
+        ...event, sequence: allocation.sequence, message: redactLogMessage(event.message), redactionApplied: true
+      }).returning();
+      if (!row) throw new Error("Failed to append deployment log");
+      return toLogEvent(row);
+    });
   }
 
   async listLogs(deploymentId: string, afterSequence = -1): Promise<LogEvent[]> {

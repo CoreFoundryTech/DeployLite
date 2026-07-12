@@ -74,7 +74,7 @@ describe("PostgreSQL deployment log allocation", () => {
             }
           }
     }));
-    const db = { insert } as never;
+    const db = { insert, transaction: async (callback: (tx: { insert: typeof insert }) => unknown) => callback({ insert }) } as never;
     const repository = new DbDeploymentRepository(db);
 
     const events = await Promise.all(Array.from({ length: 128 }, (_, index) => repository.appendAllocatedLog({

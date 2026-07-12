@@ -142,10 +142,16 @@ export class DbDeploymentCommandRepository implements DeploymentCommandRepositor
         const [authoritative] = await tx.select().from(deploymentCommands).where(eq(deploymentCommands.id, commandId)).limit(1);
         return { command: authoritative ? toDeploymentCommand(authoritative) : command, applied: false };
       }
-      const [terminal] = await tx.update(deploymentCommands).set({ state, completedAt: new Date(), leaseExpiresAt: null, failureReason: state === "failed" ? "Simulated agent marked the deployment failed" : null, updatedAt: new Date() })
+      const [terminal] = await tx.update(deploymentCommands).set({ state, completedAt: new Date(), leaseExpiresAt: null, failureReason: state === "failed" ? redactLogMessage(event.message) : null, updatedAt: new Date() })
         .where(and(eq(deploymentCommands.id, commandId), eq(deploymentCommands.agentId, agentId), eq(deploymentCommands.state, "claimed"), gt(deploymentCommands.leaseExpiresAt, sql`clock_timestamp()`))).returning();
       if (!terminal) throw new TerminalProjectionConflict();
-      const [allocation] = await tx.insert(deploymentLogSequences).values({ deploymentId: event.deploymentId, nextSequence: 2 }).onConflictDoUpdate({ target: deploymentLogSequences.deploymentId, set: { nextSequence: sql`${deploymentLogSequences.nextSequence} + 1` } }).returning({ sequence: sql<number>`${deploymentLogSequences.nextSequence} - 1` });
+      const [allocation] = await tx.insert(deploymentLogSequences).values({
+        deploymentId: event.deploymentId,
+        nextSequence: sql<number>`COALESCE((SELECT MAX(${deploymentLogs.sequence}) + 2 FROM ${deploymentLogs} WHERE ${deploymentLogs.deploymentId} = ${event.deploymentId}), 2)`
+      }).onConflictDoUpdate({
+        target: deploymentLogSequences.deploymentId,
+        set: { nextSequence: sql`GREATEST(${deploymentLogSequences.nextSequence}, COALESCE((SELECT MAX(${deploymentLogs.sequence}) + 1 FROM ${deploymentLogs} WHERE ${deploymentLogs.deploymentId} = ${event.deploymentId}), 1)) + 1` }
+      }).returning({ sequence: sql<number>`${deploymentLogSequences.nextSequence} - 1` });
       if (!allocation) throw new Error("Failed to allocate deployment log sequence");
       await tx.insert(deploymentLogs).values({ ...event, sequence: allocation.sequence, message: redactLogMessage(event.message), redactionApplied: true });
       return { command: toDeploymentCommand(terminal), applied: true };
