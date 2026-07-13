@@ -15,7 +15,7 @@ import { auditEvents, deploymentCommands, deploymentLogSequences, deploymentLogs
 
 const TERMINAL_STATES: ReadonlyArray<DeploymentCommandState> = ["completed", "cancelled", "failed"];
 
-const ACTIVE_STATES: ReadonlyArray<DeploymentCommandState> = ["pending", "claimed"];
+const ACTIVE_STATES: ReadonlyArray<DeploymentCommandState> = ["pending", "claimed", "executing"];
 
 // Test-only synchronization point for proving a competing cancellation wins.
 type ProjectRunningTestHooks = {
@@ -104,6 +104,16 @@ export class DbDeploymentCommandRepository implements DeploymentCommandRepositor
     }).where(and(
       eq(deploymentCommands.id, commandId),
       eq(deploymentCommands.agentId, agentId),
+      inArray(deploymentCommands.state, ["claimed", "executing"]),
+      gt(deploymentCommands.leaseExpiresAt, new Date(now))
+    )).returning();
+    return row ? toDeploymentCommand(row) : null;
+  }
+
+  async reserveExecution(commandId: string, agentId: string, now: string): Promise<DeploymentCommandRecord | null> {
+    const [row] = await this.db.update(deploymentCommands).set({ state: "executing", updatedAt: new Date() }).where(and(
+      eq(deploymentCommands.id, commandId),
+      eq(deploymentCommands.agentId, agentId),
       eq(deploymentCommands.state, "claimed"),
       gt(deploymentCommands.leaseExpiresAt, new Date(now))
     )).returning();
@@ -113,7 +123,7 @@ export class DbDeploymentCommandRepository implements DeploymentCommandRepositor
   async transitionTerminal(
     commandId: string,
     agentId: string,
-    expectedState: "pending" | "claimed",
+    expectedState: "pending" | "claimed" | "executing",
     next: Pick<DeploymentCommandRecord, "state" | "completedAt" | "leaseExpiresAt" | "failureReason" | "payload">,
     condition?: { leaseExpiresAtNotAfterNow: () => string } | { leaseExpiresAtAfterNow: () => string }
   ): Promise<{ command: DeploymentCommandRecord; applied: boolean } | null> {
@@ -146,9 +156,9 @@ export class DbDeploymentCommandRepository implements DeploymentCommandRepositor
       if (!observed) return null;
       await this.testHooks?.afterFenceRead?.();
 
-      // Updating the fenced row takes a row lock and makes the lease test part
-      // of the same transaction as the deployment, log, and audit effects.
-      const [command] = await tx.update(deploymentCommands).set({ updatedAt: sql`clock_timestamp()` }).where(and(
+      // This reservation is the fence: it takes the row lock and moves the
+      // command to executing in the same transaction as every running effect.
+      const [command] = await tx.update(deploymentCommands).set({ state: "executing", updatedAt: sql`clock_timestamp()` }).where(and(
         eq(deploymentCommands.id, commandId),
         eq(deploymentCommands.agentId, agentId),
         eq(deploymentCommands.state, "claimed"),
@@ -173,6 +183,7 @@ export class DbDeploymentCommandRepository implements DeploymentCommandRepositor
         eq(deploymentLogs.requestId, projection.log.requestId),
         eq(deploymentLogs.correlationId, projection.log.correlationId)
       )).limit(1);
+      if (existingLog.length > 0) return { command: toDeploymentCommand(command), applied: false };
       if (existingLog.length === 0) {
         const [allocation] = await tx.insert(deploymentLogSequences).values({ deploymentId: projection.log.deploymentId, nextSequence: 2 }).onConflictDoUpdate({
           target: deploymentLogSequences.deploymentId,
@@ -238,7 +249,7 @@ export class DbDeploymentCommandRepository implements DeploymentCommandRepositor
 
 export const DB_DEPLOYMENT_COMMAND_KINDS: ReadonlyArray<DeploymentCommandKind> = ["start", "cancel", "restart", "rollback"];
 
-export const DB_DEPLOYMENT_COMMAND_STATES: ReadonlyArray<DeploymentCommandState> = ["pending", "claimed", "completed", "cancelled", "failed"];
+export const DB_DEPLOYMENT_COMMAND_STATES: ReadonlyArray<DeploymentCommandState> = ["pending", "claimed", "executing", "completed", "cancelled", "failed"];
 
 export const DB_DEPLOYMENT_COMMAND_TERMINAL_STATES: ReadonlyArray<DeploymentCommandState> = TERMINAL_STATES;
 
@@ -269,6 +280,8 @@ export function describeDeploymentCommandEventType(state: DeploymentCommandState
       return "deployment.command.submitted";
     case "claimed":
       return "deployment.command.claimed";
+    case "executing":
+      return "deployment.command.executing";
     case "completed":
       return "deployment.command.completed";
     case "failed":

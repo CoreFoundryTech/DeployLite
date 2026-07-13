@@ -47,6 +47,7 @@ export type AgentCommandTransport = CommandBusClient & {
   heartbeat(agentId: string, observedAt: string, resourceSnapshot: ResourceSnapshot, signal: AbortSignal): Promise<Agent>;
   poll(agentId: string, signal: AbortSignal): Promise<DeploymentExecutionInput | null>;
   recoverClaimed(agentId: string, signal: AbortSignal): Promise<DeploymentExecutionInput | null>;
+  projectRunning(commandId: string, agentId: string): Promise<{ command: DeploymentCommand; applied: boolean } | null>;
 };
 
 export type ResourceSnapshot = z.infer<typeof resourceSnapshotSchema>;
@@ -164,11 +165,13 @@ export class AgentWorker {
           continue;
         }
         terminalRetryMs = this.#retryDelayMs;
-        if (!startupReconciled) {
-          const claimed = await this.options.transport.recoverClaimed(this.options.agentId, signal);
-          if (claimed) await this.options.executor.reconcile(claimed);
-          startupReconciled = true;
+        const claimed = await this.options.transport.recoverClaimed(this.options.agentId, signal);
+        if (claimed) {
+          if (!startupReconciled) await this.options.executor.reconcile(claimed);
+          else await this.executeWithLease(claimed, signal);
+          if (signal.aborted) break;
         }
+        startupReconciled = true;
         const input = await this.options.transport.poll(this.options.agentId, signal);
         if (signal.aborted) break;
         apiFailures = 0;
@@ -224,11 +227,14 @@ export class AgentWorker {
 
   private async executeWithLease(input: DeploymentExecutionInput, parentSignal: AbortSignal): Promise<void> {
     if (input.command.state !== "claimed" || !input.command.leaseExpiresAt) throw new Error("Polled command was not leased");
+    const running = await this.options.transport.projectRunning(input.command.id, this.options.agentId);
+    if (!running || running.command.id !== input.command.id || running.command.agentId !== this.options.agentId || !running.applied || running.command.state !== "executing" || !running.command.leaseExpiresAt || parentSignal.aborted) return;
+    const executionInput = { ...input, command: running.command };
     const execution = new AbortController();
     const stop = () => execution.abort();
     parentSignal.addEventListener("abort", stop, { once: true });
     let finished = false;
-    const execute = this.options.executor.execute(input, execution.signal).finally(() => {
+    const execute = this.options.executor.execute(executionInput, execution.signal).finally(() => {
       finished = true;
       execution.abort();
     });
@@ -238,7 +244,7 @@ export class AgentWorker {
         if (finished || execution.signal.aborted) break;
         try {
           const command = await this.options.transport.renewLease(input.command.id, this.options.agentId);
-          if (!command || command.id !== input.command.id || command.agentId !== this.options.agentId || command.state !== "claimed" || !command.leaseExpiresAt) {
+          if (!command || command.id !== input.command.id || command.agentId !== this.options.agentId || command.state !== "executing" || !command.leaseExpiresAt) {
             throw new Error("Command lease renewal was not confirmed");
           }
         } catch {
@@ -371,6 +377,16 @@ export class HttpAgentCommandTransport implements AgentCommandTransport {
 
   async renewLease(commandId: string, agentId: string): Promise<DeploymentCommand | null> {
     return this.commandRequest(commandId, "renew", { agentId });
+  }
+
+  async projectRunning(commandId: string, agentId: string): Promise<{ command: DeploymentCommand; applied: boolean } | null> {
+    const result = await this.request(`/api/v1/agent/commands/${encodeURIComponent(commandId)}/running`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ agentId })
+    });
+    if (result === null) return null;
+    return z.object({ command: deploymentCommandSchema, applied: z.boolean() }).parse(result);
   }
 
   private async commandRequest(commandId: string, action: string, body: Record<string, unknown>): Promise<DeploymentCommand | null> {

@@ -1826,6 +1826,9 @@ describe("Phase 5 slice 1 — DeploymentCommandBus control plane", () => {
       async claim() {
         throw new Error("command store unavailable");
       },
+      async reserveExecution() {
+        throw new Error("command store unavailable");
+      },
       async renewLease() {
         throw new Error("command store unavailable");
       },

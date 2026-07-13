@@ -102,6 +102,7 @@ describe("DeploymentCommandBusService", () => {
     const repository: DeploymentCommandRepository = {
       save: (command) => inner.save(command),
       claim: (...args) => inner.claim(...args),
+      reserveExecution: (...args) => inner.reserveExecution(...args),
       renewLease: (...args) => inner.renewLease(...args),
       findById: (id) => inner.findById(id),
       findActiveForDeployment: (id) => inner.findActiveForDeployment(id),
@@ -155,6 +156,7 @@ describe("DeploymentCommandBusService", () => {
     const repository: DeploymentCommandRepository = {
       save: (command) => inner.save(command),
       claim: (...args) => inner.claim(...args),
+      reserveExecution: (...args) => inner.reserveExecution(...args),
       renewLease: (...args) => inner.renewLease(...args),
       findById: (id) => inner.findById(id),
       findActiveForDeployment: (id) => inner.findActiveForDeployment(id),
@@ -219,6 +221,7 @@ describe("DeploymentCommandBusService", () => {
     const repository: DeploymentCommandRepository = {
       save: (command) => inner.save(command),
       claim: (...args) => inner.claim(...args),
+      reserveExecution: (...args) => inner.reserveExecution(...args),
       findById: (id) => inner.findById(id),
       findActiveForDeployment: (id) => inner.findActiveForDeployment(id),
       list: () => inner.list(),
@@ -250,6 +253,22 @@ describe("DeploymentCommandBusService", () => {
     expect(await inner.findById(command.id)).toMatchObject({ state: "claimed", leaseExpiresAt: "2026-01-01T00:00:50.000Z" });
   });
 
+  it.each(["reserve", "cancel"] as const)("atomically gives %s the claimed-to-executing cancellation race", async (winner) => {
+    const repository = new InMemoryDeploymentCommandRepository();
+    const bus = new DeploymentCommandBusService(repository, () => new Date(NOW));
+    const command = await bus.submit(baseInput);
+    await bus.claim(command.id, command.agentId);
+
+    const reserve = () => bus.reserveExecution(command.id, command.agentId);
+    const cancel = () => bus.cancel(command.id, "user_2");
+    const [first, second] = winner === "reserve"
+      ? await Promise.all([reserve(), cancel()])
+      : await Promise.all([cancel(), reserve()]);
+
+    expect([first?.state, second?.state]).toContain(winner === "reserve" ? "executing" : "cancelled");
+    expect((await bus.findById(command.id))?.state).toBe(winner === "reserve" ? "executing" : "cancelled");
+  });
+
   it("keeps expiry authoritative when it reaches persistence before renewal", async () => {
     const inner = new InMemoryDeploymentCommandRepository();
     const renewGate = deferred();
@@ -259,6 +278,7 @@ describe("DeploymentCommandBusService", () => {
     const repository: DeploymentCommandRepository = {
       save: (command) => inner.save(command),
       claim: (...args) => inner.claim(...args),
+      reserveExecution: (...args) => inner.reserveExecution(...args),
       findById: (id) => inner.findById(id),
       findActiveForDeployment: (id) => inner.findActiveForDeployment(id),
       list: () => inner.list(),
@@ -299,6 +319,7 @@ describe("DeploymentCommandBusService", () => {
     const repository: DeploymentCommandRepository = {
       save: (command) => inner.save(command),
       claim: (...args) => inner.claim(...args),
+      reserveExecution: (...args) => inner.reserveExecution(...args),
       renewLease: (...args) => inner.renewLease(...args),
       findById: (id) => inner.findById(id),
       findActiveForDeployment: (id) => inner.findActiveForDeployment(id),
@@ -375,7 +396,7 @@ describe("DeploymentCommandBusService", () => {
     const renewEntered = deferred();
     const failEntered = deferred();
     const repository: DeploymentCommandRepository = {
-      save: (value) => inner.save(value), claim: (...args) => inner.claim(...args), findById: (id) => inner.findById(id),
+      save: (value) => inner.save(value), claim: (...args) => inner.claim(...args), reserveExecution: (...args) => inner.reserveExecution(...args), findById: (id) => inner.findById(id),
       findActiveForDeployment: (id) => inner.findActiveForDeployment(id), list: () => inner.list(),
       async renewLease(...args) { renewEntered.resolve(); await renewGate.promise; return inner.renewLease(...args); },
       async transitionTerminal(...args) { failEntered.resolve(); await failGate.promise; return inner.transitionTerminal(...args); }
@@ -430,8 +451,8 @@ describe("DeploymentCommandBusService", () => {
     const command = await bus.submit(baseInput);
     const dispatched = await bus.dispatch(command);
 
-    expect(executor.execute).toHaveBeenCalledWith(expect.objectContaining({ id: command.id, state: "claimed" }));
-    expect(dispatched?.state).toBe("claimed");
+    expect(executor.execute).toHaveBeenCalledWith(expect.objectContaining({ id: command.id, state: "executing" }));
+    expect(dispatched?.state).toBe("executing");
     expect((await bus.findById(command.id))?.state).toBe("completed");
   });
 
@@ -455,6 +476,7 @@ describe("DeploymentCommandBusService", () => {
     expect(events.map((event) => event.type)).toEqual([
       "deployment.command.submitted",
       "deployment.command.claimed",
+      "deployment.command.executing",
       "deployment.command.failed"
     ]);
   });

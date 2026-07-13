@@ -183,11 +183,11 @@ describe("domain foundation", () => {
       log: { id: "log_running", deploymentId: "dep_running", level: "info", message: `running token ${secretToken}`, timestamp: now.toISOString(), redactionApplied: false, requestId: "req_running", correlationId: "corr_running" },
       audit: { action: "deployment.running", targetType: "deployment", targetId: "dep_running", requestId: "req_running", correlationId: "corr_running", metadata: { token: secretToken } }
     };
-    await expect(commands.projectRunning("cmd_running", "agent_1", runningProjection)).resolves.toMatchObject({ applied: true, command: { state: "claimed" } });
+    await expect(commands.projectRunning("cmd_running", "agent_1", runningProjection)).resolves.toMatchObject({ applied: true, command: { state: "executing" } });
     await expect(commands.projectRunning("cmd_running", "agent_1", {
       ...runningProjection,
       log: { ...runningProjection.log, id: "log_running_retry", message: "retry token dl_fedcba0987654321" }
-    })).resolves.toMatchObject({ applied: true });
+    })).resolves.toMatchObject({ applied: false });
 
     expect(await deployments.findById("dep_running")).toMatchObject({ status: "running" });
     const persistedLogs = await deployments.listLogs("dep_running");

@@ -195,13 +195,84 @@ describeIntegration("DeployLite API PostgreSQL integration", () => {
 
     await restartedApp.close();
   }, 30_000);
+
+  it("projects real-agent running exactly once and rejects cancelled or stale leases without effects", async () => {
+    const agentId = randomUUID();
+    const projectId = randomUUID();
+    const token = "postgres-agent-token-for-running-projection";
+    const now = new Date();
+    const commands = new DbDeploymentCommandRepository(requireDb());
+    const deployments = new DbDeploymentRepository(requireDb());
+
+    await new DbProjectRepository(requireDb()).save({
+      id: projectId, name: "Running projection project", repoUrl: "https://github.com/example/running-projection", defaultBranch: "main", buildCommand: null, runCommand: null, port: 3000, description: null, imageTag: null
+    });
+    await new DbAgentRepository(requireDb()).save({
+      id: agentId, name: "Running projection agent", endpoint: "https://running.agent.postgres.test", status: "online", lastHeartbeatAt: now.toISOString(), resourceSnapshot: null
+    });
+    const app = await createPostgresApp({
+      DEPLOYLITE_AGENT_ID: agentId,
+      DEPLOYLITE_AGENT_TOKEN: token,
+      DEPLOYLITE_SECRET_KEY: "postgres-agent-running-projection-secret"
+    });
+    const headers = { ...contentHeaders, authorization: `Bearer ${token}` };
+
+    const seed = async (suffix: string, leaseExpiresAt: string) => {
+      const deploymentId = randomUUID();
+      const commandId = randomUUID();
+      await deployments.save({ id: deploymentId, projectId, agentId, status: "queued", commitSha: "abcdef1", startedAt: now.toISOString(), finishedAt: null });
+      await commands.save({
+        id: commandId, deploymentId, agentId, kind: "start", state: "claimed", payload: {}, requestedBy: null,
+        requestId: `req-running-${suffix}`, correlationId: `corr-running-${suffix}`, issuedAt: now.toISOString(), claimedAt: now.toISOString(), leaseExpiresAt, completedAt: null, failureReason: null
+      });
+      return { commandId, deploymentId };
+    };
+
+    try {
+      const live = await seed("live", new Date(now.getTime() + 60_000).toISOString());
+      const first = await app.inject({ method: "POST", url: `/api/v1/agent/commands/${live.commandId}/running`, headers, payload: { agentId } });
+      const retry = await app.inject({ method: "POST", url: `/api/v1/agent/commands/${live.commandId}/running`, headers, payload: { agentId } });
+      expect(first.statusCode).toBe(200);
+      expect(first.json()).toMatchObject({ applied: true, command: { id: live.commandId, state: "executing" } });
+      expect(retry.json()).toMatchObject({ applied: false, command: { id: live.commandId } });
+      expect(await deployments.findById(live.deploymentId)).toMatchObject({ status: "running" });
+      const logs = await deployments.listLogs(live.deploymentId);
+      expect(logs).toEqual([expect.objectContaining({ message: "Agent claimed deployment command; deployment is running.", redactionApplied: true })]);
+       expect(JSON.stringify(logs)).not.toContain(token);
+       await expect(requirePool().query("SELECT count(*)::int AS count FROM audit_events WHERE request_id = $1", ["req-running-live"])).resolves.toMatchObject({ rows: [{ count: 1 }] });
+
+       const postProjectionCancelled = await seed("post-projection-cancelled", new Date(now.getTime() + 60_000).toISOString());
+       const projected = await app.inject({ method: "POST", url: `/api/v1/agent/commands/${postProjectionCancelled.commandId}/running`, headers, payload: { agentId } });
+      expect(projected.json()).toMatchObject({ applied: true, command: { state: "executing" } });
+      const cancellation = await commands.cancel(postProjectionCancelled.commandId, null, now.toISOString());
+      expect(cancellation).toMatchObject({ applied: false, command: { state: "executing" } });
+      expect(await deployments.findById(postProjectionCancelled.deploymentId)).toMatchObject({ status: "running" });
+       expect(await deployments.listLogs(postProjectionCancelled.deploymentId)).toHaveLength(1);
+       await expect(requirePool().query("SELECT count(*)::int AS count FROM audit_events WHERE request_id = $1", ["req-running-post-projection-cancelled"])).resolves.toMatchObject({ rows: [{ count: 1 }] });
+
+       const cancelled = await seed("cancelled", new Date(now.getTime() + 60_000).toISOString());
+      await commands.cancel(cancelled.commandId, null, now.toISOString());
+      const cancelledResponse = await app.inject({ method: "POST", url: `/api/v1/agent/commands/${cancelled.commandId}/running`, headers, payload: { agentId } });
+      expect(cancelledResponse.json()).toMatchObject({ applied: false, command: { state: "cancelled" } });
+      expect(await deployments.findById(cancelled.deploymentId)).toMatchObject({ status: "queued" });
+      expect(await deployments.listLogs(cancelled.deploymentId)).toEqual([]);
+
+      const stale = await seed("stale", new Date(now.getTime() - 1_000).toISOString());
+      const staleResponse = await app.inject({ method: "POST", url: `/api/v1/agent/commands/${stale.commandId}/running`, headers, payload: { agentId } });
+      expect(staleResponse.json()).toMatchObject({ applied: false, command: { state: "claimed" } });
+      expect(await deployments.findById(stale.deploymentId)).toMatchObject({ status: "queued" });
+      expect(await deployments.listLogs(stale.deploymentId)).toEqual([]);
+    } finally {
+      await app.close();
+    }
+  }, 30_000);
 });
 
-async function createPostgresApp(): Promise<FastifyInstance> {
+async function createPostgresApp(envOverrides: NodeJS.ProcessEnv = {}): Promise<FastifyInstance> {
   return buildApiApp({
     authConfig: { cookieName: "dl_pg_session", cookieSecure: false, sessionTtlSeconds: 3600 },
     db: { pool: requirePool(), client: requireDb() },
-    env: { ...process.env, NODE_ENV: "test", DATABASE_URL: databaseUrl, DEPLOYLITE_BCRYPT_COST: "10" }
+    env: { ...process.env, NODE_ENV: "test", DATABASE_URL: databaseUrl, DEPLOYLITE_BCRYPT_COST: "10", ...envOverrides }
   });
 }
 

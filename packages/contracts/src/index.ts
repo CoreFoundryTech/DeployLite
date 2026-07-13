@@ -204,13 +204,13 @@ export const deploymentSchema = z.object({
 // bus port (`DeploymentCommandBus` in `packages/domain`).
 //
 // State machine:
-//   pending  -> claimed   -> completed
-//                        -> failed
+//   pending  -> claimed   -> executing -> completed
+//                                     -> failed
 //           -> cancelled
-//   claimed  -> cancelled (handled by the executor mid-flight)
+//   claimed  -> cancelled
 // =====================================================================
 
-export const deploymentCommandStateSchema = z.enum(["pending", "claimed", "completed", "cancelled", "failed"]);
+export const deploymentCommandStateSchema = z.enum(["pending", "claimed", "executing", "completed", "cancelled", "failed"]);
 
 export const deploymentCommandKindSchema = z.enum(["start", "cancel", "restart", "rollback"]);
 
@@ -234,6 +234,7 @@ export const deploymentCommandSchema = z.object({
 export const deploymentCommandEventTypeSchema = z.enum([
   "deployment.command.submitted",
   "deployment.command.claimed",
+  "deployment.command.executing",
   "deployment.command.completed",
   "deployment.command.failed",
   "deployment.command.cancelled"

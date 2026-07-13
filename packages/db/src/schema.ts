@@ -298,7 +298,7 @@ export const deploymentCommands = pgTable(
     index("deployment_commands_issued_at_idx").on(table.issuedAt),
     index("deployment_commands_lease_expires_at_idx").on(table.leaseExpiresAt),
     check("deployment_commands_kind_valid", sql`${table.kind} in ('start', 'cancel', 'restart', 'rollback')`),
-    check("deployment_commands_state_valid", sql`${table.state} in ('pending', 'claimed', 'completed', 'cancelled', 'failed')`),
+    check("deployment_commands_state_valid", sql`${table.state} in ('pending', 'claimed', 'executing', 'completed', 'cancelled', 'failed')`),
     check(
       "deployment_commands_terminal_state_has_completed_at",
       sql`(${table.state} in ('completed', 'cancelled', 'failed')) = (${table.completedAt} is not null)`
@@ -309,7 +309,7 @@ export const deploymentCommands = pgTable(
     ),
     check(
       "deployment_commands_claimed_has_lease",
-      sql`(${table.state} = 'claimed') = (${table.leaseExpiresAt} is not null)`
+      sql`(${table.state} in ('claimed', 'executing')) = (${table.leaseExpiresAt} is not null)`
     )
   ]
 );

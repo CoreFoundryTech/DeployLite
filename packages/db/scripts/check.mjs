@@ -90,7 +90,7 @@ function assertRequiredFoundation(sql) {
     "CREATE INDEX audit_events_actor_user_id_idx ON audit_events (actor_user_id)",
     "CREATE INDEX certificates_domain_id_idx ON certificates (domain_id)",
     "CONSTRAINT deployment_commands_kind_valid CHECK (kind IN ('start', 'cancel', 'restart', 'rollback'))",
-    "CONSTRAINT deployment_commands_state_valid CHECK (state IN ('pending', 'claimed', 'completed', 'cancelled', 'failed'))",
+    "CONSTRAINT deployment_commands_state_valid CHECK (state IN ('pending', 'claimed', 'executing', 'completed', 'cancelled', 'failed'))",
     "CREATE INDEX deployment_commands_state_idx ON deployment_commands (state)",
     "CREATE INDEX deployment_commands_agent_id_idx ON deployment_commands (agent_id)"
   ];

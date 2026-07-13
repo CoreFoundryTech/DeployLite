@@ -318,11 +318,11 @@ describeIntegration("PostgreSQL auth foundation integration", () => {
     const repository = new DbDeploymentCommandRepository(requireDb());
     const projection = runningProjection(live);
 
-    await expect(repository.projectRunning(live.commandId, live.agentId, projection)).resolves.toMatchObject({ applied: true, command: { state: "claimed" } });
+    await expect(repository.projectRunning(live.commandId, live.agentId, projection)).resolves.toMatchObject({ applied: true, command: { state: "executing" } });
     await expect(repository.projectRunning(live.commandId, live.agentId, {
       ...projection,
       log: { ...projection.log, id: randomUUID(), message: "retry token dl_fedcba0987654321" }
-    })).resolves.toMatchObject({ applied: true });
+    })).resolves.toMatchObject({ applied: false });
     await expect(client.query("SELECT status FROM deployments WHERE id = $1", [live.deploymentId])).resolves.toMatchObject({ rows: [{ status: "running" }] });
     await expect(client.query("SELECT sequence, message, redaction_applied FROM deployment_logs WHERE deployment_id = $1", [live.deploymentId])).resolves.toMatchObject({ rows: [{ sequence: 1, message: "running token [REDACTED]", redaction_applied: true }] });
     await expect(client.query("SELECT count(*)::int AS count FROM deployment_logs WHERE deployment_id = $1 AND message LIKE 'retry%'", [live.deploymentId])).resolves.toMatchObject({ rows: [{ count: 0 }] });
