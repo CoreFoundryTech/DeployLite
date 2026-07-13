@@ -160,7 +160,7 @@ describe("domain foundation", () => {
     await expect(deployments.appendAllocatedLog({ id: "allocated_log", deploymentId: "dep_explicit", level: "info", message: "allocated", timestamp: now.toISOString(), redactionApplied: false, requestId: "req_explicit", correlationId: "corr_explicit" })).resolves.toMatchObject({ sequence: 8 });
   });
 
-  it("projects a claimed live lease to running with one redacted allocated log and audit event", async () => {
+  it("deduplicates a running projection retry with a changed message, preserving its first redacted log and one audit event", async () => {
     const deployments = new InMemoryDeploymentRepository();
     const audits: Array<{ action: string; metadata?: Record<string, unknown> }> = [];
     const secretToken = "dl_1234567890abcdef";
@@ -184,12 +184,16 @@ describe("domain foundation", () => {
       audit: { action: "deployment.running", targetType: "deployment", targetId: "dep_running", requestId: "req_running", correlationId: "corr_running", metadata: { token: secretToken } }
     };
     await expect(commands.projectRunning("cmd_running", "agent_1", runningProjection)).resolves.toMatchObject({ applied: true, command: { state: "claimed" } });
-    await expect(commands.projectRunning("cmd_running", "agent_1", runningProjection)).resolves.toMatchObject({ applied: true });
+    await expect(commands.projectRunning("cmd_running", "agent_1", {
+      ...runningProjection,
+      log: { ...runningProjection.log, id: "log_running_retry", message: "retry token dl_fedcba0987654321" }
+    })).resolves.toMatchObject({ applied: true });
 
     expect(await deployments.findById("dep_running")).toMatchObject({ status: "running" });
     const persistedLogs = await deployments.listLogs("dep_running");
     expect(persistedLogs).toEqual([expect.objectContaining({ sequence: 1, message: "running token [REDACTED]", redactionApplied: true })]);
     expect(JSON.stringify(persistedLogs)).not.toContain(secretToken);
+    expect(JSON.stringify(persistedLogs)).not.toContain("retry token");
     expect(audits).toEqual([expect.objectContaining({ action: "deployment.running", metadata: { token: "[REDACTED]" } })]);
     expect(JSON.stringify(audits)).not.toContain(secretToken);
   });

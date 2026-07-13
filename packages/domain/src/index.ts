@@ -617,7 +617,7 @@ export class InMemoryDeploymentCommandRepository implements DeploymentCommandRep
       try {
         const existingLogs = await this.#projection!.deployments.listLogs(projection.deployment.id);
         const safeMessage = redactLogMessage(projection.log.message);
-        if (!existingLogs.some((log) => log.requestId === projection.log.requestId && log.correlationId === projection.log.correlationId && log.message === safeMessage)) {
+        if (!existingLogs.some((log) => log.requestId === projection.log.requestId && log.correlationId === projection.log.correlationId)) {
           await this.#projection!.deployments.save(projection.deployment);
           await this.#projection!.deployments.appendAllocatedLog({ ...projection.log, message: safeMessage, redactionApplied: true });
         }

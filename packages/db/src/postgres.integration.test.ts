@@ -312,16 +312,20 @@ describeIntegration("PostgreSQL auth foundation integration", () => {
     ).toThrow("Environment variable metadata cannot include secret value field");
   });
 
-  it("projects a live claimed command with redacted log and idempotent audit, while rejecting non-live leases", async () => {
+  it("deduplicates a running projection retry with a changed message, preserving its first redacted log and one audit event", async () => {
     const client = requirePool();
     const live = await seedClaimedProjectionFixture("live", new Date(Date.now() + 60_000).toISOString());
     const repository = new DbDeploymentCommandRepository(requireDb());
     const projection = runningProjection(live);
 
     await expect(repository.projectRunning(live.commandId, live.agentId, projection)).resolves.toMatchObject({ applied: true, command: { state: "claimed" } });
-    await expect(repository.projectRunning(live.commandId, live.agentId, projection)).resolves.toMatchObject({ applied: true });
+    await expect(repository.projectRunning(live.commandId, live.agentId, {
+      ...projection,
+      log: { ...projection.log, id: randomUUID(), message: "retry token dl_fedcba0987654321" }
+    })).resolves.toMatchObject({ applied: true });
     await expect(client.query("SELECT status FROM deployments WHERE id = $1", [live.deploymentId])).resolves.toMatchObject({ rows: [{ status: "running" }] });
     await expect(client.query("SELECT sequence, message, redaction_applied FROM deployment_logs WHERE deployment_id = $1", [live.deploymentId])).resolves.toMatchObject({ rows: [{ sequence: 1, message: "running token [REDACTED]", redaction_applied: true }] });
+    await expect(client.query("SELECT count(*)::int AS count FROM deployment_logs WHERE deployment_id = $1 AND message LIKE 'retry%'", [live.deploymentId])).resolves.toMatchObject({ rows: [{ count: 0 }] });
     await expect(client.query("SELECT count(*)::int AS count FROM audit_events WHERE request_id = $1", [live.requestId])).resolves.toMatchObject({ rows: [{ count: 1 }] });
     await expect(client.query("SELECT metadata FROM audit_events WHERE request_id = $1", [live.requestId])).resolves.toMatchObject({ rows: [{ metadata: { token: "[REDACTED]" } }] });
 
