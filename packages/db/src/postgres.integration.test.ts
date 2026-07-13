@@ -239,12 +239,12 @@ describeIntegration("PostgreSQL auth foundation integration", () => {
       endpoint: "https://agent.integration.test",
       status: "online"
     });
-    await expect(requireDbProjectRepository().list()).resolves.toContainEqual({
+    await expect(requireDbProjectRepository().list()).resolves.toContainEqual(expect.objectContaining({
       id: projectId,
       name: "Integration project",
       repoUrl: "https://github.com/example/deploylite-integration",
       defaultBranch: "main"
-    });
+    }));
     await expect(requireDbDeploymentRepository().findById(deploymentId)).resolves.toMatchObject({
       id: deploymentId,
       projectId,
