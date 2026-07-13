@@ -229,11 +229,16 @@ export class AgentWorker {
     if (input.command.state !== "claimed" || !input.command.leaseExpiresAt) throw new Error("Polled command was not leased");
     const running = await this.options.transport.projectRunning(input.command.id, this.options.agentId);
     if (!running || running.command.id !== input.command.id || running.command.agentId !== this.options.agentId || !running.applied) return;
+    // The projection acknowledgement is not an execution lease: cancellation can
+    // win after it commits. Revalidate immediately before any executor side effect.
+    const authoritative = await this.options.transport.renewLease(input.command.id, this.options.agentId);
+    if (!authoritative || authoritative.id !== input.command.id || authoritative.agentId !== this.options.agentId || authoritative.state !== "claimed" || !authoritative.leaseExpiresAt || parentSignal.aborted) return;
+    const executionInput = { ...input, command: authoritative };
     const execution = new AbortController();
     const stop = () => execution.abort();
     parentSignal.addEventListener("abort", stop, { once: true });
     let finished = false;
-    const execute = this.options.executor.execute(input, execution.signal).finally(() => {
+    const execute = this.options.executor.execute(executionInput, execution.signal).finally(() => {
       finished = true;
       execution.abort();
     });

@@ -253,6 +253,18 @@ describe("agent command HTTP transport integration", () => {
     expect(stale.auditInputs).toEqual([]);
   });
 
+  it("returns cancellation as the authoritative pre-execution lease state without duplicating running effects", async () => {
+    const test = await fixture();
+    await test.transport.poll(agentId, new AbortController().signal);
+    await expect(test.transport.projectRunning(commandId, agentId)).resolves.toMatchObject({ applied: true, command: { state: "claimed" } });
+    await test.commands.transitionTerminal(commandId, agentId, "claimed", { state: "cancelled", completedAt: "2026-07-10T00:00:05.000Z", leaseExpiresAt: null, failureReason: null, payload: {} });
+
+    await expect(test.transport.renewLease(commandId, agentId)).resolves.toMatchObject({ state: "cancelled", leaseExpiresAt: null });
+    expect(await test.deployments.findById(deploymentId)).toMatchObject({ status: "running" });
+    expect((await test.deployments.listLogs(deploymentId)).filter((log) => log.message.startsWith("Agent claimed deployment command"))).toHaveLength(1);
+    expect(test.auditInputs.filter((event) => event.action === "deployment.running")).toHaveLength(1);
+  });
+
   it("does not terminally mutate a command when running projection persistence fails", async () => {
     const test = await fixture();
     await test.transport.poll(agentId, new AbortController().signal);

@@ -25,7 +25,7 @@ function transport(overrides: Partial<AgentCommandTransport> = {}): AgentCommand
     recoverClaimed: vi.fn(async () => null),
     projectRunning: vi.fn(async () => ({ command: { ...command, state: "claimed" as const, leaseExpiresAt: "2026-01-01T00:00:30.000Z" }, applied: true })),
     claim: vi.fn(async () => ({ ...command, state: "claimed" as const, leaseExpiresAt: "2026-01-01T00:00:30.000Z" })),
-    renewLease: vi.fn(async () => ({ ...command, state: "claimed" as const, leaseExpiresAt: "2026-01-01T00:00:30.000Z" })),
+    renewLease: vi.fn(async () => input.command),
     complete: vi.fn(async () => ({ ...command, state: "completed" as const })),
     fail: vi.fn(async () => ({ ...command, state: "failed" as const })),
     ...overrides
@@ -67,6 +67,38 @@ describe("AgentWorker", () => {
     await new AgentWorker({ agentId: "agent-1", agentName: "Agent", agentEndpoint: "http://agent.test", transport: commandTransport, executor, resourceCollector: { collect: async () => snapshot } }).run(shutdown.signal);
 
     expect(commandTransport.projectRunning).toHaveBeenCalledWith("command-1", "agent-1");
+    expect(executor.execute).not.toHaveBeenCalled();
+  });
+
+  it("does not execute when cancellation wins after the running projection and before execution", async () => {
+    const shutdown = new AbortController();
+    let releaseRevalidation!: () => void;
+    let revalidationStarted!: () => void;
+    const revalidationGate = new Promise<void>((resolve) => { releaseRevalidation = resolve; });
+    const revalidationReached = new Promise<void>((resolve) => { revalidationStarted = resolve; });
+    let cancelled = false;
+    const cancel = vi.fn(() => { cancelled = true; });
+    const commandTransport = transport({
+      poll: vi.fn(async () => input),
+      renewLease: vi.fn(async () => {
+        revalidationStarted();
+        await revalidationGate;
+        shutdown.abort();
+        return cancelled ? { ...input.command, state: "cancelled" as const, completedAt: "2026-01-01T00:00:01.000Z", leaseExpiresAt: null } : input.command;
+      })
+    });
+    const executor = { execute: vi.fn(), reconcile: vi.fn() };
+    const worker = new AgentWorker({ agentId: "agent-1", agentName: "Agent", agentEndpoint: "http://agent.test", transport: commandTransport, executor, resourceCollector: { collect: async () => snapshot } });
+
+    const running = worker.run(shutdown.signal);
+    await revalidationReached;
+    cancel();
+    releaseRevalidation();
+    await running;
+
+    expect(commandTransport.projectRunning).toHaveBeenCalledOnce();
+    expect(cancel).toHaveBeenCalledOnce();
+    expect(commandTransport.renewLease).toHaveBeenCalledOnce();
     expect(executor.execute).not.toHaveBeenCalled();
   });
 
@@ -446,9 +478,13 @@ describe("AgentWorker", () => {
 
   it("aborts execution when lease renewal cannot be confirmed and does not execute twice", async () => {
     const shutdown = new AbortController();
+    const renewLease = vi.fn(async () => {
+      if (renewLease.mock.calls.length === 1) return input.command;
+      throw new Error("network partition");
+    });
     const commandTransport = transport({
       poll: vi.fn(async () => input),
-      renewLease: vi.fn(async () => { throw new Error("network partition"); })
+      renewLease
     });
     const executor = {
       reconcile: vi.fn(),
@@ -463,7 +499,7 @@ describe("AgentWorker", () => {
       executor, resourceCollector: { collect: async () => snapshot }, leaseRenewalIntervalMs: 1,
       wait: async (_milliseconds, signal) => { if (!signal.aborted) await Promise.resolve(); }
     }).run(shutdown.signal);
-    expect(commandTransport.renewLease).toHaveBeenCalledOnce();
+    expect(commandTransport.renewLease).toHaveBeenCalledTimes(2);
     expect(executor.execute).toHaveBeenCalledOnce();
   });
 

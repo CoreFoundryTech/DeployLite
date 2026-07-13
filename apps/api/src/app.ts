@@ -1133,6 +1133,7 @@ function registerRoutes(app: FastifyInstance, state: PlatformRepositories, adapt
     const renewed = await state.deploymentCommandBus.renewLease(params.data.commandId, state.externalAgentIdentity.agentId);
     if (!renewed) {
       const existing = await assignedCommand(state, params.data.commandId, state.externalAgentIdentity.agentId);
+      if (existing && existing.state !== "claimed") return reply.send(existing);
       if (existing?.state === "claimed") await reconcileExpiredClaims(state, state.externalAgentIdentity.agentId);
       return reply.code(409).send(errorEnvelope(request, "COMMAND_LEASE_LOST", "Command lease could not be renewed."));
     }
