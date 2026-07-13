@@ -815,7 +815,7 @@ async function terminallyFailAgentCommand(state: PlatformRepositories, command: 
 async function terminallyExpireAgentCommand(state: PlatformRepositories, command: DeploymentCommand, reason: string, marker: string): Promise<DeploymentCommand | null> {
   const safeReason = redactLogMessage(reason).slice(0, INVALID_COMMAND_REASON_MAX);
   const authoritative = await state.deploymentCommandBus.failExpiredClaim(command.id, safeReason);
-  if (authoritative && authoritative.state !== "claimed") {
+  if (authoritative && authoritative.state !== "claimed" && authoritative.state !== "executing") {
     await projectAuthoritativeTerminalCommand(state, authoritative, { marker, message: `${marker}: ${safeReason}` });
   }
   return authoritative;
@@ -824,7 +824,7 @@ async function terminallyExpireAgentCommand(state: PlatformRepositories, command
 async function reconcileExpiredClaims(state: PlatformRepositories, agentId: string): Promise<void> {
   const now = state.now().getTime();
   const assigned = (await state.deploymentCommandBus.list()).filter((command) => command.agentId === agentId);
-  const claimed = assigned.filter((command) => command.state === "claimed");
+  const claimed = assigned.filter((command) => command.state === "claimed" || command.state === "executing");
   for (const command of claimed) {
     if (!command.leaseExpiresAt || new Date(command.leaseExpiresAt).getTime() <= now) {
       await terminallyExpireAgentCommand(state, command, "Agent command lease expired; execution was not retried.", "Agent command lease expired");
@@ -1133,11 +1133,21 @@ function registerRoutes(app: FastifyInstance, state: PlatformRepositories, adapt
     const renewed = await state.deploymentCommandBus.renewLease(params.data.commandId, state.externalAgentIdentity.agentId);
     if (!renewed) {
       const existing = await assignedCommand(state, params.data.commandId, state.externalAgentIdentity.agentId);
-      if (existing && existing.state !== "claimed") return reply.send(existing);
-      if (existing?.state === "claimed") await reconcileExpiredClaims(state, state.externalAgentIdentity.agentId);
+      if (existing && existing.state !== "claimed" && existing.state !== "executing") return reply.send(existing);
+      if (existing?.state === "claimed" || existing?.state === "executing") await reconcileExpiredClaims(state, state.externalAgentIdentity.agentId);
       return reply.code(409).send(errorEnvelope(request, "COMMAND_LEASE_LOST", "Command lease could not be renewed."));
     }
     return reply.send(renewed);
+  });
+  app.post(`${API_PREFIX}/agent/commands/:commandId/reserve`, async (request, reply) => {
+    if (!authenticateAgentRequest(request, reply, state.externalAgentIdentity)) return reply;
+    const params = z.object({ commandId: commandIdSchema }).safeParse(request.params);
+    const body = agentClaimBodySchema.safeParse(request.body);
+    if (!params.success || !body.success) return reply.code(400).send(errorEnvelope(request, "VALIDATION_ERROR", "Invalid agent command request."));
+    if (body.data.agentId !== state.externalAgentIdentity.agentId) return reply.code(403).send(errorEnvelope(request, "AGENT_IDENTITY_MISMATCH", "Agent identity mismatch."));
+    const reserved = await state.deploymentCommandBus.reserveExecution(params.data.commandId, state.externalAgentIdentity.agentId);
+    if (!reserved) return reply.code(409).send(errorEnvelope(request, "COMMAND_STATE_CONFLICT", "Command cannot be reserved for execution in its current state."));
+    return reply.send(reserved);
   });
   app.post(`${API_PREFIX}/agent/commands/:commandId/complete`, async (request, reply) => {
     if (!authenticateAgentRequest(request, reply, state.externalAgentIdentity)) return reply;
@@ -1158,11 +1168,11 @@ function registerRoutes(app: FastifyInstance, state: PlatformRepositories, adapt
       await projectAuthoritativeTerminalCommand(state, existing);
       return reply.code(409).send(terminalConflictResponse(request, existing, "completed"));
     }
-    if (existing.state !== "claimed") return reply.code(409).send(errorEnvelope(request, "COMMAND_STATE_CONFLICT", "Command cannot be completed in its current state."));
+    if (existing.state !== "executing") return reply.code(409).send(errorEnvelope(request, "COMMAND_STATE_CONFLICT", "Command cannot be completed in its current state."));
     if (!existing.leaseExpiresAt || new Date(existing.leaseExpiresAt).getTime() <= state.now().getTime()) {
       const authoritative = await terminallyExpireAgentCommand(state, existing, "Agent command lease expired; completion was rejected.", "Agent command lease expired");
       if (authoritative?.state === "completed") return reply.send(authoritative);
-      if (authoritative && authoritative.state !== "claimed") return reply.code(409).send(terminalConflictResponse(request, authoritative, "completed"));
+      if (authoritative && authoritative.state !== "claimed" && authoritative.state !== "executing") return reply.code(409).send(terminalConflictResponse(request, authoritative, "completed"));
       if (!authoritative) return reply.code(404).send(errorEnvelope(request, "NOT_FOUND", "Command not found."));
     }
     const completed = await state.deploymentCommandBus.complete(existing.id, body.data.output ? redactSecrets(body.data.output) : undefined);
@@ -1191,10 +1201,10 @@ function registerRoutes(app: FastifyInstance, state: PlatformRepositories, adapt
       await projectAuthoritativeTerminalCommand(state, existing);
       return reply.code(409).send(terminalConflictResponse(request, existing, "failed"));
     }
-    if (existing.state !== "claimed") return reply.code(409).send(errorEnvelope(request, "COMMAND_STATE_CONFLICT", "Command cannot fail in its current state."));
+    if (existing.state !== "executing") return reply.code(409).send(errorEnvelope(request, "COMMAND_STATE_CONFLICT", "Command cannot fail in its current state."));
     const failed = await state.deploymentCommandBus.fail(existing.id, safeReason);
     if (!failed) return reply.code(404).send(errorEnvelope(request, "NOT_FOUND", "Command not found."));
-    if (failed.state === "claimed") {
+    if (failed.state === "executing") {
       const authoritative = await state.deploymentCommandBus.findById(existing.id);
       if (!authoritative) return reply.code(404).send(errorEnvelope(request, "NOT_FOUND", "Command not found."));
       return reply.code(409).send(leaseConflictResponse(request, authoritative, "failed"));

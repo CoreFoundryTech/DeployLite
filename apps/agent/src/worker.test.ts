@@ -25,6 +25,7 @@ function transport(overrides: Partial<AgentCommandTransport> = {}): AgentCommand
     recoverClaimed: vi.fn(async () => null),
     projectRunning: vi.fn(async () => ({ command: { ...command, state: "claimed" as const, leaseExpiresAt: "2026-01-01T00:00:30.000Z" }, applied: true })),
     claim: vi.fn(async () => ({ ...command, state: "claimed" as const, leaseExpiresAt: "2026-01-01T00:00:30.000Z" })),
+    reserveExecution: vi.fn(async () => ({ ...command, state: "executing" as const, leaseExpiresAt: "2026-01-01T00:00:30.000Z" })),
     renewLease: vi.fn(async () => input.command),
     complete: vi.fn(async () => ({ ...command, state: "completed" as const })),
     fail: vi.fn(async () => ({ ...command, state: "failed" as const })),
@@ -50,7 +51,7 @@ describe("AgentWorker", () => {
     expect(commandTransport.register).toHaveBeenCalledOnce();
     expect(commandTransport.poll).toHaveBeenCalledWith("agent-1", shutdown.signal);
     expect(commandTransport.projectRunning).toHaveBeenCalledWith("command-1", "agent-1");
-    expect(executor.execute).toHaveBeenCalledWith(input, expect.any(AbortSignal));
+    expect(executor.execute).toHaveBeenCalledWith({ ...input, command: expect.objectContaining({ state: "executing" }) }, expect.any(AbortSignal));
   });
 
   it("does not execute when the authoritative running projection rejects a cancelled or stale command", async () => {
@@ -70,19 +71,19 @@ describe("AgentWorker", () => {
     expect(executor.execute).not.toHaveBeenCalled();
   });
 
-  it("does not execute when cancellation wins after the running projection and before execution", async () => {
+  it("lets exactly one of cancellation and execution reservation win before any executor call", async () => {
     const shutdown = new AbortController();
-    let releaseRevalidation!: () => void;
-    let revalidationStarted!: () => void;
-    const revalidationGate = new Promise<void>((resolve) => { releaseRevalidation = resolve; });
-    const revalidationReached = new Promise<void>((resolve) => { revalidationStarted = resolve; });
+    let releaseReservation!: () => void;
+    let reservationStarted!: () => void;
+    const reservationGate = new Promise<void>((resolve) => { releaseReservation = resolve; });
+    const reservationReached = new Promise<void>((resolve) => { reservationStarted = resolve; });
     let cancelled = false;
     const cancel = vi.fn(() => { cancelled = true; });
     const commandTransport = transport({
       poll: vi.fn(async () => input),
-      renewLease: vi.fn(async () => {
-        revalidationStarted();
-        await revalidationGate;
+      reserveExecution: vi.fn(async () => {
+        reservationStarted();
+        await reservationGate;
         shutdown.abort();
         return cancelled ? { ...input.command, state: "cancelled" as const, completedAt: "2026-01-01T00:00:01.000Z", leaseExpiresAt: null } : input.command;
       })
@@ -91,14 +92,14 @@ describe("AgentWorker", () => {
     const worker = new AgentWorker({ agentId: "agent-1", agentName: "Agent", agentEndpoint: "http://agent.test", transport: commandTransport, executor, resourceCollector: { collect: async () => snapshot } });
 
     const running = worker.run(shutdown.signal);
-    await revalidationReached;
+    await reservationReached;
     cancel();
-    releaseRevalidation();
+    releaseReservation();
     await running;
 
     expect(commandTransport.projectRunning).toHaveBeenCalledOnce();
     expect(cancel).toHaveBeenCalledOnce();
-    expect(commandTransport.renewLease).toHaveBeenCalledOnce();
+    expect(commandTransport.reserveExecution).toHaveBeenCalledOnce();
     expect(executor.execute).not.toHaveBeenCalled();
   });
 
@@ -479,7 +480,7 @@ describe("AgentWorker", () => {
   it("aborts execution when lease renewal cannot be confirmed and does not execute twice", async () => {
     const shutdown = new AbortController();
     const renewLease = vi.fn(async () => {
-      if (renewLease.mock.calls.length === 1) return input.command;
+      if (renewLease.mock.calls.length === 1) return { ...input.command, state: "executing" as const };
       throw new Error("network partition");
     });
     const commandTransport = transport({

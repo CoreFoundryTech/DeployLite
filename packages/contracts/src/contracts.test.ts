@@ -230,7 +230,7 @@ describe("contracts", () => {
   });
 
   it("exposes the deployment command bus state and kind enums and rejects unknown values", () => {
-    expect(deploymentCommandStateSchema.options).toEqual(["pending", "claimed", "completed", "cancelled", "failed"]);
+    expect(deploymentCommandStateSchema.options).toEqual(["pending", "claimed", "executing", "completed", "cancelled", "failed"]);
     expect(deploymentCommandKindSchema.options).toEqual(["start", "cancel", "restart", "rollback"]);
 
     expect(deploymentCommandStateSchema.safeParse("queued").success).toBe(false);
@@ -280,6 +280,7 @@ describe("contracts", () => {
     expect(deploymentCommandEventTypeSchema.options).toEqual([
       "deployment.command.submitted",
       "deployment.command.claimed",
+      "deployment.command.executing",
       "deployment.command.completed",
       "deployment.command.failed",
       "deployment.command.cancelled"

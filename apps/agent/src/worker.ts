@@ -229,10 +229,9 @@ export class AgentWorker {
     if (input.command.state !== "claimed" || !input.command.leaseExpiresAt) throw new Error("Polled command was not leased");
     const running = await this.options.transport.projectRunning(input.command.id, this.options.agentId);
     if (!running || running.command.id !== input.command.id || running.command.agentId !== this.options.agentId || !running.applied) return;
-    // The projection acknowledgement is not an execution lease: cancellation can
-    // win after it commits. Revalidate immediately before any executor side effect.
-    const authoritative = await this.options.transport.renewLease(input.command.id, this.options.agentId);
-    if (!authoritative || authoritative.id !== input.command.id || authoritative.agentId !== this.options.agentId || authoritative.state !== "claimed" || !authoritative.leaseExpiresAt || parentSignal.aborted) return;
+    // Reservation atomically closes the cancellation window before any executor side effect.
+    const authoritative = await this.options.transport.reserveExecution(input.command.id, this.options.agentId);
+    if (!authoritative || authoritative.id !== input.command.id || authoritative.agentId !== this.options.agentId || authoritative.state !== "executing" || !authoritative.leaseExpiresAt || parentSignal.aborted) return;
     const executionInput = { ...input, command: authoritative };
     const execution = new AbortController();
     const stop = () => execution.abort();
@@ -248,7 +247,7 @@ export class AgentWorker {
         if (finished || execution.signal.aborted) break;
         try {
           const command = await this.options.transport.renewLease(input.command.id, this.options.agentId);
-          if (!command || command.id !== input.command.id || command.agentId !== this.options.agentId || command.state !== "claimed" || !command.leaseExpiresAt) {
+          if (!command || command.id !== input.command.id || command.agentId !== this.options.agentId || command.state !== "executing" || !command.leaseExpiresAt) {
             throw new Error("Command lease renewal was not confirmed");
           }
         } catch {
@@ -381,6 +380,10 @@ export class HttpAgentCommandTransport implements AgentCommandTransport {
 
   async renewLease(commandId: string, agentId: string): Promise<DeploymentCommand | null> {
     return this.commandRequest(commandId, "renew", { agentId });
+  }
+
+  async reserveExecution(commandId: string, agentId: string): Promise<DeploymentCommand | null> {
+    return this.commandRequest(commandId, "reserve", { agentId });
   }
 
   async projectRunning(commandId: string, agentId: string): Promise<{ command: DeploymentCommand; applied: boolean } | null> {

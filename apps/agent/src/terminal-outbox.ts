@@ -151,6 +151,11 @@ export class DurableTerminalCommandBus implements CommandBusClient {
     return this.transport.renewLease(commandId, agentId);
   }
 
+  reserveExecution(commandId: string, agentId: string): Promise<DeploymentCommand | null> {
+    if (agentId !== this.agentId) throw new Error("Agent identity mismatch");
+    return this.transport.reserveExecution(commandId, agentId);
+  }
+
   async complete(commandId: string, output?: Record<string, unknown>): Promise<DeploymentCommand | null> {
     await this.outbox.put(this.record(commandId, "complete"));
     try {

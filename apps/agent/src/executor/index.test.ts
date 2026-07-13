@@ -25,7 +25,7 @@ function setup(results = [{ code: 0, stdout: "", stderr: "", timedOut: false }])
     return result;
   }) };
   const fail = vi.fn(async () => null);
-  const bus: CommandBusClient = { claim: vi.fn(async () => ({ ...command, state: "claimed" as const, leaseExpiresAt: "2026-01-01T00:00:30.000Z" })), renewLease: vi.fn(async () => null), complete: vi.fn(async () => null), fail };
+  const bus: CommandBusClient = { claim: vi.fn(async () => ({ ...command, state: "claimed" as const, leaseExpiresAt: "2026-01-01T00:00:30.000Z" })), reserveExecution: vi.fn(async () => ({ ...command, state: "executing" as const, leaseExpiresAt: "2026-01-01T00:00:30.000Z" })), renewLease: vi.fn(async () => null), complete: vi.fn(async () => null), fail };
   const health: HealthProbe = { probe: vi.fn(async () => true) };
   const filesystem: WorkspaceFilesystem = {
     create: vi.fn(async () => undefined),

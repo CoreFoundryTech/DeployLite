@@ -23,6 +23,7 @@ afterEach(async () => {
 function transport(overrides: Partial<CommandBusClient> = {}): CommandBusClient {
   return {
     claim: vi.fn(async () => base),
+    reserveExecution: vi.fn(async () => ({ ...base, state: "executing" as const })),
     renewLease: vi.fn(async () => base),
     complete: vi.fn(async () => ({ ...base, state: "completed" as const, leaseExpiresAt: null, completedAt: "2026-01-01T00:00:02.000Z" })),
     fail: vi.fn(async () => ({ ...base, state: "failed" as const, leaseExpiresAt: null, completedAt: "2026-01-01T00:00:02.000Z", failureReason: "safe" })),

@@ -27,10 +27,9 @@ import { DEPLOYMENT_COMMAND_LEASE_MS } from "@deploylite/domain";
  *
  * State machine (enforced both at the application boundary and at the
  * database CHECK constraints, see `0005_deployment_commands.sql`):
- *   pending  -> claimed   -> completed
- *                        -> failed
+ *   pending  -> claimed   -> executing -> completed
+ *                                     -> failed
  *           -> cancelled
- *   claimed  -> cancelled (handled by the executor mid-flight)
  *
  * Each transition emits a `DeploymentCommandEvent`. The executor is
  * registered with the bus and is responsible for claiming the command
@@ -108,6 +107,13 @@ export class DeploymentCommandBusService implements DeploymentCommandBus {
     return this.#repository.renewLease(commandId, agentId, now.toISOString(), new Date(now.getTime() + DEPLOYMENT_COMMAND_LEASE_MS).toISOString());
   }
 
+  async reserveExecution(commandId: string, agentId: string): Promise<DeploymentCommandRecord | null> {
+    const now = this.now();
+    const reserved = await this.#repository.reserveExecution(commandId, agentId, now.toISOString());
+    if (reserved) await this.#emit("deployment.command.executing", reserved);
+    return reserved;
+  }
+
   async complete(commandId: string, output?: Record<string, unknown>): Promise<DeploymentCommandRecord | null> {
     const existing = await this.#repository.findById(commandId);
     if (!existing) return null;
@@ -122,10 +128,10 @@ export class DeploymentCommandBusService implements DeploymentCommandBus {
       leaseExpiresAt: null,
       payload: output ? { ...existing.payload, output } : existing.payload
     };
-    const result = await this.#repository.transitionTerminal(existing.id, existing.agentId, "claimed", next, {
+    const result = await this.#repository.transitionTerminal(existing.id, existing.agentId, existing.state === "executing" ? "executing" : "claimed", next, {
       leaseExpiresAtAfterNow: () => this.now().toISOString()
     });
-    if (result && !result.applied && result.command.state === "claimed") {
+    if (result && !result.applied && (result.command.state === "claimed" || result.command.state === "executing")) {
       return this.failExpiredClaim(commandId, "Agent command lease expired; completion was rejected.");
     }
     if (result?.applied) await this.#emit("deployment.command.completed", result.command);
@@ -146,7 +152,7 @@ export class DeploymentCommandBusService implements DeploymentCommandBus {
       leaseExpiresAt: null,
       failureReason: reason
     };
-    const result = await this.#repository.transitionTerminal(existing.id, existing.agentId, "claimed", next, {
+    const result = await this.#repository.transitionTerminal(existing.id, existing.agentId, existing.state === "executing" ? "executing" : "claimed", next, {
       leaseExpiresAtAfterNow: () => this.now().toISOString()
     });
     if (result?.applied) await this.#emit("deployment.command.failed", result.command);
@@ -183,7 +189,7 @@ export class DeploymentCommandBusService implements DeploymentCommandBus {
     const existing = await this.#repository.findById(commandId);
     if (!existing) return null;
     if (existing.state === "completed" || existing.state === "failed" || existing.state === "cancelled") return existing;
-    if (existing.state !== "claimed") return existing;
+    if (existing.state !== "claimed" && existing.state !== "executing") return existing;
     const now = this.now().toISOString();
     const next: DeploymentCommandRecord = {
       ...existing,
@@ -192,7 +198,7 @@ export class DeploymentCommandBusService implements DeploymentCommandBus {
       leaseExpiresAt: null,
       failureReason: reason
     };
-    const result = await this.#repository.transitionTerminal(existing.id, existing.agentId, "claimed", next, {
+    const result = await this.#repository.transitionTerminal(existing.id, existing.agentId, existing.state, next, {
       leaseExpiresAtNotAfterNow: () => this.now().toISOString()
     });
     if (result?.applied) await this.#emit("deployment.command.failed", result.command);
@@ -254,18 +260,20 @@ export class DeploymentCommandBusService implements DeploymentCommandBus {
     if (!claimed) {
       return null;
     }
+    const executing = await this.reserveExecution(claimed.id, claimed.agentId);
+    if (!executing) return null;
     try {
-      await this.#executor.execute(claimed);
+      await this.#executor.execute(executing);
     } catch (error) {
       const reason = error instanceof Error ? error.message : "Deployment executor failed";
-      await this.fail(claimed.id, reason);
+      await this.fail(executing.id, reason);
       throw error;
     }
     // The executor is responsible for resolving the command (complete /
     // fail / cancel). It may also do so asynchronously; this dispatch
     // helper returns the claimed row so the caller can observe the
     // initial state transition.
-    return claimed;
+    return executing;
   }
 
   async #emit(type: DeploymentCommandEventType, command: DeploymentCommandRecord): Promise<void> {

@@ -32,6 +32,7 @@ class TestAgentTransport {
   heartbeat(id: string, observedAt: string, resourceSnapshot: unknown, signal: AbortSignal) { return this.request(`/api/v1/agent/${id}/heartbeat`, { method: "POST", signal, body: JSON.stringify({ agentId: id, observedAt, resourceSnapshot }) }); }
   poll(id: string, signal: AbortSignal) { return this.request(`/api/v1/agent/commands/next?agentId=${id}`, { method: "GET", signal }); }
   claim(id: string, assignedAgentId: string) { return this.request(`/api/v1/agent/commands/${id}/claim`, { method: "POST", body: JSON.stringify({ agentId: assignedAgentId }) }); }
+  reserveExecution(id: string, assignedAgentId: string) { return this.request(`/api/v1/agent/commands/${id}/reserve`, { method: "POST", body: JSON.stringify({ agentId: assignedAgentId }) }); }
   renewLease(id: string, assignedAgentId: string) { return this.request(`/api/v1/agent/commands/${id}/renew`, { method: "POST", body: JSON.stringify({ agentId: assignedAgentId }) }); }
   complete(id: string, output?: Record<string, unknown>) { return this.request(`/api/v1/agent/commands/${id}/complete`, { method: "POST", body: JSON.stringify({ output }) }); }
   fail(id: string, reason: string) { return this.request(`/api/v1/agent/commands/${id}/fail`, { method: "POST", body: JSON.stringify({ reason }) }); }
@@ -217,6 +218,7 @@ describe("agent command HTTP transport integration", () => {
     expect((await transport.claim(commandId, agentId))?.state).toBe("claimed");
     expect((await transport.claim(commandId, agentId))?.state).toBe("claimed");
     expect((await transport.renewLease(commandId, agentId))?.state).toBe("claimed");
+    expect((await transport.reserveExecution(commandId, agentId))?.state).toBe("executing");
     expect((await deployments.findById(deploymentId))?.status).toBe("running");
     expect((await transport.complete(commandId, { token: plaintext }))?.state).toBe("completed");
     expect((await transport.complete(commandId))?.state).toBe("completed");
@@ -280,6 +282,7 @@ describe("agent command HTTP transport integration", () => {
   it("fails an assigned claimed command idempotently with a redacted reason", async () => {
     const { commands, deployments, transport } = await fixture({ state: "claimed", claimedAt: "2026-07-10T00:00:01.000Z", leaseExpiresAt: "2026-07-10T00:00:31.000Z" });
     const reason = `private_key=-----BEGIN PRIVATE KEY-----\n${plaintext}\n-----END PRIVATE KEY-----`;
+    await expect(transport.reserveExecution(commandId, agentId)).resolves.toMatchObject({ state: "executing" });
     expect((await transport.fail(commandId, reason))?.state).toBe("failed");
     expect((await transport.fail(commandId, reason))?.state).toBe("failed");
     const persisted = await commands.findById(commandId);
@@ -297,6 +300,7 @@ describe("agent command HTTP transport integration", () => {
     let now = new Date("2026-07-10T00:00:29.999Z");
     const leaseExpiresAt = "2026-07-10T00:00:30.000Z";
     const test = await fixture({ state: "claimed", claimedAt: "2026-07-10T00:00:00.000Z", leaseExpiresAt }, true, () => now);
+    await expect(test.transport.reserveExecution(commandId, agentId)).resolves.toMatchObject({ state: "executing" });
     now = new Date(leaseExpiresAt);
     const response = await test.app.inject({
       method: "POST",
@@ -306,7 +310,7 @@ describe("agent command HTTP transport integration", () => {
     });
     expect(response.statusCode).toBe(409);
     expect(response.json()).toMatchObject({
-      data: { authoritativeCommand: { id: commandId, state: "claimed", failureReason: null }, attemptedState: "failed", leaseConflict: true },
+      data: { authoritativeCommand: { id: commandId, state: "executing", failureReason: null }, attemptedState: "failed", leaseConflict: true },
       error: { code: "AUTHORITATIVE_LEASE_CONFLICT" }
     });
     expect(await test.deployments.findById(deploymentId)).toMatchObject({ status: "queued", finishedAt: null });
@@ -336,6 +340,7 @@ describe("agent command HTTP transport integration", () => {
     let now = new Date("2026-07-10T00:00:05.000Z");
     const test = await fixture({}, true, () => now);
     await test.transport.poll(agentId, new AbortController().signal);
+    await test.transport.reserveExecution(commandId, agentId);
     await expect(test.transport.complete(commandId)).resolves.toMatchObject({ state: "completed" });
     now = new Date("2026-07-10T00:00:40.000Z");
     await expect(test.transport.poll(agentId, new AbortController().signal)).resolves.toBeNull();
@@ -353,6 +358,7 @@ describe("agent command HTTP transport integration", () => {
     const repository: DeploymentCommandRepository & DeploymentCommandProjectionRepository = {
       save: (record) => inner.save(record),
       claim: (...args) => inner.claim(...args),
+      reserveExecution: (...args) => inner.reserveExecution(...args),
       renewLease: (...args) => inner.renewLease(...args),
       findById: (id) => inner.findById(id),
       findActiveForDeployment: (id) => inner.findActiveForDeployment(id),
@@ -370,6 +376,7 @@ describe("agent command HTTP transport integration", () => {
     const test = await fixture({ state: "claimed", claimedAt: "2026-07-10T00:00:00.000Z", leaseExpiresAt: "2026-07-10T00:00:30.000Z" }, true, () => now, undefined, repository);
     const headers = { authorization: `Bearer ${token}`, "content-type": "application/json" };
 
+    await test.transport.reserveExecution(commandId, agentId);
     const completion = test.app.inject({ method: "POST", url: `/api/v1/agent/commands/${commandId}/complete`, headers, payload: {} });
     await arrival;
     now = new Date("2026-07-10T00:00:30.000Z");
@@ -469,10 +476,11 @@ describe("agent command HTTP transport integration", () => {
     await test.transport.projectRunning(commandId, agentId);
     now = new Date("2026-07-10T00:00:20.000Z");
     await test.transport.renewLease(commandId, agentId);
+    await test.transport.reserveExecution(commandId, agentId);
     now = new Date("2026-07-10T00:00:40.000Z");
     await expect(test.transport.poll(agentId, new AbortController().signal)).resolves.toBeNull();
 
-    expect(await test.commands.findById(commandId)).toMatchObject({ state: "claimed", leaseExpiresAt: "2026-07-10T00:00:50.000Z" });
+    expect(await test.commands.findById(commandId)).toMatchObject({ state: "executing", leaseExpiresAt: "2026-07-10T00:00:50.000Z" });
     expect(await test.deployments.findById(deploymentId)).toMatchObject({ status: "running", finishedAt: null });
     expect((await test.deployments.listLogs(deploymentId)).filter((log) => log.message.startsWith("Agent command lease expired"))).toHaveLength(0);
 

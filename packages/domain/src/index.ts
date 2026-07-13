@@ -154,6 +154,7 @@ export type DeploymentLifecycleProjection = {
 export type DeploymentCommandEventType =
   | "deployment.command.submitted"
   | "deployment.command.claimed"
+  | "deployment.command.executing"
   | "deployment.command.completed"
   | "deployment.command.failed"
   | "deployment.command.cancelled";
@@ -179,6 +180,7 @@ export type DeploymentCommandBusSubmitInput = {
 export type DeploymentCommandBus = {
   submit(input: DeploymentCommandBusSubmitInput): Promise<DeploymentCommandRecord>;
   claim(commandId: string, agentId: string): Promise<DeploymentCommandRecord | null>;
+  reserveExecution(commandId: string, agentId: string): Promise<DeploymentCommandRecord | null>;
   renewLease(commandId: string, agentId: string): Promise<DeploymentCommandRecord | null>;
   complete(commandId: string, output?: Record<string, unknown>): Promise<DeploymentCommandRecord | null>;
   fail(commandId: string, reason: string): Promise<DeploymentCommandRecord | null>;
@@ -208,11 +210,12 @@ export type DeploymentExecutor = {
 export type DeploymentCommandRepository = {
   save(command: DeploymentCommandRecord): Promise<DeploymentCommandRecord>;
   claim(commandId: string, agentId: string, claimedAt: string, leaseExpiresAt: string): Promise<DeploymentCommandRecord | null>;
+  reserveExecution(commandId: string, agentId: string, now: string): Promise<DeploymentCommandRecord | null>;
   renewLease(commandId: string, agentId: string, now: string, leaseExpiresAt: string): Promise<DeploymentCommandRecord | null>;
   transitionTerminal(
     commandId: string,
     agentId: string,
-    expectedState: "pending" | "claimed",
+    expectedState: "pending" | "claimed" | "executing",
     next: Pick<DeploymentCommandRecord, "state" | "completedAt" | "leaseExpiresAt" | "failureReason" | "payload">,
     condition?: { leaseExpiresAtNotAfterNow: () => string } | { leaseExpiresAtAfterNow: () => string }
   ): Promise<{ command: DeploymentCommandRecord; applied: boolean } | null>;
@@ -241,7 +244,8 @@ export type DeploymentCommandProjectionRepository = {
 
 const ALLOWED_COMMAND_TRANSITIONS: Readonly<Record<DeploymentCommandState, ReadonlyArray<DeploymentCommandState>>> = {
   pending: ["claimed", "cancelled", "failed"],
-  claimed: ["completed", "failed", "cancelled"],
+  claimed: ["executing", "completed", "failed", "cancelled"],
+  executing: ["completed", "failed"],
   completed: [],
   cancelled: [],
   failed: []
@@ -571,16 +575,24 @@ export class InMemoryDeploymentCommandRepository implements DeploymentCommandRep
     return this.save({ ...existing, state: "claimed", claimedAt, leaseExpiresAt });
   }
 
+  async reserveExecution(commandId: string, agentId: string, now: string): Promise<DeploymentCommandRecord | null> {
+    return this.#withinCritical(async () => {
+      const existing = this.#commands.get(commandId);
+      if (!existing || existing.agentId !== agentId || existing.state !== "claimed" || !existing.leaseExpiresAt || existing.leaseExpiresAt <= now) return null;
+      return this.save({ ...existing, state: "executing" });
+    });
+  }
+
   async renewLease(commandId: string, agentId: string, now: string, leaseExpiresAt: string): Promise<DeploymentCommandRecord | null> {
     const existing = this.#commands.get(commandId);
-    if (!existing || existing.agentId !== agentId || existing.state !== "claimed" || !existing.leaseExpiresAt || existing.leaseExpiresAt <= now) return null;
+    if (!existing || existing.agentId !== agentId || (existing.state !== "claimed" && existing.state !== "executing") || !existing.leaseExpiresAt || existing.leaseExpiresAt <= now) return null;
     return this.save({ ...existing, leaseExpiresAt });
   }
 
   async transitionTerminal(
     commandId: string,
     agentId: string,
-    expectedState: "pending" | "claimed",
+    expectedState: "pending" | "claimed" | "executing",
     next: Pick<DeploymentCommandRecord, "state" | "completedAt" | "leaseExpiresAt" | "failureReason" | "payload">,
     condition?: { leaseExpiresAtNotAfterNow: () => string } | { leaseExpiresAtAfterNow: () => string }
   ): Promise<{ command: DeploymentCommandRecord; applied: boolean } | null> {
@@ -665,7 +677,7 @@ export class InMemoryDeploymentCommandRepository implements DeploymentCommandRep
 
   async findActiveForDeployment(deploymentId: string): Promise<DeploymentCommandRecord | null> {
     for (const command of this.#commands.values()) {
-      if (command.deploymentId === deploymentId && (command.state === "pending" || command.state === "claimed")) {
+      if (command.deploymentId === deploymentId && (command.state === "pending" || command.state === "claimed" || command.state === "executing")) {
         return structuredClone(command);
       }
     }

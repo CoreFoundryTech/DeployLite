@@ -36,6 +36,7 @@ export type ProcessRunner = { run(plan: CommandPlan, timeoutMs: number, signal?:
 // an agent -> API dependency while remaining compatible with the shared bus.
 export type CommandBusClient = {
   claim(commandId: string, agentId: string): Promise<DeploymentCommand | null>;
+  reserveExecution(commandId: string, agentId: string): Promise<DeploymentCommand | null>;
   complete(commandId: string, output?: Record<string, unknown>): Promise<DeploymentCommand | null>;
   fail(commandId: string, reason: string): Promise<DeploymentCommand | null>;
   renewLease(commandId: string, agentId: string): Promise<DeploymentCommand | null>;
