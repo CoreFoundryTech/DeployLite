@@ -211,7 +211,7 @@ describe("agent command HTTP transport integration", () => {
     expect(input?.envFile.contents).toBe(`private_key=${plaintext}\n`);
     expect(await deployments.findById(deploymentId)).toMatchObject({ status: "queued", startedAt: "2026-07-10T00:00:00.000Z", finishedAt: null });
     await expect(transport.projectRunning(commandId, agentId)).resolves.toMatchObject({ applied: true, command: { state: "claimed" } });
-    await expect(transport.projectRunning(commandId, agentId)).resolves.toMatchObject({ applied: true, command: { state: "claimed" } });
+    await expect(transport.projectRunning(commandId, agentId)).resolves.toMatchObject({ applied: false, command: { state: "claimed" } });
     expect(await deployments.findById(deploymentId)).toMatchObject({ status: "running", startedAt: "2026-07-10T00:00:00.000Z", finishedAt: null });
     expect((await deployments.listLogs(deploymentId)).filter((log) => log.message.startsWith("Agent claimed deployment command"))).toHaveLength(1);
     expect((await transport.claim(commandId, agentId))?.state).toBe("claimed");

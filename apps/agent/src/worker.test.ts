@@ -70,6 +70,41 @@ describe("AgentWorker", () => {
     expect(executor.execute).not.toHaveBeenCalled();
   });
 
+  it("retries a claimed command after a transient running projection failure and executes it once", async () => {
+    const shutdown = new AbortController();
+    let recovered = false;
+    const projectRunning = vi.fn(async () => {
+      if (projectRunning.mock.calls.length === 1) throw new Error("transient projection failure");
+      return { command: input.command, applied: true };
+    });
+    const commandTransport = transport({
+      recoverClaimed: vi.fn(async () => recovered ? input : null),
+      poll: vi.fn(async () => { recovered = true; return input; }),
+      projectRunning
+    });
+    const executor = {
+      reconcile: vi.fn(),
+      execute: vi.fn(async () => {
+        shutdown.abort();
+        return { ok: true, dryRun: false, commands: [] };
+      })
+    };
+
+    await new AgentWorker({
+      agentId: "agent-1", agentName: "Agent", agentEndpoint: "http://agent.test", transport: commandTransport, executor,
+      resourceCollector: { collect: async () => snapshot }, retryDelayMs: 0, heartbeatIntervalMs: 60_000,
+      wait: async (milliseconds, signal) => {
+        if (milliseconds === 0 || signal.aborted) return;
+        await new Promise<void>((resolve) => signal.addEventListener("abort", () => resolve(), { once: true }));
+      }
+    }).run(shutdown.signal);
+
+    expect(commandTransport.recoverClaimed).toHaveBeenCalledTimes(2);
+    expect(commandTransport.poll).toHaveBeenCalledOnce();
+    expect(projectRunning).toHaveBeenCalledTimes(2);
+    expect(executor.execute).toHaveBeenCalledOnce();
+  });
+
   it("does not execute a command routed to another agent", async () => {
     const shutdown = new AbortController();
     const commandTransport = transport({ poll: vi.fn(async () => ({ ...input, command: { ...command, agentId: "agent-2" } })) });

@@ -234,7 +234,7 @@ describeIntegration("DeployLite API PostgreSQL integration", () => {
       const retry = await app.inject({ method: "POST", url: `/api/v1/agent/commands/${live.commandId}/running`, headers, payload: { agentId } });
       expect(first.statusCode).toBe(200);
       expect(first.json()).toMatchObject({ applied: true, command: { id: live.commandId, state: "claimed" } });
-      expect(retry.json()).toMatchObject({ applied: true, command: { id: live.commandId } });
+      expect(retry.json()).toMatchObject({ applied: false, command: { id: live.commandId } });
       expect(await deployments.findById(live.deploymentId)).toMatchObject({ status: "running" });
       const logs = await deployments.listLogs(live.deploymentId);
       expect(logs).toEqual([expect.objectContaining({ message: "Agent claimed deployment command; deployment is running.", redactionApplied: true })]);

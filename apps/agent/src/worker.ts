@@ -165,11 +165,13 @@ export class AgentWorker {
           continue;
         }
         terminalRetryMs = this.#retryDelayMs;
-        if (!startupReconciled) {
-          const claimed = await this.options.transport.recoverClaimed(this.options.agentId, signal);
-          if (claimed) await this.options.executor.reconcile(claimed);
-          startupReconciled = true;
+        const claimed = await this.options.transport.recoverClaimed(this.options.agentId, signal);
+        if (claimed) {
+          if (!startupReconciled) await this.options.executor.reconcile(claimed);
+          else await this.executeWithLease(claimed, signal);
+          if (signal.aborted) break;
         }
+        startupReconciled = true;
         const input = await this.options.transport.poll(this.options.agentId, signal);
         if (signal.aborted) break;
         apiFailures = 0;

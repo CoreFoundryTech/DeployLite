@@ -173,6 +173,7 @@ export class DbDeploymentCommandRepository implements DeploymentCommandRepositor
         eq(deploymentLogs.requestId, projection.log.requestId),
         eq(deploymentLogs.correlationId, projection.log.correlationId)
       )).limit(1);
+      if (existingLog.length > 0) return { command: toDeploymentCommand(command), applied: false };
       if (existingLog.length === 0) {
         const [allocation] = await tx.insert(deploymentLogSequences).values({ deploymentId: projection.log.deploymentId, nextSequence: 2 }).onConflictDoUpdate({
           target: deploymentLogSequences.deploymentId,

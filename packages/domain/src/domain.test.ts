@@ -187,7 +187,7 @@ describe("domain foundation", () => {
     await expect(commands.projectRunning("cmd_running", "agent_1", {
       ...runningProjection,
       log: { ...runningProjection.log, id: "log_running_retry", message: "retry token dl_fedcba0987654321" }
-    })).resolves.toMatchObject({ applied: true });
+    })).resolves.toMatchObject({ applied: false });
 
     expect(await deployments.findById("dep_running")).toMatchObject({ status: "running" });
     const persistedLogs = await deployments.listLogs("dep_running");
