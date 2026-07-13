@@ -23,6 +23,7 @@ function transport(overrides: Partial<AgentCommandTransport> = {}): AgentCommand
     heartbeat: vi.fn(async () => agent),
     poll: vi.fn(async () => null),
     recoverClaimed: vi.fn(async () => null),
+    projectRunning: vi.fn(async () => ({ command: { ...command, state: "claimed" as const, leaseExpiresAt: "2026-01-01T00:00:30.000Z" }, applied: true })),
     claim: vi.fn(async () => ({ ...command, state: "claimed" as const, leaseExpiresAt: "2026-01-01T00:00:30.000Z" })),
     renewLease: vi.fn(async () => ({ ...command, state: "claimed" as const, leaseExpiresAt: "2026-01-01T00:00:30.000Z" })),
     complete: vi.fn(async () => ({ ...command, state: "completed" as const })),
@@ -48,7 +49,25 @@ describe("AgentWorker", () => {
 
     expect(commandTransport.register).toHaveBeenCalledOnce();
     expect(commandTransport.poll).toHaveBeenCalledWith("agent-1", shutdown.signal);
+    expect(commandTransport.projectRunning).toHaveBeenCalledWith("command-1", "agent-1");
     expect(executor.execute).toHaveBeenCalledWith(input, expect.any(AbortSignal));
+  });
+
+  it("does not execute when the authoritative running projection rejects a cancelled or stale command", async () => {
+    const shutdown = new AbortController();
+    const commandTransport = transport({
+      poll: vi.fn(async () => input),
+      projectRunning: vi.fn(async () => {
+        shutdown.abort();
+        return { command: { ...input.command, state: "cancelled" as const, completedAt: "2026-01-01T00:00:01.000Z", leaseExpiresAt: null }, applied: false };
+      })
+    });
+    const executor = { execute: vi.fn(), reconcile: vi.fn() };
+
+    await new AgentWorker({ agentId: "agent-1", agentName: "Agent", agentEndpoint: "http://agent.test", transport: commandTransport, executor, resourceCollector: { collect: async () => snapshot } }).run(shutdown.signal);
+
+    expect(commandTransport.projectRunning).toHaveBeenCalledWith("command-1", "agent-1");
+    expect(executor.execute).not.toHaveBeenCalled();
   });
 
   it("does not execute a command routed to another agent", async () => {

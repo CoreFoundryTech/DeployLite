@@ -47,6 +47,7 @@ export type AgentCommandTransport = CommandBusClient & {
   heartbeat(agentId: string, observedAt: string, resourceSnapshot: ResourceSnapshot, signal: AbortSignal): Promise<Agent>;
   poll(agentId: string, signal: AbortSignal): Promise<DeploymentExecutionInput | null>;
   recoverClaimed(agentId: string, signal: AbortSignal): Promise<DeploymentExecutionInput | null>;
+  projectRunning(commandId: string, agentId: string): Promise<{ command: DeploymentCommand; applied: boolean } | null>;
 };
 
 export type ResourceSnapshot = z.infer<typeof resourceSnapshotSchema>;
@@ -224,6 +225,8 @@ export class AgentWorker {
 
   private async executeWithLease(input: DeploymentExecutionInput, parentSignal: AbortSignal): Promise<void> {
     if (input.command.state !== "claimed" || !input.command.leaseExpiresAt) throw new Error("Polled command was not leased");
+    const running = await this.options.transport.projectRunning(input.command.id, this.options.agentId);
+    if (!running || running.command.id !== input.command.id || running.command.agentId !== this.options.agentId || !running.applied) return;
     const execution = new AbortController();
     const stop = () => execution.abort();
     parentSignal.addEventListener("abort", stop, { once: true });
@@ -371,6 +374,16 @@ export class HttpAgentCommandTransport implements AgentCommandTransport {
 
   async renewLease(commandId: string, agentId: string): Promise<DeploymentCommand | null> {
     return this.commandRequest(commandId, "renew", { agentId });
+  }
+
+  async projectRunning(commandId: string, agentId: string): Promise<{ command: DeploymentCommand; applied: boolean } | null> {
+    const result = await this.request(`/api/v1/agent/commands/${encodeURIComponent(commandId)}/running`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ agentId })
+    });
+    if (result === null) return null;
+    return z.object({ command: deploymentCommandSchema, applied: z.boolean() }).parse(result);
   }
 
   private async commandRequest(commandId: string, action: string, body: Record<string, unknown>): Promise<DeploymentCommand | null> {
