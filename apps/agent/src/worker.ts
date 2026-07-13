@@ -167,7 +167,10 @@ export class AgentWorker {
         terminalRetryMs = this.#retryDelayMs;
         const claimed = await this.options.transport.recoverClaimed(this.options.agentId, signal);
         if (claimed) {
-          if (!startupReconciled) await this.options.executor.reconcile(claimed);
+          // Recovery is never a second execution path. A durable executing
+          // command can only be reconciled; a claimed command is reconciled
+          // once on startup and otherwise proceeds through the running fence.
+          if (!startupReconciled || claimed.command.state === "executing") await this.options.executor.reconcile(claimed);
           else await this.executeWithLease(claimed, signal);
           if (signal.aborted) break;
         }

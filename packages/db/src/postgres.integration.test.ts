@@ -384,6 +384,52 @@ describeIntegration("PostgreSQL auth foundation integration", () => {
     await expect(client.query("SELECT count(*)::int AS count FROM deployment_logs WHERE deployment_id = $1", [fixture.deploymentId])).resolves.toMatchObject({ rows: [{ count: 0 }] });
     await expect(client.query("SELECT count(*)::int AS count FROM audit_events WHERE request_id = $1", [fixture.requestId])).resolves.toMatchObject({ rows: [{ count: 0 }] });
   });
+
+  it("commits one terminal projection when completion and recovery race", async () => {
+    const client = requirePool();
+    const fixture = await seedClaimedProjectionFixture("terminal_recovery_race", new Date(Date.now() + 60_000).toISOString());
+    const repository = new DbDeploymentCommandRepository(requireDb());
+    await expect(repository.projectRunning(fixture.commandId, fixture.agentId, runningProjection(fixture))).resolves.toMatchObject({ applied: true, command: { state: "executing" } });
+
+    const projection = terminalProjection(fixture);
+    const completion = repository.transitionTerminalAndProject(
+      fixture.commandId,
+      fixture.agentId,
+      "executing",
+      { state: "completed", completedAt: fixture.now, leaseExpiresAt: null, failureReason: null, payload: {} },
+      projection,
+      { leaseExpiresAtAfterNow: () => new Date().toISOString() }
+    );
+    const recovery = repository.projectTerminal(fixture.commandId, fixture.agentId, "completed", projection);
+    const results = await Promise.all([completion, recovery]);
+
+    expect(results.filter((result) => result?.applied)).toHaveLength(1);
+    await expect(repository.findById(fixture.commandId)).resolves.toMatchObject({ state: "completed" });
+    await expect(client.query("SELECT status FROM deployments WHERE id = $1", [fixture.deploymentId])).resolves.toMatchObject({ rows: [{ status: "succeeded" }] });
+    await expect(client.query("SELECT count(*)::int AS count FROM deployment_logs WHERE deployment_id = $1", [fixture.deploymentId])).resolves.toMatchObject({ rows: [{ count: 2 }] });
+    await expect(client.query("SELECT count(*)::int AS count FROM audit_events WHERE request_id = $1", [fixture.requestId])).resolves.toMatchObject({ rows: [{ count: 2 }] });
+  });
+
+  it("recovers terminal effects after a running projection shares the request and correlation IDs", async () => {
+    const client = requirePool();
+    const fixture = await seedClaimedProjectionFixture("terminal_recovery_running_log", new Date(Date.now() + 60_000).toISOString());
+    const repository = new DbDeploymentCommandRepository(requireDb());
+    await expect(repository.projectRunning(fixture.commandId, fixture.agentId, runningProjection(fixture))).resolves.toMatchObject({ applied: true, command: { state: "executing" } });
+    await expect(repository.transitionTerminal(
+      fixture.commandId,
+      fixture.agentId,
+      "executing",
+      { state: "completed", completedAt: fixture.now, leaseExpiresAt: null, failureReason: null, payload: {} },
+      { leaseExpiresAtAfterNow: () => new Date().toISOString() }
+    )).resolves.toMatchObject({ applied: true, command: { state: "completed" } });
+
+    const projection = terminalProjection(fixture);
+    await expect(repository.projectTerminal(fixture.commandId, fixture.agentId, "completed", projection)).resolves.toMatchObject({ applied: true });
+    await expect(repository.projectTerminal(fixture.commandId, fixture.agentId, "completed", projection)).resolves.toMatchObject({ applied: false });
+    await expect(client.query("SELECT status FROM deployments WHERE id = $1", [fixture.deploymentId])).resolves.toMatchObject({ rows: [{ status: "succeeded" }] });
+    await expect(client.query("SELECT count(*)::int AS count FROM deployment_logs WHERE deployment_id = $1", [fixture.deploymentId])).resolves.toMatchObject({ rows: [{ count: 2 }] });
+    await expect(client.query("SELECT count(*)::int AS count FROM audit_events WHERE request_id = $1", [fixture.requestId])).resolves.toMatchObject({ rows: [{ count: 2 }] });
+  });
 });
 
 async function seedClaimedProjectionFixture(label: string, leaseExpiresAt: string) {
@@ -407,6 +453,14 @@ function runningProjection(fixture: Awaited<ReturnType<typeof seedClaimedProject
     deployment: { id: fixture.deploymentId, projectId: fixture.projectId, agentId: fixture.agentId, status: "running" as const, commitSha: "abcdef1", startedAt: fixture.now, finishedAt: null },
     log: { id: randomUUID(), deploymentId: fixture.deploymentId, level: "info" as const, message: "running token dl_1234567890abcdef", timestamp: fixture.now, redactionApplied: false, requestId: fixture.requestId, correlationId: fixture.correlationId },
     audit: { actorUserId, action: "deployment.running", targetType: "deployment", targetId: fixture.deploymentId, requestId: fixture.requestId, correlationId: fixture.correlationId, metadata: { token: "dl_1234567890abcdef" } }
+  };
+}
+
+function terminalProjection(fixture: Awaited<ReturnType<typeof seedClaimedProjectionFixture>>) {
+  return {
+    deployment: { id: fixture.deploymentId, projectId: fixture.projectId, agentId: fixture.agentId, status: "succeeded" as const, commitSha: "abcdef1", startedAt: fixture.now, finishedAt: fixture.now },
+    log: { id: randomUUID(), deploymentId: fixture.deploymentId, level: "info" as const, message: "Agent completed deployment command; deployment succeeded.", timestamp: fixture.now, redactionApplied: true, requestId: fixture.requestId, correlationId: fixture.correlationId },
+    audit: { actorUserId: null, action: "deployment.completed", targetType: "deployment", targetId: fixture.deploymentId, requestId: fixture.requestId, correlationId: fixture.correlationId, metadata: { source: "agent" } }
   };
 }
 
