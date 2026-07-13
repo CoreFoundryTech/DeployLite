@@ -8,6 +8,7 @@ import { createDbClient, createDbPool, closeDbPool, type DeployLiteDb } from "./
 import { assertEnvMetadataHasNoValueColumns, toEnvVariableMetadataInsert } from "./env-metadata.js";
 import { DbAuthUserRepository, DbRoleRepository, DbSessionRepository } from "./repositories/auth.js";
 import { DbAgentRepository, DbDeploymentRepository, DbProjectRepository } from "./repositories/deployment-data.js";
+import { DbDeploymentCommandRepository } from "./repositories/deployment-commands.js";
 
 const { Client } = pg;
 
@@ -238,12 +239,12 @@ describeIntegration("PostgreSQL auth foundation integration", () => {
       endpoint: "https://agent.integration.test",
       status: "online"
     });
-    await expect(requireDbProjectRepository().list()).resolves.toContainEqual({
+    await expect(requireDbProjectRepository().list()).resolves.toContainEqual(expect.objectContaining({
       id: projectId,
       name: "Integration project",
       repoUrl: "https://github.com/example/deploylite-integration",
       defaultBranch: "main"
-    });
+    }));
     await expect(requireDbDeploymentRepository().findById(deploymentId)).resolves.toMatchObject({
       id: deploymentId,
       projectId,
@@ -310,7 +311,104 @@ describeIntegration("PostgreSQL auth foundation integration", () => {
       } as Parameters<typeof toEnvVariableMetadataInsert>[0])
     ).toThrow("Environment variable metadata cannot include secret value field");
   });
+
+  it("deduplicates a running projection retry with a changed message, preserving its first redacted log and one audit event", async () => {
+    const client = requirePool();
+    const live = await seedClaimedProjectionFixture("live", new Date(Date.now() + 60_000).toISOString());
+    const repository = new DbDeploymentCommandRepository(requireDb());
+    const projection = runningProjection(live);
+
+    await expect(repository.projectRunning(live.commandId, live.agentId, projection)).resolves.toMatchObject({ applied: true, command: { state: "claimed" } });
+    await expect(repository.projectRunning(live.commandId, live.agentId, {
+      ...projection,
+      log: { ...projection.log, id: randomUUID(), message: "retry token dl_fedcba0987654321" }
+    })).resolves.toMatchObject({ applied: true });
+    await expect(client.query("SELECT status FROM deployments WHERE id = $1", [live.deploymentId])).resolves.toMatchObject({ rows: [{ status: "running" }] });
+    await expect(client.query("SELECT sequence, message, redaction_applied FROM deployment_logs WHERE deployment_id = $1", [live.deploymentId])).resolves.toMatchObject({ rows: [{ sequence: 1, message: "running token [REDACTED]", redaction_applied: true }] });
+    await expect(client.query("SELECT count(*)::int AS count FROM deployment_logs WHERE deployment_id = $1 AND message LIKE 'retry%'", [live.deploymentId])).resolves.toMatchObject({ rows: [{ count: 0 }] });
+    await expect(client.query("SELECT count(*)::int AS count FROM audit_events WHERE request_id = $1", [live.requestId])).resolves.toMatchObject({ rows: [{ count: 1 }] });
+    await expect(client.query("SELECT metadata FROM audit_events WHERE request_id = $1", [live.requestId])).resolves.toMatchObject({ rows: [{ metadata: { token: "[REDACTED]" } }] });
+
+    for (const leaseExpiresAt of [new Date().toISOString(), new Date(Date.now() - 60_000).toISOString()]) {
+      const rejected = await seedClaimedProjectionFixture(`rejected_${leaseExpiresAt}`, leaseExpiresAt);
+      await expect(repository.projectRunning(rejected.commandId, rejected.agentId, runningProjection(rejected))).resolves.toMatchObject({ applied: false });
+      await expect(client.query("SELECT status FROM deployments WHERE id = $1", [rejected.deploymentId])).resolves.toMatchObject({ rows: [{ status: "queued" }] });
+      await expect(client.query("SELECT count(*)::int AS count FROM deployment_logs WHERE deployment_id = $1", [rejected.deploymentId])).resolves.toMatchObject({ rows: [{ count: 0 }] });
+    }
+  });
+
+  it("advances allocation beyond an explicitly appended log sequence", async () => {
+    const fixture = await seedClaimedProjectionFixture("explicit_sequence", new Date(Date.now() + 60_000).toISOString());
+    const repository = new DbDeploymentRepository(requireDb());
+
+    await repository.appendLog({ id: randomUUID(), deploymentId: fixture.deploymentId, sequence: 7, level: "info", message: "explicit", timestamp: fixture.now, redactionApplied: false, requestId: fixture.requestId, correlationId: fixture.correlationId });
+    await expect(repository.appendAllocatedLog({ id: randomUUID(), deploymentId: fixture.deploymentId, level: "info", message: "allocated", timestamp: fixture.now, redactionApplied: false, requestId: fixture.requestId, correlationId: fixture.correlationId })).resolves.toMatchObject({ sequence: 8 });
+  });
+
+  it("does not project running effects when cancellation wins after the lease fence is read", async () => {
+    const client = requirePool();
+    const fixture = await seedClaimedProjectionFixture("cancel_after_fence", new Date(Date.now() + 60_000).toISOString());
+    let releaseFence: (() => void) | undefined;
+    let signalFenceRead: (() => void) | undefined;
+    const fenceRead = new Promise<void>((resolve) => { signalFenceRead = resolve; });
+    const resumeProjection = new Promise<void>((resolve) => { releaseFence = resolve; });
+    const racePool = createDbPool(databaseUrl, { max: 2 });
+    const raceDb = createDbClient(racePool);
+
+    try {
+      const running = new DbDeploymentCommandRepository(raceDb, {
+        afterFenceRead: async () => {
+          signalFenceRead?.();
+          await resumeProjection;
+        }
+      }).projectRunning(fixture.commandId, fixture.agentId, runningProjection(fixture));
+      await fenceRead;
+      await expect(new DbDeploymentCommandRepository(raceDb).cancel(fixture.commandId, null, new Date().toISOString())).resolves.toMatchObject({ applied: true, command: { state: "cancelled" } });
+      releaseFence?.();
+
+      await expect(running).resolves.toMatchObject({ applied: false, command: { state: "cancelled" } });
+      await expect(client.query("SELECT status FROM deployments WHERE id = $1", [fixture.deploymentId])).resolves.toMatchObject({ rows: [{ status: "queued" }] });
+      await expect(client.query("SELECT count(*)::int AS count FROM deployment_logs WHERE deployment_id = $1", [fixture.deploymentId])).resolves.toMatchObject({ rows: [{ count: 0 }] });
+    } finally {
+      await closeDbPool(racePool);
+    }
+  });
+
+  it("rolls back running projection when its audit write cannot commit", async () => {
+    const client = requirePool();
+    const fixture = await seedClaimedProjectionFixture("rollback", new Date(Date.now() + 60_000).toISOString());
+    const projection = runningProjection(fixture, randomUUID());
+
+    await expect(new DbDeploymentCommandRepository(requireDb()).projectRunning(fixture.commandId, fixture.agentId, projection)).rejects.toThrow();
+    await expect(client.query("SELECT status FROM deployments WHERE id = $1", [fixture.deploymentId])).resolves.toMatchObject({ rows: [{ status: "queued" }] });
+    await expect(client.query("SELECT count(*)::int AS count FROM deployment_logs WHERE deployment_id = $1", [fixture.deploymentId])).resolves.toMatchObject({ rows: [{ count: 0 }] });
+    await expect(client.query("SELECT count(*)::int AS count FROM audit_events WHERE request_id = $1", [fixture.requestId])).resolves.toMatchObject({ rows: [{ count: 0 }] });
+  });
 });
+
+async function seedClaimedProjectionFixture(label: string, leaseExpiresAt: string) {
+  const client = requirePool();
+  const agentId = randomUUID();
+  const projectId = randomUUID();
+  const deploymentId = randomUUID();
+  const commandId = randomUUID();
+  const requestId = `req_projection_${label}`;
+  const correlationId = `corr_projection_${label}`;
+  const now = new Date().toISOString();
+  await client.query("INSERT INTO agents (id, name, endpoint, status) VALUES ($1, $2, $3, 'online')", [agentId, `Agent ${label}`, `https://${label}.agent.test`]);
+  await client.query("INSERT INTO projects (id, name, repo_url, default_branch, port) VALUES ($1, $2, $3, 'main', 3000)", [projectId, `Project ${label}`, `https://github.com/example/${label}`]);
+  await client.query("INSERT INTO deployments (id, project_id, agent_id, status, commit_sha, started_at) VALUES ($1, $2, $3, 'queued', 'abcdef1', $4)", [deploymentId, projectId, agentId, now]);
+  await client.query("INSERT INTO deployment_commands (id, deployment_id, agent_id, kind, state, payload, request_id, correlation_id, issued_at, claimed_at, lease_expires_at) VALUES ($1, $2, $3, 'start', 'claimed', '{}'::jsonb, $4, $5, $6, $6, $7)", [commandId, deploymentId, agentId, requestId, correlationId, now, leaseExpiresAt]);
+  return { agentId, projectId, deploymentId, commandId, requestId, correlationId, now };
+}
+
+function runningProjection(fixture: Awaited<ReturnType<typeof seedClaimedProjectionFixture>>, actorUserId: string | null = null) {
+  return {
+    deployment: { id: fixture.deploymentId, projectId: fixture.projectId, agentId: fixture.agentId, status: "running" as const, commitSha: "abcdef1", startedAt: fixture.now, finishedAt: null },
+    log: { id: randomUUID(), deploymentId: fixture.deploymentId, level: "info" as const, message: "running token dl_1234567890abcdef", timestamp: fixture.now, redactionApplied: false, requestId: fixture.requestId, correlationId: fixture.correlationId },
+    audit: { actorUserId, action: "deployment.running", targetType: "deployment", targetId: fixture.deploymentId, requestId: fixture.requestId, correlationId: fixture.correlationId, metadata: { token: "dl_1234567890abcdef" } }
+  };
+}
 
 function requirePool(): pg.Pool {
   if (!pool) {

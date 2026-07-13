@@ -1,10 +1,10 @@
-import { asc, eq, isNotNull } from "drizzle-orm";
+import { asc, eq, isNotNull, sql } from "drizzle-orm";
 import { redactLogMessage } from "@deploylite/config";
 import type { Agent, Deployment, LogEvent, Project } from "@deploylite/contracts";
 import type { AgentRepository, DeploymentRepository, ProjectRepository } from "@deploylite/domain";
 
 import type { DeployLiteDb } from "../client.js";
-import { agents, deploymentLogs, deployments, projects } from "../schema.js";
+import { agents, deploymentLogSequences, deploymentLogs, deployments, projects } from "../schema.js";
 
 
 export class DbAgentRepository implements AgentRepository {
@@ -162,22 +162,60 @@ export class DbDeploymentRepository implements DeploymentRepository {
   }
 
   async appendLog(event: LogEvent): Promise<LogEvent> {
-    const [row] = await this.db
-      .insert(deploymentLogs)
-      .values({
+    return this.db.transaction(async (tx) => {
+      const [row] = await tx
+        .insert(deploymentLogs)
+        .values({
+          id: event.id,
+          deploymentId: event.deploymentId,
+          sequence: event.sequence,
+          level: event.level,
+          message: redactLogMessage(event.message),
+          redactionApplied: true,
+          requestId: event.requestId,
+          correlationId: event.correlationId
+        })
+        .returning();
+
+      if (!row) throw new Error("Failed to append deployment log");
+      await tx.insert(deploymentLogSequences).values({
+        deploymentId: event.deploymentId,
+        nextSequence: event.sequence + 1
+      }).onConflictDoUpdate({
+        target: deploymentLogSequences.deploymentId,
+        set: { nextSequence: sql`GREATEST(${deploymentLogSequences.nextSequence}, ${event.sequence + 1})` }
+      });
+      return toLogEvent(row);
+    });
+  }
+
+  async appendAllocatedLog(event: Omit<LogEvent, "sequence">): Promise<LogEvent> {
+    return this.db.transaction(async (tx) => {
+      // PostgreSQL serializes conflicting UPSERTs on this one counter row. This
+      // avoids MAX(sequence)+1 and its bounded-retry failure mode under load.
+      const [allocation] = await tx
+        .insert(deploymentLogSequences)
+        .values({ deploymentId: event.deploymentId, nextSequence: 2 })
+        .onConflictDoUpdate({
+          target: deploymentLogSequences.deploymentId,
+          set: { nextSequence: sql`${deploymentLogSequences.nextSequence} + 1` }
+        })
+        .returning({ sequence: sql<number>`${deploymentLogSequences.nextSequence} - 1` });
+
+      if (!allocation) throw new Error("Failed to allocate deployment log sequence");
+      const [row] = await tx.insert(deploymentLogs).values({
         id: event.id,
         deploymentId: event.deploymentId,
-        sequence: event.sequence,
+        sequence: allocation.sequence,
         level: event.level,
         message: redactLogMessage(event.message),
         redactionApplied: true,
         requestId: event.requestId,
         correlationId: event.correlationId
-      })
-      .returning();
-
-    if (!row) throw new Error("Failed to append deployment log");
-    return toLogEvent(row);
+      }).returning();
+      if (!row) throw new Error("Failed to append deployment log");
+      return toLogEvent(row);
+    });
   }
 
   async listLogs(deploymentId: string, afterSequence = -1): Promise<LogEvent[]> {

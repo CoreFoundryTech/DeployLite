@@ -174,6 +174,16 @@ export const deploymentLogs = pgTable(
   ]
 );
 
+/** Per-deployment counter used to allocate log sequences without MAX()+retry races. */
+export const deploymentLogSequences = pgTable(
+  "deployment_log_sequences",
+  {
+    deploymentId: uuid("deployment_id").primaryKey().references(() => deployments.id, { onDelete: "cascade", onUpdate: "cascade" }),
+    nextSequence: integer("next_sequence").notNull().default(1)
+  },
+  (table) => [check("deployment_log_sequences_next_sequence_positive", sql`${table.nextSequence} > 0`)]
+);
+
 export const auditEvents = pgTable(
   "audit_events",
   {
@@ -357,6 +367,7 @@ export type DeploymentRow = typeof deployments.$inferSelect;
 export type NewDeploymentRow = typeof deployments.$inferInsert;
 export type DeploymentLogRow = typeof deploymentLogs.$inferSelect;
 export type NewDeploymentLogRow = typeof deploymentLogs.$inferInsert;
+export type DeploymentLogSequenceRow = typeof deploymentLogSequences.$inferSelect;
 export type NewEnvVariableMetadata = typeof envVariableMetadata.$inferInsert;
 export type EnvSecretValueRow = typeof envSecretValues.$inferSelect;
 export type NewEnvSecretValue = typeof envSecretValues.$inferInsert;

@@ -133,6 +133,10 @@ function metadataRepositories() {
       calls.push("deployments.appendLog");
       throw new Error("metadata read routes must not append logs");
     },
+    async appendAllocatedLog() {
+      calls.push("deployments.appendAllocatedLog");
+      throw new Error("metadata read routes must not append logs");
+    },
     async listLogs(deploymentId) {
       calls.push("deployments.listLogs");
       return deploymentId === "dep-1" ? [{ id: "log-1", deploymentId, sequence: 1, level: "info", message: "Started", timestamp: "2026-01-01T00:00:00.000Z", redactionApplied: true, requestId: "req-1", correlationId: "req-1" }] : [];
@@ -1772,6 +1776,7 @@ describe("Phase 5 slice 1 — DeploymentCommandBus control plane", () => {
       findById: (id) => delegate.findById(id),
       list: () => delegate.list(),
       appendLog: (event) => delegate.appendLog(event),
+      appendAllocatedLog: (event) => delegate.appendAllocatedLog(event),
       listLogs: (deploymentId, afterSequence) => delegate.listLogs(deploymentId, afterSequence)
     };
     const { app } = await authFixture({

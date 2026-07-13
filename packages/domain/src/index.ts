@@ -121,6 +121,7 @@ export type DeploymentRepository = {
   findById(id: string): Promise<Deployment | null>;
   list(): Promise<Deployment[]>;
   appendLog(event: LogEvent): Promise<LogEvent>;
+  appendAllocatedLog(event: Omit<LogEvent, "sequence">): Promise<LogEvent>;
   listLogs(deploymentId: string, afterSequence?: number): Promise<LogEvent[]>;
 };
 
@@ -138,6 +139,17 @@ export type DeploymentRepository = {
 // =====================================================================
 
 export type DeploymentCommandRecord = DeploymentCommand;
+
+/**
+ * A single, fenced lifecycle projection. Implementations must update the
+ * command fence (when applicable), deployment, allocated log, and audit event
+ * atomically; callers must never compose these writes themselves.
+ */
+export type DeploymentLifecycleProjection = {
+  deployment: Deployment;
+  log: Omit<LogEvent, "sequence">;
+  audit: AuditEventInput;
+};
 
 export type DeploymentCommandEventType =
   | "deployment.command.submitted"
@@ -207,6 +219,15 @@ export type DeploymentCommandRepository = {
   findById(id: string): Promise<DeploymentCommandRecord | null>;
   findActiveForDeployment(deploymentId: string): Promise<DeploymentCommandRecord | null>;
   list(): Promise<DeploymentCommandRecord[]>;
+};
+
+/**
+ * Opt-in persistence capability for lifecycle projection. Keeping this separate
+ * from the command state-machine repository lets existing command-only adapters
+ * remain valid until the executor integration adopts the projection boundary.
+ */
+export type DeploymentCommandProjectionRepository = {
+  projectRunning(commandId: string, agentId: string, projection: DeploymentLifecycleProjection): Promise<{ command: DeploymentCommandRecord; applied: boolean } | null>;
 };
 
 // =====================================================================
@@ -472,6 +493,7 @@ export function deploymentContainerName(projectSlug: string, commandId: string):
 export class InMemoryDeploymentRepository implements DeploymentRepository {
   readonly #deployments = new Map<string, Deployment>();
   readonly #logs = new Map<string, LogEvent[]>();
+  readonly #nextLogSequence = new Map<string, number>();
 
   async save(deployment: Deployment): Promise<Deployment> {
     this.#deployments.set(deployment.id, structuredClone(deployment));
@@ -493,16 +515,49 @@ export class InMemoryDeploymentRepository implements DeploymentRepository {
       throw new Error("Log sequences are immutable and unique per deployment");
     }
     this.#logs.set(event.deploymentId, [...events, safeEvent]);
+    this.#nextLogSequence.set(event.deploymentId, Math.max(this.#nextLogSequence.get(event.deploymentId) ?? 1, event.sequence + 1));
     return safeEvent;
+  }
+
+  async appendAllocatedLog(event: Omit<LogEvent, "sequence">): Promise<LogEvent> {
+    const sequence = this.#nextLogSequence.get(event.deploymentId) ?? 1;
+    this.#nextLogSequence.set(event.deploymentId, sequence + 1);
+    return this.appendLog({ ...event, sequence });
   }
 
   async listLogs(deploymentId: string, afterSequence = -1): Promise<LogEvent[]> {
     return (this.#logs.get(deploymentId) ?? []).filter((event) => event.sequence > afterSequence);
   }
+
+  snapshotLifecycle(deploymentId: string): { deployment: Deployment | undefined; logs: LogEvent[] | undefined; nextSequence: number | undefined } {
+    return {
+      deployment: this.#deployments.get(deploymentId) ? structuredClone(this.#deployments.get(deploymentId)) : undefined,
+      logs: this.#logs.get(deploymentId) ? structuredClone(this.#logs.get(deploymentId)) : undefined,
+      nextSequence: this.#nextLogSequence.get(deploymentId)
+    };
+  }
+
+  restoreLifecycle(deploymentId: string, snapshot: { deployment: Deployment | undefined; logs: LogEvent[] | undefined; nextSequence: number | undefined }): void {
+    if (snapshot.deployment) this.#deployments.set(deploymentId, snapshot.deployment); else this.#deployments.delete(deploymentId);
+    if (snapshot.logs) this.#logs.set(deploymentId, snapshot.logs); else this.#logs.delete(deploymentId);
+    if (snapshot.nextSequence) this.#nextLogSequence.set(deploymentId, snapshot.nextSequence); else this.#nextLogSequence.delete(deploymentId);
+  }
 }
 
 export class InMemoryDeploymentCommandRepository implements DeploymentCommandRepository {
   readonly #commands = new Map<string, DeploymentCommandRecord>();
+  readonly #projectedAudits = new Set<string>();
+  #critical: Promise<void> = Promise.resolve();
+  readonly #projection?: {
+    deployments: InMemoryDeploymentRepository;
+    audit: AuditRepository;
+    now: () => Date;
+    beforeProject?: () => Promise<void>;
+  };
+
+  constructor(projection?: { deployments: InMemoryDeploymentRepository; audit: AuditRepository; now: () => Date; beforeProject?: () => Promise<void> }) {
+    this.#projection = projection;
+  }
 
   async save(command: DeploymentCommandRecord): Promise<DeploymentCommandRecord> {
     const clone = structuredClone(command);
@@ -543,6 +598,63 @@ export class InMemoryDeploymentCommandRepository implements DeploymentCommandRep
     const command = structuredClone({ ...existing, ...next });
     this.#commands.set(command.id, command);
     return { command: structuredClone(command), applied: true };
+  }
+
+  async projectRunning(commandId: string, agentId: string, projection: DeploymentLifecycleProjection): Promise<{ command: DeploymentCommandRecord; applied: boolean } | null> {
+    if (!this.#projection) {
+      throw new Error("In-memory lifecycle projection requires deployment and audit repositories");
+    }
+
+    await this.#projection.beforeProject?.();
+    return this.#withinCritical(async () => {
+      const command = this.#commands.get(commandId);
+      if (!command || command.agentId !== agentId) return null;
+      if (command.state !== "claimed" || !command.leaseExpiresAt || command.leaseExpiresAt <= this.#projection!.now().toISOString()) {
+        return { command: structuredClone(command), applied: false };
+      }
+
+      const snapshot = this.#projection!.deployments.snapshotLifecycle(projection.deployment.id);
+      try {
+        const existingLogs = await this.#projection!.deployments.listLogs(projection.deployment.id);
+        const safeMessage = redactLogMessage(projection.log.message);
+        if (!existingLogs.some((log) => log.requestId === projection.log.requestId && log.correlationId === projection.log.correlationId)) {
+          await this.#projection!.deployments.save(projection.deployment);
+          await this.#projection!.deployments.appendAllocatedLog({ ...projection.log, message: safeMessage, redactionApplied: true });
+        }
+        const auditKey = `${projection.audit.action}:${projection.audit.targetType}:${projection.audit.targetId}:${projection.audit.requestId}:${projection.audit.correlationId}`;
+        if (!this.#projectedAudits.has(auditKey)) {
+          await this.#projection!.audit.append({ ...projection.audit, metadata: redactSecrets(projection.audit.metadata ?? {}) as Record<string, unknown> });
+          this.#projectedAudits.add(auditKey);
+        }
+      } catch (error) {
+        this.#projection!.deployments.restoreLifecycle(projection.deployment.id, snapshot);
+        throw error;
+      }
+      return { command: structuredClone(command), applied: true };
+    });
+  }
+
+  async cancel(commandId: string, requestedBy: string | null, now: string): Promise<{ command: DeploymentCommandRecord; applied: boolean } | null> {
+    return this.#withinCritical(async () => {
+      const command = this.#commands.get(commandId);
+      if (!command) return null;
+      if (command.state !== "pending" && command.state !== "claimed") return { command: structuredClone(command), applied: false };
+      const cancelled = structuredClone({ ...command, state: "cancelled" as const, requestedBy, completedAt: now, leaseExpiresAt: null });
+      this.#commands.set(commandId, cancelled);
+      return { command: structuredClone(cancelled), applied: true };
+    });
+  }
+
+  async #withinCritical<T>(operation: () => Promise<T>): Promise<T> {
+    const previous = this.#critical;
+    let release: (() => void) | undefined;
+    this.#critical = new Promise<void>((resolve) => { release = resolve; });
+    await previous;
+    try {
+      return await operation();
+    } finally {
+      release?.();
+    }
   }
 
   async findById(id: string): Promise<DeploymentCommandRecord | null> {
