@@ -1139,16 +1139,6 @@ function registerRoutes(app: FastifyInstance, state: PlatformRepositories, adapt
     }
     return reply.send(renewed);
   });
-  app.post(`${API_PREFIX}/agent/commands/:commandId/reserve`, async (request, reply) => {
-    if (!authenticateAgentRequest(request, reply, state.externalAgentIdentity)) return reply;
-    const params = z.object({ commandId: commandIdSchema }).safeParse(request.params);
-    const body = agentClaimBodySchema.safeParse(request.body);
-    if (!params.success || !body.success) return reply.code(400).send(errorEnvelope(request, "VALIDATION_ERROR", "Invalid agent command request."));
-    if (body.data.agentId !== state.externalAgentIdentity.agentId) return reply.code(403).send(errorEnvelope(request, "AGENT_IDENTITY_MISMATCH", "Agent identity mismatch."));
-    const reserved = await state.deploymentCommandBus.reserveExecution(params.data.commandId, state.externalAgentIdentity.agentId);
-    if (!reserved) return reply.code(409).send(errorEnvelope(request, "COMMAND_STATE_CONFLICT", "Command cannot be reserved for execution in its current state."));
-    return reply.send(reserved);
-  });
   app.post(`${API_PREFIX}/agent/commands/:commandId/complete`, async (request, reply) => {
     if (!authenticateAgentRequest(request, reply, state.externalAgentIdentity)) return reply;
     const params = z.object({ commandId: commandIdSchema }).safeParse(request.params);

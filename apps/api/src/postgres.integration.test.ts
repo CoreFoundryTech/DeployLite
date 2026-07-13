@@ -233,7 +233,7 @@ describeIntegration("DeployLite API PostgreSQL integration", () => {
       const first = await app.inject({ method: "POST", url: `/api/v1/agent/commands/${live.commandId}/running`, headers, payload: { agentId } });
       const retry = await app.inject({ method: "POST", url: `/api/v1/agent/commands/${live.commandId}/running`, headers, payload: { agentId } });
       expect(first.statusCode).toBe(200);
-      expect(first.json()).toMatchObject({ applied: true, command: { id: live.commandId, state: "claimed" } });
+      expect(first.json()).toMatchObject({ applied: true, command: { id: live.commandId, state: "executing" } });
       expect(retry.json()).toMatchObject({ applied: false, command: { id: live.commandId } });
       expect(await deployments.findById(live.deploymentId)).toMatchObject({ status: "running" });
       const logs = await deployments.listLogs(live.deploymentId);
@@ -243,12 +243,10 @@ describeIntegration("DeployLite API PostgreSQL integration", () => {
 
        const postProjectionCancelled = await seed("post-projection-cancelled", new Date(now.getTime() + 60_000).toISOString());
        const projected = await app.inject({ method: "POST", url: `/api/v1/agent/commands/${postProjectionCancelled.commandId}/running`, headers, payload: { agentId } });
-       expect(projected.json()).toMatchObject({ applied: true, command: { state: "claimed" } });
-       await commands.cancel(postProjectionCancelled.commandId, null, now.toISOString());
-       const revalidated = await app.inject({ method: "POST", url: `/api/v1/agent/commands/${postProjectionCancelled.commandId}/renew`, headers, payload: { agentId } });
-       expect(revalidated.statusCode).toBe(200);
-       expect(revalidated.json()).toMatchObject({ state: "cancelled", leaseExpiresAt: null });
-       expect(await deployments.findById(postProjectionCancelled.deploymentId)).toMatchObject({ status: "running" });
+      expect(projected.json()).toMatchObject({ applied: true, command: { state: "executing" } });
+      const cancellation = await commands.cancel(postProjectionCancelled.commandId, null, now.toISOString());
+      expect(cancellation).toMatchObject({ applied: false, command: { state: "executing" } });
+      expect(await deployments.findById(postProjectionCancelled.deploymentId)).toMatchObject({ status: "running" });
        expect(await deployments.listLogs(postProjectionCancelled.deploymentId)).toHaveLength(1);
        await expect(requirePool().query("SELECT count(*)::int AS count FROM audit_events WHERE request_id = $1", ["req-running-post-projection-cancelled"])).resolves.toMatchObject({ rows: [{ count: 1 }] });
 

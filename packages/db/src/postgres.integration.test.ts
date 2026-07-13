@@ -318,7 +318,7 @@ describeIntegration("PostgreSQL auth foundation integration", () => {
     const repository = new DbDeploymentCommandRepository(requireDb());
     const projection = runningProjection(live);
 
-    await expect(repository.projectRunning(live.commandId, live.agentId, projection)).resolves.toMatchObject({ applied: true, command: { state: "claimed" } });
+    await expect(repository.projectRunning(live.commandId, live.agentId, projection)).resolves.toMatchObject({ applied: true, command: { state: "executing" } });
     await expect(repository.projectRunning(live.commandId, live.agentId, {
       ...projection,
       log: { ...projection.log, id: randomUUID(), message: "retry token dl_fedcba0987654321" }

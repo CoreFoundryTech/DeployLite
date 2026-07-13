@@ -228,11 +228,8 @@ export class AgentWorker {
   private async executeWithLease(input: DeploymentExecutionInput, parentSignal: AbortSignal): Promise<void> {
     if (input.command.state !== "claimed" || !input.command.leaseExpiresAt) throw new Error("Polled command was not leased");
     const running = await this.options.transport.projectRunning(input.command.id, this.options.agentId);
-    if (!running || running.command.id !== input.command.id || running.command.agentId !== this.options.agentId || !running.applied) return;
-    // Reservation atomically closes the cancellation window before any executor side effect.
-    const authoritative = await this.options.transport.reserveExecution(input.command.id, this.options.agentId);
-    if (!authoritative || authoritative.id !== input.command.id || authoritative.agentId !== this.options.agentId || authoritative.state !== "executing" || !authoritative.leaseExpiresAt || parentSignal.aborted) return;
-    const executionInput = { ...input, command: authoritative };
+    if (!running || running.command.id !== input.command.id || running.command.agentId !== this.options.agentId || !running.applied || running.command.state !== "executing" || !running.command.leaseExpiresAt || parentSignal.aborted) return;
+    const executionInput = { ...input, command: running.command };
     const execution = new AbortController();
     const stop = () => execution.abort();
     parentSignal.addEventListener("abort", stop, { once: true });
@@ -380,10 +377,6 @@ export class HttpAgentCommandTransport implements AgentCommandTransport {
 
   async renewLease(commandId: string, agentId: string): Promise<DeploymentCommand | null> {
     return this.commandRequest(commandId, "renew", { agentId });
-  }
-
-  async reserveExecution(commandId: string, agentId: string): Promise<DeploymentCommand | null> {
-    return this.commandRequest(commandId, "reserve", { agentId });
   }
 
   async projectRunning(commandId: string, agentId: string): Promise<{ command: DeploymentCommand; applied: boolean } | null> {

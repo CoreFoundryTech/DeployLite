@@ -625,6 +625,7 @@ export class InMemoryDeploymentCommandRepository implements DeploymentCommandRep
         return { command: structuredClone(command), applied: false };
       }
 
+      const commandSnapshot = structuredClone(command);
       const snapshot = this.#projection!.deployments.snapshotLifecycle(projection.deployment.id);
       try {
         const existingLogs = await this.#projection!.deployments.listLogs(projection.deployment.id);
@@ -632,6 +633,8 @@ export class InMemoryDeploymentCommandRepository implements DeploymentCommandRep
         if (existingLogs.some((log) => log.requestId === projection.log.requestId && log.correlationId === projection.log.correlationId)) {
           return { command: structuredClone(command), applied: false };
         }
+        const executing = structuredClone({ ...command, state: "executing" as const });
+        this.#commands.set(commandId, executing);
         await this.#projection!.deployments.save(projection.deployment);
         await this.#projection!.deployments.appendAllocatedLog({ ...projection.log, message: safeMessage, redactionApplied: true });
         const auditKey = `${projection.audit.action}:${projection.audit.targetType}:${projection.audit.targetId}:${projection.audit.requestId}:${projection.audit.correlationId}`;
@@ -640,10 +643,11 @@ export class InMemoryDeploymentCommandRepository implements DeploymentCommandRep
           this.#projectedAudits.add(auditKey);
         }
       } catch (error) {
+        this.#commands.set(commandId, commandSnapshot);
         this.#projection!.deployments.restoreLifecycle(projection.deployment.id, snapshot);
         throw error;
       }
-      return { command: structuredClone(command), applied: true };
+      return { command: structuredClone(this.#commands.get(commandId)!), applied: true };
     });
   }
 

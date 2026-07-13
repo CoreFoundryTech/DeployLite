@@ -156,9 +156,9 @@ export class DbDeploymentCommandRepository implements DeploymentCommandRepositor
       if (!observed) return null;
       await this.testHooks?.afterFenceRead?.();
 
-      // Updating the fenced row takes a row lock and makes the lease test part
-      // of the same transaction as the deployment, log, and audit effects.
-      const [command] = await tx.update(deploymentCommands).set({ updatedAt: sql`clock_timestamp()` }).where(and(
+      // This reservation is the fence: it takes the row lock and moves the
+      // command to executing in the same transaction as every running effect.
+      const [command] = await tx.update(deploymentCommands).set({ state: "executing", updatedAt: sql`clock_timestamp()` }).where(and(
         eq(deploymentCommands.id, commandId),
         eq(deploymentCommands.agentId, agentId),
         eq(deploymentCommands.state, "claimed"),
