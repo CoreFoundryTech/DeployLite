@@ -156,6 +156,7 @@ describe("domain foundation", () => {
   it("projects a claimed live lease to running with one redacted allocated log and audit event", async () => {
     const deployments = new InMemoryDeploymentRepository();
     const audits: Array<{ action: string; metadata?: Record<string, unknown> }> = [];
+    const secretToken = "dl_1234567890abcdef";
     const commands = new InMemoryDeploymentCommandRepository({
       deployments,
       audit: {
@@ -172,15 +173,18 @@ describe("domain foundation", () => {
 
     const runningProjection = {
       deployment: { id: "dep_running", projectId: "project_1", agentId: "agent_1", status: "running", commitSha: "abcdef1", startedAt: now.toISOString(), finishedAt: null },
-      log: { id: "log_running", deploymentId: "dep_running", level: "info", message: "running token dl_1234567890abcdef", timestamp: now.toISOString(), redactionApplied: false, requestId: "req_running", correlationId: "corr_running" },
-      audit: { action: "deployment.running", targetType: "deployment", targetId: "dep_running", requestId: "req_running", correlationId: "corr_running", metadata: { token: "dl_1234567890abcdef" } }
+      log: { id: "log_running", deploymentId: "dep_running", level: "info", message: `running token ${secretToken}`, timestamp: now.toISOString(), redactionApplied: false, requestId: "req_running", correlationId: "corr_running" },
+      audit: { action: "deployment.running", targetType: "deployment", targetId: "dep_running", requestId: "req_running", correlationId: "corr_running", metadata: { token: secretToken } }
     };
     await expect(commands.projectRunning("cmd_running", "agent_1", runningProjection)).resolves.toMatchObject({ applied: true, command: { state: "claimed" } });
     await expect(commands.projectRunning("cmd_running", "agent_1", runningProjection)).resolves.toMatchObject({ applied: true });
 
     expect(await deployments.findById("dep_running")).toMatchObject({ status: "running" });
-    await expect(deployments.listLogs("dep_running")).resolves.toEqual([expect.objectContaining({ sequence: 1, message: "running token [REDACTED]" })]);
+    const persistedLogs = await deployments.listLogs("dep_running");
+    expect(persistedLogs).toEqual([expect.objectContaining({ sequence: 1, message: "running token [REDACTED]", redactionApplied: true })]);
+    expect(JSON.stringify(persistedLogs)).not.toContain(secretToken);
     expect(audits).toEqual([expect.objectContaining({ action: "deployment.running", metadata: { token: "[REDACTED]" } })]);
+    expect(JSON.stringify(audits)).not.toContain(secretToken);
   });
 
   it("rejects equality and expired leases without projecting running state", async () => {

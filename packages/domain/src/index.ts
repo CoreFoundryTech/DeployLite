@@ -619,7 +619,7 @@ export class InMemoryDeploymentCommandRepository implements DeploymentCommandRep
         const safeMessage = redactLogMessage(projection.log.message);
         if (!existingLogs.some((log) => log.requestId === projection.log.requestId && log.correlationId === projection.log.correlationId && log.message === safeMessage)) {
           await this.#projection!.deployments.save(projection.deployment);
-          await this.#projection!.deployments.appendAllocatedLog(projection.log);
+          await this.#projection!.deployments.appendAllocatedLog({ ...projection.log, message: safeMessage, redactionApplied: true });
         }
         const auditKey = `${projection.audit.action}:${projection.audit.targetType}:${projection.audit.targetId}:${projection.audit.requestId}:${projection.audit.correlationId}`;
         if (!this.#projectedAudits.has(auditKey)) {
