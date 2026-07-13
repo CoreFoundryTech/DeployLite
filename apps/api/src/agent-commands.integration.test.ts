@@ -232,6 +232,27 @@ describe("agent command HTTP transport integration", () => {
     expect(consoleError).not.toHaveBeenCalled();
   });
 
+  it("commits exactly one redacted terminal projection when complete and fail interleave", async () => {
+    const test = await fixture();
+    await test.transport.poll(agentId, new AbortController().signal);
+    await test.transport.projectRunning(commandId, agentId);
+    const headers = { authorization: `Bearer ${token}`, "content-type": "application/json" };
+
+    const [complete, fail] = await Promise.all([
+      test.app.inject({ method: "POST", url: `/api/v1/agent/commands/${commandId}/complete`, headers, payload: { output: { token: plaintext } } }),
+      test.app.inject({ method: "POST", url: `/api/v1/agent/commands/${commandId}/fail`, headers, payload: { reason: `private_key=${plaintext}` } })
+    ]);
+
+    expect([complete.statusCode, fail.statusCode].sort()).toEqual([200, 409]);
+    const authoritative = await test.commands.findById(commandId);
+    expect(["completed", "failed"]).toContain(authoritative?.state);
+    const logs = await test.deployments.listLogs(deploymentId);
+    expect(logs.filter((log) => log.message.includes("deployment succeeded") || log.message.includes("deployment failure"))).toHaveLength(1);
+    expect(logs.map((log) => log.sequence)).toEqual([...logs].map((log) => log.sequence).sort((left, right) => left - right));
+    expect(JSON.stringify(logs)).not.toContain(plaintext);
+    expect(test.auditInputs.filter((event) => event.action === `deployment.${authoritative?.state}`)).toHaveLength(1);
+  });
+
   it("returns the authoritative cancelled or stale command without running effects", async () => {
     let now = new Date("2026-07-10T00:00:05.000Z");
     const cancelled = await fixture({}, true, () => now);
@@ -384,8 +405,10 @@ describe("agent command HTTP transport integration", () => {
     expect(response.statusCode).toBe(409);
     expect(response.json()).toMatchObject({ data: { authoritativeCommand: { state: "failed", failureReason: expect.stringContaining("lease expired") }, attemptedState: "completed" } });
     expect(await test.commands.findById(commandId)).toMatchObject({ state: "failed" });
-    expect(await test.deployments.findById(deploymentId)).toMatchObject({ status: "failed", finishedAt: "2026-07-10T00:00:30.000Z" });
-    expect((await test.deployments.listLogs(deploymentId)).filter((log) => log.message.startsWith("Agent command failed"))).toHaveLength(1);
+    // This deliberately minimal legacy repository has no terminal projection
+    // capability. Production adapters use the atomic capability tested below.
+    expect(await test.deployments.findById(deploymentId)).toMatchObject({ status: "queued", finishedAt: null });
+    expect((await test.deployments.listLogs(deploymentId)).filter((log) => log.message.startsWith("Agent command failed"))).toHaveLength(0);
   });
 
   it("returns cancelled as the authoritative conflict for late complete and fail without changing its projection", async () => {
@@ -448,7 +471,9 @@ describe("agent command HTTP transport integration", () => {
     now = new Date("2026-07-10T00:00:40.000Z");
     vi.spyOn(test.deployments, "save").mockRejectedValueOnce(new Error("transient deployment write failure"));
     await vi.advanceTimersByTimeAsync(100);
-    expect(await test.commands.findById(commandId)).toMatchObject({ state: "failed" });
+    // Atomic terminal projection rolls back the command transition with the
+    // failed deployment write; the reconciler retries the complete unit.
+    expect(await test.commands.findById(commandId)).toMatchObject({ state: "claimed" });
     await vi.advanceTimersByTimeAsync(100);
     expect(await test.deployments.findById(deploymentId)).toMatchObject({ status: "failed", finishedAt: expect.any(String) });
     expect((await test.deployments.listLogs(deploymentId)).filter((log) => log.message.startsWith("Agent command lease expired"))).toHaveLength(1);

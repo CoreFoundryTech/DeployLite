@@ -50,6 +50,7 @@ import {
   type CreateSessionInput,
   type DeploymentCommandBus,
   type DeploymentCommandProjectionRepository,
+  type DeploymentCommandTerminalProjectionRepository,
   type DeploymentCommandRepository,
   type EnvSecretValueRepository,
   type EnvSecretMaterializationRepository,
@@ -459,6 +460,7 @@ type PlatformRepositories = PlatformRepositoryOptions & {
   envSecretCipher: EnvSecretCipher;
   deploymentCommandBus: DeploymentCommandBus;
   deploymentRunningProjection: DeploymentCommandProjectionRepository | null;
+  deploymentTerminalProjection: DeploymentCommandTerminalProjectionRepository | null;
   deploymentExecutor: DeploymentExecutor;
   cancelDeploymentExecutorTimers: () => void;
   externalAgentIdentity: { agentId: string; token: string } | null;
@@ -525,6 +527,7 @@ function createApiState(env: EnvSecretKeySource, overrides: Partial<PlatformRepo
     agentStatus,
     deploymentCommandBus,
     deploymentRunningProjection: asDeploymentCommandProjectionRepository(deploymentCommands),
+    deploymentTerminalProjection: asDeploymentCommandTerminalProjectionRepository(deploymentCommands),
     deploymentExecutor,
     cancelDeploymentExecutorTimers: () => deploymentExecutor.cancelTimers(),
     externalAgentIdentity: agentId && agentToken ? { agentId, token: agentToken } : null,
@@ -539,6 +542,11 @@ function createApiState(env: EnvSecretKeySource, overrides: Partial<PlatformRepo
 function asDeploymentCommandProjectionRepository(repository: DeploymentCommandRepository): DeploymentCommandProjectionRepository | null {
   const candidate = repository as DeploymentCommandRepository & Partial<DeploymentCommandProjectionRepository>;
   return typeof candidate.projectRunning === "function" ? candidate as DeploymentCommandProjectionRepository : null;
+}
+
+function asDeploymentCommandTerminalProjectionRepository(repository: DeploymentCommandRepository): DeploymentCommandTerminalProjectionRepository | null {
+  const candidate = repository as DeploymentCommandRepository & Partial<DeploymentCommandTerminalProjectionRepository>;
+  return typeof candidate.projectTerminal === "function" ? candidate as DeploymentCommandTerminalProjectionRepository : null;
 }
 
 function asEnvSecretMaterializationRepository(repository: EnvSecretValueRepository): EnvSecretMaterializationRepository {
@@ -784,7 +792,14 @@ async function projectAuthoritativeTerminalCommand(
   command: DeploymentCommand,
   failedLifecycle?: { marker: string; message: string }
 ): Promise<void> {
-  if (!(await state.deployments.findById(command.deploymentId))) return;
+  const deployment = await state.deployments.findById(command.deploymentId);
+  if (!deployment) return;
+  const lifecycle = terminalLifecycle(command, failedLifecycle);
+  if (lifecycle && state.deploymentTerminalProjection && (command.state === "completed" || command.state === "failed" || command.state === "cancelled")) {
+    await state.deploymentTerminalProjection.projectTerminal(command.id, command.agentId, command.state, terminalProjection(deployment, command, lifecycle));
+    return;
+  }
+  if (!deployment) return;
   if (command.state === "completed") {
     await ensureAgentDeploymentLifecycle(state, command, { status: "succeeded", level: "info", marker: "Agent completed deployment command", message: "Agent completed deployment command; deployment succeeded." });
   } else if (command.state === "failed") {
@@ -805,6 +820,52 @@ async function projectAuthoritativeTerminalCommand(
   }
 }
 
+function terminalLifecycle(command: DeploymentCommand, failedLifecycle?: { marker: string; message: string }): AgentDeploymentLifecycle | null {
+  if (command.state === "completed") return { status: "succeeded", level: "info", marker: "Agent completed deployment command", message: "Agent completed deployment command; deployment succeeded." };
+  if (command.state === "failed") {
+    const fallback = `Agent command failed: ${redactLogMessage(command.failureReason ?? "Unknown failure").slice(0, INVALID_COMMAND_REASON_MAX)}`;
+    return { status: "failed", level: "error", marker: failedLifecycle?.marker ?? "Agent command failed", message: failedLifecycle?.message ?? fallback };
+  }
+  if (command.state === "cancelled") return { status: "canceled", level: "error", marker: "Deployment command cancelled", message: "Deployment command cancelled; deployment was canceled." };
+  return null;
+}
+
+function terminalProjection(deployment: Deployment, command: DeploymentCommand, lifecycle: AgentDeploymentLifecycle) {
+  const finishedAt = command.completedAt ?? new Date().toISOString();
+  return {
+    deployment: { ...deployment, status: lifecycle.status, finishedAt, startedAt: deployment.startedAt ?? finishedAt },
+    log: { id: createRequestId(), deploymentId: deployment.id, level: lifecycle.level, message: lifecycle.message, timestamp: finishedAt, redactionApplied: true, requestId: command.requestId, correlationId: command.correlationId },
+    audit: { actorUserId: null, action: `deployment.${command.state}`, targetType: "deployment", targetId: deployment.id, requestId: command.requestId, correlationId: command.correlationId, metadata: { source: "agent" } }
+  };
+}
+
+async function transitionAgentTerminal(
+  state: PlatformRepositories,
+  command: DeploymentCommand,
+  next: Pick<DeploymentCommand, "state" | "completedAt" | "leaseExpiresAt" | "failureReason" | "payload">,
+  failedLifecycle?: { marker: string; message: string },
+  condition?: { leaseExpiresAtNotAfterNow: () => string } | { leaseExpiresAtAfterNow: () => string }
+): Promise<{ command: DeploymentCommand; applied: boolean } | null> {
+  const deployment = await state.deployments.findById(command.deploymentId);
+  if (!deployment || deployment.agentId !== command.agentId) throw new Error("Linked deployment is unavailable for agent terminal projection");
+  const projected = { ...command, ...next } as DeploymentCommand;
+  const lifecycle = terminalLifecycle(projected, failedLifecycle);
+  if (!lifecycle) throw new Error("Terminal projection requires a terminal command state");
+  if (command.state !== "pending" && command.state !== "claimed" && command.state !== "executing") {
+    throw new Error("Terminal projection requires an active command state");
+  }
+  if (!state.deploymentTerminalProjection) {
+    const legacy = next.state === "completed"
+      ? await state.deploymentCommandBus.complete(command.id, (next.payload as Record<string, unknown>).output as Record<string, unknown> | undefined)
+      : await state.deploymentCommandBus.fail(command.id, next.failureReason ?? "Agent command failed");
+    if (legacy?.state === next.state) await ensureAgentDeploymentLifecycle(state, legacy, lifecycle);
+    return legacy ? { command: legacy, applied: legacy.state === next.state } : null;
+  }
+  return state.deploymentTerminalProjection.transitionTerminalAndProject(
+    command.id, command.agentId, command.state, next, terminalProjection(deployment, projected, lifecycle), condition
+  );
+}
+
 async function terminallyFailAgentCommand(state: PlatformRepositories, command: DeploymentCommand, reason: string, marker = "Agent command rejected"): Promise<DeploymentCommand | null> {
   const safeReason = redactLogMessage(reason).slice(0, INVALID_COMMAND_REASON_MAX);
   const authoritative = await state.deploymentCommandBus.failSystem(command.id, safeReason);
@@ -814,11 +875,21 @@ async function terminallyFailAgentCommand(state: PlatformRepositories, command: 
 
 async function terminallyExpireAgentCommand(state: PlatformRepositories, command: DeploymentCommand, reason: string, marker: string): Promise<DeploymentCommand | null> {
   const safeReason = redactLogMessage(reason).slice(0, INVALID_COMMAND_REASON_MAX);
-  const authoritative = await state.deploymentCommandBus.failExpiredClaim(command.id, safeReason);
-  if (authoritative && authoritative.state !== "claimed" && authoritative.state !== "executing") {
-    await projectAuthoritativeTerminalCommand(state, authoritative, { marker, message: `${marker}: ${safeReason}` });
+  if (!state.deploymentTerminalProjection) {
+    const authoritative = await state.deploymentCommandBus.failExpiredClaim(command.id, safeReason);
+    if (authoritative && authoritative.state !== "claimed" && authoritative.state !== "executing") {
+      const lifecycle = terminalLifecycle(authoritative, { marker, message: `${marker}: ${safeReason}` });
+      if (lifecycle) await ensureAgentDeploymentLifecycle(state, authoritative, lifecycle);
+    }
+    return authoritative;
   }
-  return authoritative;
+  const next = { state: "failed" as const, completedAt: state.now().toISOString(), leaseExpiresAt: null, failureReason: safeReason, payload: command.payload };
+  const result = await transitionAgentTerminal(state, command, next, { marker, message: `${marker}: ${safeReason}` }, { leaseExpiresAtNotAfterNow: () => state.now().toISOString() });
+  if (!result) return null;
+  if (!result.applied && result.command.state !== "claimed" && result.command.state !== "executing") {
+    await projectAuthoritativeTerminalCommand(state, result.command, { marker, message: `${marker}: ${safeReason}` });
+  }
+  return result.command;
 }
 
 async function reconcileExpiredClaims(state: PlatformRepositories, agentId: string): Promise<void> {
@@ -1088,7 +1159,7 @@ function registerRoutes(app: FastifyInstance, state: PlatformRepositories, adapt
     if (!parsed.success) return reply.code(400).send(errorEnvelope(request, "VALIDATION_ERROR", "Invalid agent command request."));
     if (parsed.data.agentId !== state.externalAgentIdentity.agentId) return reply.code(403).send(errorEnvelope(request, "AGENT_IDENTITY_MISMATCH", "Agent identity mismatch."));
     await reconcileExpiredClaims(state, parsed.data.agentId);
-    const command = (await state.deploymentCommandBus.list()).find((item) => item.agentId === parsed.data.agentId && item.state === "claimed");
+    const command = (await state.deploymentCommandBus.list()).find((item) => item.agentId === parsed.data.agentId && (item.state === "executing" || item.state === "claimed"));
     if (!command) return reply.code(204).send();
     try {
       return reply.send(await materializeAgentExecutionInput(state, command));
@@ -1165,11 +1236,19 @@ function registerRoutes(app: FastifyInstance, state: PlatformRepositories, adapt
       if (authoritative && authoritative.state !== "claimed" && authoritative.state !== "executing") return reply.code(409).send(terminalConflictResponse(request, authoritative, "completed"));
       if (!authoritative) return reply.code(404).send(errorEnvelope(request, "NOT_FOUND", "Command not found."));
     }
-    const completed = await state.deploymentCommandBus.complete(existing.id, body.data.output ? redactSecrets(body.data.output) : undefined);
+    const completed = await transitionAgentTerminal(state, existing, {
+      state: "completed", completedAt: state.now().toISOString(), leaseExpiresAt: null, failureReason: null,
+      payload: body.data.output ? { ...existing.payload, output: redactSecrets(body.data.output) } : existing.payload
+    }, undefined, { leaseExpiresAtAfterNow: () => state.now().toISOString() });
     if (!completed) return reply.code(404).send(errorEnvelope(request, "NOT_FOUND", "Command not found."));
-    await projectAuthoritativeTerminalCommand(state, completed);
-    if (completed.state !== "completed") return reply.code(409).send(terminalConflictResponse(request, completed, "completed"));
-    return reply.send(completed);
+    if (!completed.applied && (completed.command.state === "claimed" || completed.command.state === "executing")) {
+      const authoritative = await terminallyExpireAgentCommand(state, completed.command, "Agent command lease expired; completion was rejected.", "Agent command lease expired");
+      if (!authoritative) return reply.code(404).send(errorEnvelope(request, "NOT_FOUND", "Command not found."));
+      if (authoritative.state === "completed") return reply.send(authoritative);
+      return reply.code(409).send(terminalConflictResponse(request, authoritative, "completed"));
+    }
+    if (completed.command.state !== "completed") return reply.code(409).send(terminalConflictResponse(request, completed.command, "completed"));
+    return reply.send(completed.command);
   });
   app.post(`${API_PREFIX}/agent/commands/:commandId/fail`, async (request, reply) => {
     if (!authenticateAgentRequest(request, reply, state.externalAgentIdentity)) return reply;
@@ -1192,16 +1271,17 @@ function registerRoutes(app: FastifyInstance, state: PlatformRepositories, adapt
       return reply.code(409).send(terminalConflictResponse(request, existing, "failed"));
     }
     if (existing.state !== "executing") return reply.code(409).send(errorEnvelope(request, "COMMAND_STATE_CONFLICT", "Command cannot fail in its current state."));
-    const failed = await state.deploymentCommandBus.fail(existing.id, safeReason);
+    const failed = await transitionAgentTerminal(state, existing, {
+      state: "failed", completedAt: state.now().toISOString(), leaseExpiresAt: null, failureReason: safeReason, payload: existing.payload
+    }, { marker: "Agent reported deployment failure", message: `Agent reported deployment failure: ${safeReason}` }, { leaseExpiresAtAfterNow: () => state.now().toISOString() });
     if (!failed) return reply.code(404).send(errorEnvelope(request, "NOT_FOUND", "Command not found."));
-    if (failed.state === "executing") {
+    if (!failed.applied && (failed.command.state === "claimed" || failed.command.state === "executing")) {
       const authoritative = await state.deploymentCommandBus.findById(existing.id);
       if (!authoritative) return reply.code(404).send(errorEnvelope(request, "NOT_FOUND", "Command not found."));
       return reply.code(409).send(leaseConflictResponse(request, authoritative, "failed"));
     }
-    await projectAuthoritativeTerminalCommand(state, failed, { marker: "Agent reported deployment failure", message: `Agent reported deployment failure: ${safeReason}` });
-    if (failed.state !== "failed") return reply.code(409).send(terminalConflictResponse(request, failed, "failed"));
-    return reply.send(failed);
+    if (failed.command.state !== "failed") return reply.code(409).send(terminalConflictResponse(request, failed.command, "failed"));
+    return reply.send(failed.command);
   });
   app.get(`${API_PREFIX}/bootstrap/status`, async (request) => ok(request, await getBootstrapStatus(adapters.users)));
   app.post(`${API_PREFIX}/bootstrap/initial-admin`, async (request, reply) => {

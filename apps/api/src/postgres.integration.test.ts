@@ -266,6 +266,52 @@ describeIntegration("DeployLite API PostgreSQL integration", () => {
       await app.close();
     }
   }, 30_000);
+
+  it("keeps one terminal projection when the API completion and recovery race", async () => {
+    const agentId = randomUUID();
+    const projectId = randomUUID();
+    const deploymentId = randomUUID();
+    const commandId = randomUUID();
+    const token = "postgres-agent-token-for-terminal-recovery";
+    const now = new Date().toISOString();
+    const requestId = `req-terminal-recovery-${commandId}`;
+    const correlationId = `corr-terminal-recovery-${commandId}`;
+    const projects = new DbProjectRepository(requireDb());
+    const agents = new DbAgentRepository(requireDb());
+    const deployments = new DbDeploymentRepository(requireDb());
+    const commands = new DbDeploymentCommandRepository(requireDb());
+    await projects.save({ id: projectId, name: "Terminal recovery project", repoUrl: "https://github.com/example/terminal-recovery", defaultBranch: "main", buildCommand: null, runCommand: null, port: 3000, description: null, imageTag: null });
+    await agents.save({ id: agentId, name: "Terminal recovery agent", endpoint: "https://terminal-recovery.agent.postgres.test", status: "online", lastHeartbeatAt: now, resourceSnapshot: null });
+    await deployments.save({ id: deploymentId, projectId, agentId, status: "running", commitSha: "abcdef1", startedAt: now, finishedAt: null });
+    await commands.save({
+      id: commandId, deploymentId, agentId, kind: "start", state: "executing", payload: {}, requestedBy: null,
+      requestId, correlationId, issuedAt: now, claimedAt: now, leaseExpiresAt: new Date(Date.now() + 60_000).toISOString(), completedAt: null, failureReason: null
+    });
+    const app = await createPostgresApp({ DEPLOYLITE_AGENT_ID: agentId, DEPLOYLITE_AGENT_TOKEN: token, DEPLOYLITE_SECRET_KEY: "postgres-agent-terminal-recovery-secret" });
+    const headers = { ...contentHeaders, authorization: `Bearer ${token}` };
+    const recoveryProjection = {
+      deployment: { id: deploymentId, projectId, agentId, status: "succeeded" as const, commitSha: "abcdef1", startedAt: now, finishedAt: now },
+      log: { id: randomUUID(), deploymentId, level: "info" as const, message: "Agent completed deployment command; deployment succeeded.", timestamp: now, redactionApplied: true, requestId, correlationId },
+      audit: { actorUserId: null, action: "deployment.completed", targetType: "deployment", targetId: deploymentId, requestId, correlationId, metadata: { source: "agent" } }
+    };
+
+    try {
+      const [completion, recovery] = await Promise.all([
+        app.inject({ method: "POST", url: `/api/v1/agent/commands/${commandId}/complete`, headers, payload: { output: { token: "dl_1234567890abcdef" } } }),
+        commands.projectTerminal(commandId, agentId, "completed", recoveryProjection)
+      ]);
+
+      expect(completion.statusCode).toBe(200);
+      expect(recovery?.applied).toBe(false);
+      await expect(commands.findById(commandId)).resolves.toMatchObject({ state: "completed" });
+      await expect(deployments.findById(deploymentId)).resolves.toMatchObject({ status: "succeeded" });
+      await expect(requirePool().query("SELECT count(*)::int AS count FROM deployment_logs WHERE deployment_id = $1", [deploymentId])).resolves.toMatchObject({ rows: [{ count: 1 }] });
+      await expect(requirePool().query("SELECT count(*)::int AS count FROM audit_events WHERE request_id = $1", [requestId])).resolves.toMatchObject({ rows: [{ count: 1 }] });
+      await expect(requirePool().query("SELECT message FROM deployment_logs WHERE deployment_id = $1", [deploymentId])).resolves.toMatchObject({ rows: [{ message: "Agent completed deployment command; deployment succeeded." }] });
+    } finally {
+      await app.close();
+    }
+  }, 30_000);
 });
 
 async function createPostgresApp(envOverrides: NodeJS.ProcessEnv = {}): Promise<FastifyInstance> {

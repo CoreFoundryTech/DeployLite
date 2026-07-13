@@ -360,6 +360,24 @@ describe("AgentWorker", () => {
     expect(executor.execute).not.toHaveBeenCalled();
   });
 
+  it("reconciles an owned executing command during normal polling and never re-executes it", async () => {
+    const shutdown = new AbortController();
+    const executing = { ...input, command: { ...input.command, state: "executing" as const } };
+    const commandTransport = transport({
+      recoverClaimed: vi.fn(async () => executing),
+      poll: vi.fn(async () => { shutdown.abort(); return null; })
+    });
+    const executor = { execute: vi.fn(), reconcile: vi.fn(async () => { shutdown.abort(); return { ok: false, dryRun: false, commands: [] }; }) };
+
+    await new AgentWorker({
+      agentId: "agent-1", agentName: "Agent", agentEndpoint: "http://agent.test", transport: commandTransport,
+      executor, resourceCollector: { collect: async () => snapshot }
+    }).run(shutdown.signal);
+
+    expect(executor.reconcile).toHaveBeenCalledWith(executing);
+    expect(executor.execute).not.toHaveBeenCalled();
+  });
+
   it("replays durable managed-resource repairs before command recovery after restart", async () => {
     const shutdown = new AbortController();
     const order: string[] = [];

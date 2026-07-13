@@ -233,6 +233,24 @@ export type DeploymentCommandProjectionRepository = {
   projectRunning(commandId: string, agentId: string, projection: DeploymentLifecycleProjection): Promise<{ command: DeploymentCommandRecord; applied: boolean } | null>;
 };
 
+/** Projects an authoritative terminal command with its deployment, log, and audit effects. */
+export type DeploymentCommandTerminalProjectionRepository = {
+  transitionTerminalAndProject(
+    commandId: string,
+    agentId: string,
+    expectedState: "pending" | "claimed" | "executing",
+    next: Pick<DeploymentCommandRecord, "state" | "completedAt" | "leaseExpiresAt" | "failureReason" | "payload">,
+    projection: DeploymentLifecycleProjection,
+    condition?: { leaseExpiresAtNotAfterNow: () => string } | { leaseExpiresAtAfterNow: () => string }
+  ): Promise<{ command: DeploymentCommandRecord; applied: boolean } | null>;
+  projectTerminal(
+    commandId: string,
+    agentId: string,
+    expectedState: "completed" | "failed" | "cancelled",
+    projection: DeploymentLifecycleProjection
+  ): Promise<{ command: DeploymentCommandRecord; applied: boolean } | null>;
+};
+
 // =====================================================================
 // Public helpers around the deployment command state machine.
 //
@@ -548,7 +566,7 @@ export class InMemoryDeploymentRepository implements DeploymentRepository {
   }
 }
 
-export class InMemoryDeploymentCommandRepository implements DeploymentCommandRepository {
+export class InMemoryDeploymentCommandRepository implements DeploymentCommandRepository, DeploymentCommandTerminalProjectionRepository {
   readonly #commands = new Map<string, DeploymentCommandRecord>();
   readonly #projectedAudits = new Set<string>();
   #critical: Promise<void> = Promise.resolve();
@@ -648,6 +666,75 @@ export class InMemoryDeploymentCommandRepository implements DeploymentCommandRep
         throw error;
       }
       return { command: structuredClone(this.#commands.get(commandId)!), applied: true };
+    });
+  }
+
+  async projectTerminal(
+    commandId: string,
+    agentId: string,
+    expectedState: "completed" | "failed" | "cancelled",
+    projection: DeploymentLifecycleProjection
+  ): Promise<{ command: DeploymentCommandRecord; applied: boolean } | null> {
+    if (!this.#projection) throw new Error("In-memory lifecycle projection requires deployment and audit repositories");
+    return this.#withinCritical(async () => {
+      const command = this.#commands.get(commandId);
+      if (!command || command.agentId !== agentId) return null;
+      if (command.state !== expectedState) return { command: structuredClone(command), applied: false };
+      const existingLogs = await this.#projection!.deployments.listLogs(projection.deployment.id);
+      if (existingLogs.some((log) => log.requestId === projection.log.requestId && log.correlationId === projection.log.correlationId)) {
+        return { command: structuredClone(command), applied: false };
+      }
+      const snapshot = this.#projection!.deployments.snapshotLifecycle(projection.deployment.id);
+      try {
+        await this.#projection!.deployments.save(projection.deployment);
+        await this.#projection!.deployments.appendAllocatedLog({ ...projection.log, message: redactLogMessage(projection.log.message), redactionApplied: true });
+        const auditKey = `${projection.audit.action}:${projection.audit.targetType}:${projection.audit.targetId}:${projection.audit.requestId}:${projection.audit.correlationId}`;
+        if (!this.#projectedAudits.has(auditKey)) {
+          await this.#projection!.audit.append({ ...projection.audit, metadata: redactSecrets(projection.audit.metadata ?? {}) as Record<string, unknown> });
+          this.#projectedAudits.add(auditKey);
+        }
+      } catch (error) {
+        this.#projection!.deployments.restoreLifecycle(projection.deployment.id, snapshot);
+        throw error;
+      }
+      return { command: structuredClone(command), applied: true };
+    });
+  }
+
+  async transitionTerminalAndProject(
+    commandId: string,
+    agentId: string,
+    expectedState: "pending" | "claimed" | "executing",
+    next: Pick<DeploymentCommandRecord, "state" | "completedAt" | "leaseExpiresAt" | "failureReason" | "payload">,
+    projection: DeploymentLifecycleProjection,
+    condition?: { leaseExpiresAtNotAfterNow: () => string } | { leaseExpiresAtAfterNow: () => string }
+  ): Promise<{ command: DeploymentCommandRecord; applied: boolean } | null> {
+    if (!this.#projection) throw new Error("In-memory lifecycle projection requires deployment and audit repositories");
+    return this.#withinCritical(async () => {
+      const current = this.#commands.get(commandId);
+      if (!current || current.agentId !== agentId) return null;
+      const now = this.#projection!.now().getTime();
+      const lease = current.leaseExpiresAt ? new Date(current.leaseExpiresAt).getTime() : Number.NaN;
+      const leaseMatches = !condition || ("leaseExpiresAtNotAfterNow" in condition ? lease <= now : lease > now);
+      if (current.state !== expectedState || !leaseMatches) return { command: structuredClone(current), applied: false };
+      const snapshot = this.#projection!.deployments.snapshotLifecycle(projection.deployment.id);
+      const original = structuredClone(current);
+      const command = { ...current, ...next };
+      try {
+        this.#commands.set(commandId, command);
+        await this.#projection!.deployments.save(projection.deployment);
+        await this.#projection!.deployments.appendAllocatedLog({ ...projection.log, message: redactLogMessage(projection.log.message), redactionApplied: true });
+        const auditKey = `${projection.audit.action}:${projection.audit.targetType}:${projection.audit.targetId}:${projection.audit.requestId}:${projection.audit.correlationId}`;
+        if (!this.#projectedAudits.has(auditKey)) {
+          await this.#projection!.audit.append({ ...projection.audit, metadata: redactSecrets(projection.audit.metadata ?? {}) as Record<string, unknown> });
+          this.#projectedAudits.add(auditKey);
+        }
+      } catch (error) {
+        this.#commands.set(commandId, original);
+        this.#projection!.deployments.restoreLifecycle(projection.deployment.id, snapshot);
+        throw error;
+      }
+      return { command: structuredClone(command), applied: true };
     });
   }
 
