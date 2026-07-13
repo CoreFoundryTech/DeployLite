@@ -227,10 +227,25 @@ export class DbDeploymentCommandRepository implements DeploymentCommandRepositor
         const [authoritative] = await tx.select().from(deploymentCommands).where(and(eq(deploymentCommands.id, commandId), eq(deploymentCommands.agentId, agentId))).limit(1);
         return authoritative ? { command: toDeploymentCommand(authoritative), applied: false } : null;
       }
-      const existingLog = await tx.select({ id: deploymentLogs.id }).from(deploymentLogs).where(and(
-        eq(deploymentLogs.deploymentId, projection.log.deploymentId), eq(deploymentLogs.requestId, projection.log.requestId), eq(deploymentLogs.correlationId, projection.log.correlationId)
+      // Running and terminal projections intentionally share request/correlation
+      // IDs. Only a matching terminal log and terminal audit prove this terminal
+      // projection was completed; a running log must not suppress recovery.
+      const safeMessage = redactLogMessage(projection.log.message);
+      const [existingLog] = await tx.select({ id: deploymentLogs.id }).from(deploymentLogs).where(and(
+        eq(deploymentLogs.deploymentId, projection.log.deploymentId),
+        eq(deploymentLogs.requestId, projection.log.requestId),
+        eq(deploymentLogs.correlationId, projection.log.correlationId),
+        eq(deploymentLogs.level, projection.log.level),
+        eq(deploymentLogs.message, safeMessage)
       )).limit(1);
-      if (existingLog.length > 0) return { command: toDeploymentCommand(command), applied: false };
+      const [existingAudit] = await tx.select({ id: auditEvents.id }).from(auditEvents).where(and(
+        eq(auditEvents.action, projection.audit.action), eq(auditEvents.targetType, projection.audit.targetType), eq(auditEvents.targetId, projection.audit.targetId),
+        eq(auditEvents.requestId, projection.audit.requestId), eq(auditEvents.correlationId, projection.audit.correlationId)
+      )).limit(1);
+      const [existingDeployment] = await tx.select({ status: deployments.status }).from(deployments).where(eq(deployments.id, projection.deployment.id)).limit(1);
+      if (existingLog && existingAudit && existingDeployment?.status === projection.deployment.status) {
+        return { command: toDeploymentCommand(command), applied: false };
+      }
       const [deployment] = await tx.update(deployments).set({
         status: projection.deployment.status,
         startedAt: projection.deployment.startedAt ? new Date(projection.deployment.startedAt) : null,
@@ -238,17 +253,15 @@ export class DbDeploymentCommandRepository implements DeploymentCommandRepositor
         updatedAt: sql`clock_timestamp()`
       }).where(eq(deployments.id, projection.deployment.id)).returning();
       if (!deployment) throw new Error("Terminal projection deployment is missing");
-      const [allocation] = await tx.insert(deploymentLogSequences).values({ deploymentId: projection.log.deploymentId, nextSequence: 2 }).onConflictDoUpdate({
-        target: deploymentLogSequences.deploymentId,
-        set: { nextSequence: sql`${deploymentLogSequences.nextSequence} + 1` }
-      }).returning({ sequence: sql<number>`${deploymentLogSequences.nextSequence} - 1` });
-      if (!allocation) throw new Error("Terminal projection could not allocate a deployment log sequence");
-      await tx.insert(deploymentLogs).values({ ...projection.log, sequence: allocation.sequence, message: redactLogMessage(projection.log.message), redactionApplied: true });
-      const existingAudit = await tx.select({ id: auditEvents.id }).from(auditEvents).where(and(
-        eq(auditEvents.action, projection.audit.action), eq(auditEvents.targetType, projection.audit.targetType), eq(auditEvents.targetId, projection.audit.targetId),
-        eq(auditEvents.requestId, projection.audit.requestId), eq(auditEvents.correlationId, projection.audit.correlationId)
-      )).limit(1);
-      if (existingAudit.length === 0) await tx.insert(auditEvents).values({
+      if (!existingLog) {
+        const [allocation] = await tx.insert(deploymentLogSequences).values({ deploymentId: projection.log.deploymentId, nextSequence: 2 }).onConflictDoUpdate({
+          target: deploymentLogSequences.deploymentId,
+          set: { nextSequence: sql`${deploymentLogSequences.nextSequence} + 1` }
+        }).returning({ sequence: sql<number>`${deploymentLogSequences.nextSequence} - 1` });
+        if (!allocation) throw new Error("Terminal projection could not allocate a deployment log sequence");
+        await tx.insert(deploymentLogs).values({ ...projection.log, sequence: allocation.sequence, message: safeMessage, redactionApplied: true });
+      }
+      if (!existingAudit) await tx.insert(auditEvents).values({
         actorUserId: projection.audit.actorUserId ?? null, action: projection.audit.action, targetType: projection.audit.targetType,
         targetId: projection.audit.targetId, requestId: projection.audit.requestId, correlationId: projection.audit.correlationId,
         metadata: redactSecrets(projection.audit.metadata ?? {}) as Record<string, unknown>

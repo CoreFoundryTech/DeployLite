@@ -680,15 +680,25 @@ export class InMemoryDeploymentCommandRepository implements DeploymentCommandRep
       const command = this.#commands.get(commandId);
       if (!command || command.agentId !== agentId) return null;
       if (command.state !== expectedState) return { command: structuredClone(command), applied: false };
+      const safeMessage = redactLogMessage(projection.log.message);
       const existingLogs = await this.#projection!.deployments.listLogs(projection.deployment.id);
-      if (existingLogs.some((log) => log.requestId === projection.log.requestId && log.correlationId === projection.log.correlationId)) {
+      const hasTerminalLog = existingLogs.some((log) =>
+        log.requestId === projection.log.requestId &&
+        log.correlationId === projection.log.correlationId &&
+        log.level === projection.log.level &&
+        log.message === safeMessage
+      );
+      const auditKey = `${projection.audit.action}:${projection.audit.targetType}:${projection.audit.targetId}:${projection.audit.requestId}:${projection.audit.correlationId}`;
+      const existingDeployment = await this.#projection!.deployments.findById(projection.deployment.id);
+      if (hasTerminalLog && this.#projectedAudits.has(auditKey) && existingDeployment?.status === projection.deployment.status) {
         return { command: structuredClone(command), applied: false };
       }
       const snapshot = this.#projection!.deployments.snapshotLifecycle(projection.deployment.id);
       try {
         await this.#projection!.deployments.save(projection.deployment);
-        await this.#projection!.deployments.appendAllocatedLog({ ...projection.log, message: redactLogMessage(projection.log.message), redactionApplied: true });
-        const auditKey = `${projection.audit.action}:${projection.audit.targetType}:${projection.audit.targetId}:${projection.audit.requestId}:${projection.audit.correlationId}`;
+        if (!hasTerminalLog) {
+          await this.#projection!.deployments.appendAllocatedLog({ ...projection.log, message: safeMessage, redactionApplied: true });
+        }
         if (!this.#projectedAudits.has(auditKey)) {
           await this.#projection!.audit.append({ ...projection.audit, metadata: redactSecrets(projection.audit.metadata ?? {}) as Record<string, unknown> });
           this.#projectedAudits.add(auditKey);
