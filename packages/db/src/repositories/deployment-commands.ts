@@ -1,20 +1,23 @@
 import { and, asc, desc, eq, gt, inArray, lte, sql } from "drizzle-orm";
+import { redactLogMessage, redactSecrets } from "@deploylite/config";
 import type { DeploymentCommandKind, DeploymentCommandState } from "@deploylite/contracts";
 import type {
   DeploymentCommandBusSubmitInput,
   DeploymentCommandEventType,
   DeploymentCommandRecord,
-  DeploymentCommandRepository
+  DeploymentCommandRepository,
+  DeploymentCommandProjectionRepository,
+  DeploymentLifecycleProjection
 } from "@deploylite/domain";
 
 import type { DeployLiteDb } from "../client.js";
-import { deploymentCommands, deployments, agents, type DeploymentCommandRow, type NewDeploymentCommandRow } from "../schema.js";
+import { auditEvents, deploymentCommands, deploymentLogSequences, deploymentLogs, deployments, agents, type DeploymentCommandRow, type NewDeploymentCommandRow } from "../schema.js";
 
 const TERMINAL_STATES: ReadonlyArray<DeploymentCommandState> = ["completed", "cancelled", "failed"];
 
 const ACTIVE_STATES: ReadonlyArray<DeploymentCommandState> = ["pending", "claimed"];
 
-export class DbDeploymentCommandRepository implements DeploymentCommandRepository {
+export class DbDeploymentCommandRepository implements DeploymentCommandRepository, DeploymentCommandProjectionRepository {
   constructor(private readonly db: DeployLiteDb) {}
 
   async save(command: DeploymentCommandRecord): Promise<DeploymentCommandRecord> {
@@ -127,6 +130,83 @@ export class DbDeploymentCommandRepository implements DeploymentCommandRepositor
     if (row) return { command: toDeploymentCommand(row), applied: true };
     const authoritative = await this.findById(commandId);
     return authoritative?.agentId === agentId ? { command: authoritative, applied: false } : null;
+  }
+
+  async projectRunning(commandId: string, agentId: string, projection: DeploymentLifecycleProjection): Promise<{ command: DeploymentCommandRecord; applied: boolean } | null> {
+    return this.db.transaction(async (tx) => {
+      // Updating the fenced row takes a row lock and makes the lease test part
+      // of the same transaction as the deployment, log, and audit effects.
+      const [command] = await tx.update(deploymentCommands).set({ updatedAt: sql`clock_timestamp()` }).where(and(
+        eq(deploymentCommands.id, commandId),
+        eq(deploymentCommands.agentId, agentId),
+        eq(deploymentCommands.state, "claimed"),
+        gt(deploymentCommands.leaseExpiresAt, sql`clock_timestamp()`)
+      )).returning();
+      if (!command) {
+        const [authoritative] = await tx.select().from(deploymentCommands).where(and(eq(deploymentCommands.id, commandId), eq(deploymentCommands.agentId, agentId))).limit(1);
+        return authoritative ? { command: toDeploymentCommand(authoritative), applied: false } : null;
+      }
+
+      const [deployment] = await tx.update(deployments).set({
+        status: projection.deployment.status,
+        startedAt: new Date(projection.deployment.startedAt),
+        finishedAt: projection.deployment.finishedAt ? new Date(projection.deployment.finishedAt) : null,
+        updatedAt: sql`clock_timestamp()`
+      }).where(eq(deployments.id, projection.deployment.id)).returning();
+      if (!deployment) throw new Error("Running projection deployment is missing");
+
+      const safeMessage = redactLogMessage(projection.log.message);
+      const existingLog = await tx.select({ id: deploymentLogs.id }).from(deploymentLogs).where(and(
+        eq(deploymentLogs.deploymentId, projection.log.deploymentId),
+        eq(deploymentLogs.requestId, projection.log.requestId),
+        eq(deploymentLogs.correlationId, projection.log.correlationId),
+        eq(deploymentLogs.message, safeMessage)
+      )).limit(1);
+      if (existingLog.length === 0) {
+        const [allocation] = await tx.insert(deploymentLogSequences).values({ deploymentId: projection.log.deploymentId, nextSequence: 2 }).onConflictDoUpdate({
+          target: deploymentLogSequences.deploymentId,
+          set: { nextSequence: sql`${deploymentLogSequences.nextSequence} + 1` }
+        }).returning({ sequence: sql<number>`${deploymentLogSequences.nextSequence} - 1` });
+        if (!allocation) throw new Error("Running projection could not allocate a deployment log sequence");
+        await tx.insert(deploymentLogs).values({ ...projection.log, sequence: allocation.sequence, message: safeMessage, redactionApplied: true });
+      }
+
+      const existingAudit = await tx.select({ id: auditEvents.id }).from(auditEvents).where(and(
+        eq(auditEvents.action, projection.audit.action),
+        eq(auditEvents.targetType, projection.audit.targetType),
+        eq(auditEvents.targetId, projection.audit.targetId),
+        eq(auditEvents.requestId, projection.audit.requestId),
+        eq(auditEvents.correlationId, projection.audit.correlationId)
+      )).limit(1);
+      if (existingAudit.length === 0) {
+        await tx.insert(auditEvents).values({
+          actorUserId: projection.audit.actorUserId ?? null,
+          action: projection.audit.action,
+          targetType: projection.audit.targetType,
+          targetId: projection.audit.targetId,
+          requestId: projection.audit.requestId,
+          correlationId: projection.audit.correlationId,
+          metadata: redactSecrets(projection.audit.metadata ?? {}) as Record<string, unknown>
+        });
+      }
+      return { command: toDeploymentCommand(command), applied: true };
+    });
+  }
+
+  async cancel(commandId: string, requestedBy: string | null, now: string): Promise<{ command: DeploymentCommandRecord; applied: boolean } | null> {
+    const [command] = await this.db.update(deploymentCommands).set({
+      state: "cancelled",
+      requestedBy,
+      completedAt: new Date(now),
+      leaseExpiresAt: null,
+      updatedAt: new Date(now)
+    }).where(and(
+      eq(deploymentCommands.id, commandId),
+      inArray(deploymentCommands.state, ["pending", "claimed"])
+    )).returning();
+    if (command) return { command: toDeploymentCommand(command), applied: true };
+    const authoritative = await this.findById(commandId);
+    return authoritative ? { command: authoritative, applied: false } : null;
   }
 
   async findActiveForDeployment(deploymentId: string): Promise<DeploymentCommandRecord | null> {
