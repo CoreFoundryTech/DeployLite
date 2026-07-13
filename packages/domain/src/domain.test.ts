@@ -153,6 +153,13 @@ describe("domain foundation", () => {
     expect(events.map((event) => event.sequence).sort((left, right) => left - right)).toEqual(Array.from({ length: 128 }, (_, index) => index + 1));
   });
 
+  it("allocates after the highest explicitly appended log sequence", async () => {
+    const deployments = new InMemoryDeploymentRepository();
+    await deployments.appendLog({ id: "explicit_log", deploymentId: "dep_explicit", sequence: 7, level: "info", message: "explicit", timestamp: now.toISOString(), redactionApplied: false, requestId: "req_explicit", correlationId: "corr_explicit" });
+
+    await expect(deployments.appendAllocatedLog({ id: "allocated_log", deploymentId: "dep_explicit", level: "info", message: "allocated", timestamp: now.toISOString(), redactionApplied: false, requestId: "req_explicit", correlationId: "corr_explicit" })).resolves.toMatchObject({ sequence: 8 });
+  });
+
   it("projects a claimed live lease to running with one redacted allocated log and audit event", async () => {
     const deployments = new InMemoryDeploymentRepository();
     const audits: Array<{ action: string; metadata?: Record<string, unknown> }> = [];

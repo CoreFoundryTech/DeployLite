@@ -17,8 +17,13 @@ const TERMINAL_STATES: ReadonlyArray<DeploymentCommandState> = ["completed", "ca
 
 const ACTIVE_STATES: ReadonlyArray<DeploymentCommandState> = ["pending", "claimed"];
 
+// Test-only synchronization point for proving a competing cancellation wins.
+type ProjectRunningTestHooks = {
+  afterFenceRead?: () => Promise<void>;
+};
+
 export class DbDeploymentCommandRepository implements DeploymentCommandRepository, DeploymentCommandProjectionRepository {
-  constructor(private readonly db: DeployLiteDb) {}
+  constructor(private readonly db: DeployLiteDb, private readonly testHooks?: ProjectRunningTestHooks) {}
 
   async save(command: DeploymentCommandRecord): Promise<DeploymentCommandRecord> {
     // Defensive FK check: refuse to write a command whose deployment or
@@ -134,6 +139,13 @@ export class DbDeploymentCommandRepository implements DeploymentCommandRepositor
 
   async projectRunning(commandId: string, agentId: string, projection: DeploymentLifecycleProjection): Promise<{ command: DeploymentCommandRecord; applied: boolean } | null> {
     return this.db.transaction(async (tx) => {
+      const [observed] = await tx.select().from(deploymentCommands).where(and(
+        eq(deploymentCommands.id, commandId),
+        eq(deploymentCommands.agentId, agentId)
+      )).limit(1);
+      if (!observed) return null;
+      await this.testHooks?.afterFenceRead?.();
+
       // Updating the fenced row takes a row lock and makes the lease test part
       // of the same transaction as the deployment, log, and audit effects.
       const [command] = await tx.update(deploymentCommands).set({ updatedAt: sql`clock_timestamp()` }).where(and(

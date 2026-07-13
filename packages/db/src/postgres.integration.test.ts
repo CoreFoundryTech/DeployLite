@@ -333,6 +333,43 @@ describeIntegration("PostgreSQL auth foundation integration", () => {
     }
   });
 
+  it("advances allocation beyond an explicitly appended log sequence", async () => {
+    const fixture = await seedClaimedProjectionFixture("explicit_sequence", new Date(Date.now() + 60_000).toISOString());
+    const repository = new DbDeploymentRepository(requireDb());
+
+    await repository.appendLog({ id: randomUUID(), deploymentId: fixture.deploymentId, sequence: 7, level: "info", message: "explicit", timestamp: fixture.now, redactionApplied: false, requestId: fixture.requestId, correlationId: fixture.correlationId });
+    await expect(repository.appendAllocatedLog({ id: randomUUID(), deploymentId: fixture.deploymentId, level: "info", message: "allocated", timestamp: fixture.now, redactionApplied: false, requestId: fixture.requestId, correlationId: fixture.correlationId })).resolves.toMatchObject({ sequence: 8 });
+  });
+
+  it("does not project running effects when cancellation wins after the lease fence is read", async () => {
+    const client = requirePool();
+    const fixture = await seedClaimedProjectionFixture("cancel_after_fence", new Date(Date.now() + 60_000).toISOString());
+    let releaseFence: (() => void) | undefined;
+    let signalFenceRead: (() => void) | undefined;
+    const fenceRead = new Promise<void>((resolve) => { signalFenceRead = resolve; });
+    const resumeProjection = new Promise<void>((resolve) => { releaseFence = resolve; });
+    const racePool = createDbPool(databaseUrl, { max: 2 });
+    const raceDb = createDbClient(racePool);
+
+    try {
+      const running = new DbDeploymentCommandRepository(raceDb, {
+        afterFenceRead: async () => {
+          signalFenceRead?.();
+          await resumeProjection;
+        }
+      }).projectRunning(fixture.commandId, fixture.agentId, runningProjection(fixture));
+      await fenceRead;
+      await expect(new DbDeploymentCommandRepository(raceDb).cancel(fixture.commandId, null, new Date().toISOString())).resolves.toMatchObject({ applied: true, command: { state: "cancelled" } });
+      releaseFence?.();
+
+      await expect(running).resolves.toMatchObject({ applied: false, command: { state: "cancelled" } });
+      await expect(client.query("SELECT status FROM deployments WHERE id = $1", [fixture.deploymentId])).resolves.toMatchObject({ rows: [{ status: "queued" }] });
+      await expect(client.query("SELECT count(*)::int AS count FROM deployment_logs WHERE deployment_id = $1", [fixture.deploymentId])).resolves.toMatchObject({ rows: [{ count: 0 }] });
+    } finally {
+      await closeDbPool(racePool);
+    }
+  });
+
   it("rolls back running projection when its audit write cannot commit", async () => {
     const client = requirePool();
     const fixture = await seedClaimedProjectionFixture("rollback", new Date(Date.now() + 60_000).toISOString());
