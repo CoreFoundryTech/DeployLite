@@ -93,7 +93,7 @@ pnpm --filter @deploylite/web test
 pnpm check
 ```
 
-`pnpm check` runs build, lint/typecheck, and tests across the workspace. Integration checks that require a live PostgreSQL instance are opt-in so the default workflow stays deterministic.
+`pnpm check` runs build, lint/typecheck, and tests across the workspace. Integration checks that require a live PostgreSQL instance are opt-in so the default workflow stays deterministic. GitHub Actions additionally runs the PostgreSQL repository and API lifecycle suites against its PostgreSQL service, including lifecycle idempotency, CORS, and SSE coverage.
 
 ## Scaffold chain
 
