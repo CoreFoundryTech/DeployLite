@@ -512,7 +512,7 @@ describe("DeployLite API scaffold", () => {
       headers: { cookie, "last-event-id": "1", "x-request-id": "req_logs_1" }
     });
 
-    expect(response.statusCode).toBe(200);
+    expect(response.statusCode, response.body).toBe(200);
     expect(response.headers["content-type"]).toContain("text/event-stream");
     expect(response.body).not.toContain("id: 1");
     expect(response.body).toContain("id: 2");
@@ -542,7 +542,11 @@ describe("DeployLite API scaffold", () => {
     expect(deployment.json().data.deployment).toMatchObject({ id: "dep-1" });
     expect(logs.statusCode).toBe(200);
     expect(logs.json().data.events).toEqual([expect.objectContaining({ sequence: 1 })]);
-    expect(calls).toEqual(["projects.list", "agents.list", "deployments.list", "deployments.findById", "deployments.listLogs"]);
+    expect(calls).toEqual([
+      "projects.list", "agents.list", "deployments.list",
+      "deployments.findById", "projects.findById", "agents.findById",
+      "deployments.findById", "projects.findById", "agents.findById", "deployments.listLogs"
+    ]);
     expect(calls).not.toEqual(expect.arrayContaining(["projects.save", "agents.save", "deployments.save", "deployments.appendLog"]));
   });
 
@@ -565,7 +569,7 @@ describe("DeployLite API scaffold", () => {
     expect(projects.json().data).toEqual({ projects: [] });
     expect(agents.json().data).toEqual({ agents: [] });
     expect(deployments.json().data).toEqual({ deployments: [] });
-    expect(logs.json().data).toEqual({ events: [] });
+    expect(logs.statusCode).toBe(404);
   });
 
   it("rejects unsafe heartbeat payloads without leaking validation details", async () => {
@@ -1613,6 +1617,64 @@ describe("DeployLite API scaffold", () => {
 });
 
 describe("Phase 5 slice 1 — DeploymentCommandBus control plane", () => {
+  it("submits an authenticated cancellation once, preserves the authoritative lifecycle, and exposes redacted SSE recovery", async () => {
+    const deployments = new InMemoryDeploymentRepository();
+    const lifecycleAudit = new InMemoryAuditRepository();
+    const deploymentCommands = new InMemoryDeploymentCommandRepository({ deployments, audit: lifecycleAudit, now: () => new Date("2026-01-01T00:00:00.000Z") });
+    const { app, user } = await authFixture({ state: { deploymentCommands, deployments } });
+    const cookie = await loginCookie(app);
+    const deployment = (await app.inject({
+      method: "POST",
+      url: "/api/v1/deployments",
+      headers: { ...contentHeaders, cookie },
+      payload: { projectId: "project_mock_1", agentId: "agent_mock_1", status: "queued", commitSha: "abcdef1" }
+    })).json().data.deployment;
+    await deploymentCommands.save({
+      id: "command-cancel-1",
+      deploymentId: deployment.id,
+      agentId: "agent_mock_1",
+      kind: "start",
+      state: "pending",
+      payload: { token: "dl_1234567890abcdef" },
+      requestedBy: user.id,
+      requestId: "request-cancel-1",
+      correlationId: "correlation-cancel-1",
+      issuedAt: "2026-01-01T00:00:00.000Z",
+      claimedAt: null,
+      leaseExpiresAt: null,
+      completedAt: null,
+      failureReason: null
+    });
+
+    const first = await app.inject({ method: "POST", url: `/api/v1/deployments/${deployment.id}/cancel`, headers: { cookie, "x-request-id": "cancel-request-1" } });
+    const repeat = await app.inject({ method: "POST", url: `/api/v1/deployments/${deployment.id}/cancel`, headers: { cookie, "x-request-id": "cancel-request-2" } });
+    const stream = await app.inject({ method: "GET", url: `/api/v1/deployments/${deployment.id}/logs/stream`, headers: { cookie, "last-event-id": "0" } });
+
+    expect(first.statusCode).toBe(200);
+    expect(first.json().data.command).toMatchObject({ id: "command-cancel-1", state: "cancelled" });
+    expect(repeat.statusCode).toBe(200);
+    expect(repeat.json().data.command).toMatchObject({ id: "command-cancel-1", state: "cancelled" });
+    expect((await deploymentCommands.findById("command-cancel-1"))?.state).toBe("cancelled");
+    expect(stream.statusCode).toBe(200);
+    expect(stream.body).toContain("Deployment command cancelled");
+    expect(stream.body).not.toContain("dl_1234567890abcdef");
+    expect(lifecycleAudit.inputs.filter((entry) => entry.action === "deployment.cancelled")).toHaveLength(1);
+
+    await app.close();
+  });
+
+  it("denies unauthorized lifecycle controls without creating commands or effects", async () => {
+    const deploymentCommands = new InMemoryDeploymentCommandRepository();
+    const { app } = await authFixture({ user: { role: "read-only" }, state: { deploymentCommands } });
+    const cookie = await loginCookie(app);
+
+    const response = await app.inject({ method: "POST", url: "/api/v1/deployments/dep_mock_1/restart", headers: { cookie } });
+
+    expect(response.statusCode).toBe(403);
+    expect(await deploymentCommands.list()).toEqual([]);
+    await app.close();
+  });
+
   it("creates UUID-backed agent, project, and deployment records with command-compatible foreign keys", async () => {
     const deploymentCommands = new InMemoryDeploymentCommandRepository();
     const { app } = await authFixture({ state: { deploymentCommands } });

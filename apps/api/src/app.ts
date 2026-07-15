@@ -76,6 +76,7 @@ declare module "fastify" {
 }
 
 const API_PREFIX = "/api/v1";
+const SSE_LOG_PAGE_LIMIT = 100;
 const AUTH_HEADER = "x-scaffold-auth";
 const SCAFFOLD_ACTOR = "scaffold-user";
 const defaultSessionCookieName = "deploylite_session";
@@ -1000,6 +1001,44 @@ async function compensateAgentLifecycleFailure(state: PlatformRepositories, comm
   } catch { /* best-effort compensation only; the original request reports the repository failure */ }
 }
 
+/** Resolve the ownership chain before exposing deployment state or accepting lifecycle controls. */
+async function resolveDeploymentScope(state: PlatformRepositories, deploymentId: string) {
+  const deployment = await state.deployments.findById(deploymentId);
+  if (!deployment) return null;
+  const [project, agent] = await Promise.all([
+    state.projects.findById(deployment.projectId),
+    state.agents.findById(deployment.agentId)
+  ]);
+  if (!project || !agent || agent.id !== deployment.agentId) return null;
+  if (state.externalAgentIdentity && agent.id !== state.externalAgentIdentity.agentId) return null;
+  return { deployment, project, agent };
+}
+
+async function appendDeploymentControlLog(
+  state: PlatformRepositories,
+  deploymentId: string,
+  level: "info" | "warn" | "error",
+  message: string,
+  request: FastifyRequest
+): Promise<void> {
+  await state.deployments.appendAllocatedLog({
+    id: createRequestId(),
+    deploymentId,
+    level,
+    message: redactLogMessage(message),
+    timestamp: state.now().toISOString(),
+    redactionApplied: true,
+    ...request.correlationContext
+  });
+}
+
+function sseResumeCursor(request: FastifyRequest): number {
+  const raw = getHeaderValue(request, "last-event-id");
+  if (!raw || !/^\d{1,15}$/.test(raw)) return -1;
+  const cursor = Number.parseInt(raw, 10);
+  return Number.isSafeInteger(cursor) ? cursor : -1;
+}
+
 async function assignedCommand(state: PlatformRepositories, commandId: string, agentId: string): Promise<DeploymentCommand | null> {
   const command = await state.deploymentCommandBus.findById(commandId);
   return command?.agentId === agentId ? command : null;
@@ -1676,8 +1715,8 @@ function registerRoutes(app: FastifyInstance, state: PlatformRepositories, adapt
   });
   app.get(`${API_PREFIX}/deployments/:deploymentId`, { preHandler: requireAuth }, async (request, reply) => {
     const params = z.object({ deploymentId: z.string().min(1) }).parse(request.params);
-    const deployment = await state.deployments.findById(params.deploymentId);
-    return deployment ? ok(request, { deployment }) : reply.code(404).send(errorEnvelope(request, "NOT_FOUND", "Deployment not found."));
+    const scoped = await resolveDeploymentScope(state, params.deploymentId);
+    return scoped ? ok(request, { deployment: scoped.deployment }) : reply.code(404).send(errorEnvelope(request, "NOT_FOUND", "Deployment not found."));
   });
   app.get(`${API_PREFIX}/deployments`, { preHandler: requireAuth }, async (request) => ok(request, { deployments: await state.deployments.list() }));
   // Audit history list — operator/admin only. The response shape strips
@@ -1719,19 +1758,69 @@ function registerRoutes(app: FastifyInstance, state: PlatformRepositories, adapt
     });
     return ok(request, page);
   });
-  app.get(`${API_PREFIX}/deployments/:deploymentId/logs`, { preHandler: requireAuth }, async (request) => {
+  app.get(`${API_PREFIX}/deployments/:deploymentId/logs`, { preHandler: requireAuth }, async (request, reply) => {
     const params = z.object({ deploymentId: z.string().min(1) }).parse(request.params);
-    return ok(request, { events: await state.deployments.listLogs(params.deploymentId) });
+    const scoped = await resolveDeploymentScope(state, params.deploymentId);
+    if (!scoped) return reply.code(404).send(errorEnvelope(request, "NOT_FOUND", "Deployment not found."));
+    return ok(request, { events: await state.deployments.listLogs(scoped.deployment.id) });
   });
   app.get(`${API_PREFIX}/deployments/:deploymentId/logs/stream`, { preHandler: requireAuth }, async (request, reply) => {
     const params = z.object({ deploymentId: z.string().min(1) }).parse(request.params);
-    const lastEventId = Number.parseInt(getHeaderValue(request, "last-event-id") ?? "-1", 10);
-    const logs = await state.deployments.listLogs(params.deploymentId, Number.isFinite(lastEventId) ? lastEventId : -1);
+    const scoped = await resolveDeploymentScope(state, params.deploymentId);
+    if (!scoped) return reply.code(404).send(errorEnvelope(request, "NOT_FOUND", "Deployment not found."));
+    const logs = await state.deployments.listLogs(scoped.deployment.id, sseResumeCursor(request));
     const body = logs
-      .map((log) => `id: ${log.sequence}\nevent: deployment.log\ndata: ${JSON.stringify({ ...log, audit: { action: "deployment.log.stream", targetType: "deployment", targetId: params.deploymentId, ...request.correlationContext } })}\n`)
+      .slice(0, SSE_LOG_PAGE_LIMIT)
+      .map((log) => `id: ${log.sequence}\nevent: deployment.log\ndata: ${JSON.stringify({ ...log, message: redactLogMessage(log.message), redactionApplied: true, stream: request.correlationContext })}\n`)
       .join("\n");
-    return reply.header("content-type", "text/event-stream; charset=utf-8").header("cache-control", "no-cache").send(body.length > 0 ? `${body}\n` : "");
+    const terminal = ["succeeded", "failed", "canceled"].includes(scoped.deployment.status);
+    const status = `event: deployment.status\ndata: ${JSON.stringify({ deploymentId: scoped.deployment.id, status: scoped.deployment.status, finishedAt: scoped.deployment.finishedAt, stream: request.correlationContext })}\n\n`;
+    const terminalFrame = terminal && logs.length <= SSE_LOG_PAGE_LIMIT
+      ? `event: deployment.terminal\ndata: ${JSON.stringify({ deploymentId: scoped.deployment.id, status: scoped.deployment.status, stream: request.correlationContext })}\n\n`
+      : "";
+    return reply
+      .header("content-type", "text/event-stream; charset=utf-8")
+      .header("cache-control", "no-cache, no-transform")
+      .header("connection", "keep-alive")
+      .header("x-accel-buffering", "no")
+      .send(`${body}\n${status}${terminalFrame}: keepalive\n\n`);
   });
+  app.post(`${API_PREFIX}/deployments/:deploymentId/cancel`, { preHandler: [requireAuth, requireMutationRole] }, async (request, reply) => {
+    const params = z.object({ deploymentId: z.string().min(1) }).parse(request.params);
+    const scoped = await resolveDeploymentScope(state, params.deploymentId);
+    if (!scoped) return reply.code(404).send(errorEnvelope(request, "NOT_FOUND", "Deployment not found."));
+    const active = await state.deploymentCommandBus.findActiveForDeployment(scoped.deployment.id);
+    const command = active
+      ? await state.deploymentCommandBus.cancel(active.id, request.auth?.user.id ?? null)
+      : (await state.deploymentCommandBus.list()).filter((item) => item.deploymentId === scoped.deployment.id).sort((left, right) => right.issuedAt.localeCompare(left.issuedAt))[0] ?? null;
+    if (!command) return reply.code(409).send(errorEnvelope(request, "COMMAND_UNAVAILABLE", "This deployment has no command that can be cancelled."));
+    if (command.state === "cancelled") await projectAuthoritativeTerminalCommand(state, command);
+    return ok(request, {
+      deployment: (await state.deployments.findById(scoped.deployment.id)) ?? scoped.deployment,
+      command,
+      idempotent: !active
+    });
+  });
+  for (const action of ["restart", "rollback"] as const) {
+    app.post(`${API_PREFIX}/deployments/:deploymentId/${action}`, { preHandler: [requireAuth, requireMutationRole] }, async (request, reply) => {
+      const params = z.object({ deploymentId: z.string().min(1) }).parse(request.params);
+      const scoped = await resolveDeploymentScope(state, params.deploymentId);
+      if (!scoped) return reply.code(404).send(errorEnvelope(request, "NOT_FOUND", "Deployment not found."));
+      const code = action === "rollback" ? "ROLLBACK_UNAVAILABLE" : "EXECUTOR_CAPABILITY_UNAVAILABLE";
+      const message = action === "rollback"
+        ? "Rollback is unavailable because no verified prior deployment image is recorded."
+        : "Restart is unavailable because the assigned agent does not advertise restart support.";
+      await appendAudit(adapters.audit, request, {
+        actorUserId: request.auth?.user.id ?? null,
+        action: `deployment.${action}.rejected`,
+        targetType: "deployment",
+        targetId: scoped.deployment.id,
+        metadata: { projectId: scoped.project.id, agentId: scoped.agent.id, reason: code }
+      });
+      await appendDeploymentControlLog(state, scoped.deployment.id, "warn", `Authorized ${action} request was rejected safely: ${code}.`, request);
+      return reply.code(409).send(errorEnvelope(request, code, message));
+    });
+  }
   app.post(`${API_PREFIX}/deployments`, { preHandler: [requireAuth, requireMutationRole] }, async (request) => {
     const body = parseBody(deploymentSchema.omit({ id: true, startedAt: true, finishedAt: true }), request.body);
     const deployment: Deployment = { id: createRequestId(), startedAt: new Date().toISOString(), finishedAt: null, ...body };

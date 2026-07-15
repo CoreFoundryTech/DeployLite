@@ -196,6 +196,84 @@ describeIntegration("DeployLite API PostgreSQL integration", () => {
     await restartedApp.close();
   }, 30_000);
 
+  it("keeps public lifecycle controls idempotent, role-gated, unavailable-safe, and redacted over PostgreSQL", async () => {
+    const app = await createPostgresApp();
+    const projects = new DbProjectRepository(requireDb());
+    const agents = new DbAgentRepository(requireDb());
+    const deployments = new DbDeploymentRepository(requireDb());
+    const commands = new DbDeploymentCommandRepository(requireDb());
+    const projectId = randomUUID();
+    const agentId = randomUUID();
+    const deploymentId = randomUUID();
+    const commandId = randomUUID();
+    const now = new Date().toISOString();
+
+    try {
+      const login = await app.inject({
+        method: "POST",
+        url: "/api/v1/auth/login",
+        headers: contentHeaders,
+        payload: { email: "admin@example.test", password: adminPassword }
+      });
+      expect(login.statusCode).toBe(200);
+      const adminCookie = login.headers["set-cookie"] as string;
+
+      await projects.save({ id: projectId, name: "Lifecycle controls project", repoUrl: "https://github.com/example/lifecycle-controls", defaultBranch: "main", buildCommand: null, runCommand: null, port: 3000, description: null, imageTag: null });
+      await agents.save({ id: agentId, name: "Lifecycle controls agent", endpoint: "https://lifecycle-controls.agent.postgres.test", status: "online", lastHeartbeatAt: now, resourceSnapshot: null });
+      await deployments.save({ id: deploymentId, projectId, agentId, status: "queued", commitSha: "abcdef1", startedAt: now, finishedAt: null });
+      await deployments.appendAllocatedLog({
+        id: randomUUID(), deploymentId, level: "info", message: "queued token dl_1234567890abcdef must never reach SSE", timestamp: now,
+        redactionApplied: false, requestId: `req-lifecycle-log-${commandId}`, correlationId: `corr-lifecycle-log-${commandId}`
+      });
+      await commands.save({
+        id: commandId, deploymentId, agentId, kind: "start", state: "pending", payload: { token: "dl_1234567890abcdef" }, requestedBy: null,
+        requestId: `req-lifecycle-cancel-${commandId}`, correlationId: `corr-lifecycle-cancel-${commandId}`, issuedAt: now, claimedAt: null, leaseExpiresAt: null, completedAt: null, failureReason: null
+      });
+
+      const firstCancel = await app.inject({ method: "POST", url: `/api/v1/deployments/${deploymentId}/cancel`, headers: { cookie: adminCookie, "x-request-id": `cancel-first-${commandId}` } });
+      const repeatedCancel = await app.inject({ method: "POST", url: `/api/v1/deployments/${deploymentId}/cancel`, headers: { cookie: adminCookie, "x-request-id": `cancel-repeat-${commandId}` } });
+      expect(firstCancel.statusCode).toBe(200);
+      expect(repeatedCancel.statusCode).toBe(200);
+      expect(firstCancel.json().data.command).toMatchObject({ id: commandId, state: "cancelled" });
+      expect(repeatedCancel.json().data.command).toMatchObject({ id: commandId, state: "cancelled" });
+      await expect(commands.findById(commandId)).resolves.toMatchObject({ state: "cancelled" });
+      await expect(deployments.findById(deploymentId)).resolves.toMatchObject({ status: "canceled" });
+      await expect(requirePool().query("SELECT count(*)::int AS count FROM audit_events WHERE action = 'deployment.cancelled' AND target_id = $1", [deploymentId]))
+        .resolves.toMatchObject({ rows: [{ count: 1 }] });
+
+      const restart = await app.inject({ method: "POST", url: `/api/v1/deployments/${deploymentId}/restart`, headers: { cookie: adminCookie } });
+      const rollback = await app.inject({ method: "POST", url: `/api/v1/deployments/${deploymentId}/rollback`, headers: { cookie: adminCookie } });
+      expect(restart.statusCode).toBe(409);
+      expect(restart.json().error.code).toBe("EXECUTOR_CAPABILITY_UNAVAILABLE");
+      expect(rollback.statusCode).toBe(409);
+      expect(rollback.json().error.code).toBe("ROLLBACK_UNAVAILABLE");
+      expect((await commands.list()).filter((command) => command.deploymentId === deploymentId)).toHaveLength(1);
+
+      const stream = await app.inject({ method: "GET", url: `/api/v1/deployments/${deploymentId}/logs/stream`, headers: { cookie: adminCookie, "last-event-id": "0" } });
+      expect(stream.statusCode).toBe(200);
+      expect(stream.headers["cache-control"]).toContain("no-transform");
+      expect(stream.headers["x-accel-buffering"]).toBe("no");
+      expect(stream.body).toContain("event: deployment.status");
+      expect(stream.body).toContain("event: deployment.terminal");
+      expect(stream.body).toContain("[REDACTED]");
+      expect(stream.body).not.toContain("dl_1234567890abcdef");
+
+      await requirePool().query("UPDATE users SET role_id = (SELECT id FROM roles WHERE name = 'read-only') WHERE email_normalized = $1", ["admin@example.test"]);
+      const readerLogin = await app.inject({ method: "POST", url: "/api/v1/auth/login", headers: contentHeaders, payload: { email: "admin@example.test", password: adminPassword } });
+      expect(readerLogin.statusCode).toBe(200);
+      const readerCookie = readerLogin.headers["set-cookie"] as string;
+      const rejectedRestart = await app.inject({ method: "POST", url: `/api/v1/deployments/${deploymentId}/restart`, headers: { cookie: readerCookie } });
+      const rejectedRollback = await app.inject({ method: "POST", url: `/api/v1/deployments/${deploymentId}/rollback`, headers: { cookie: readerCookie } });
+      expect(rejectedRestart.statusCode).toBe(403);
+      expect(rejectedRollback.statusCode).toBe(403);
+      await expect(requirePool().query("SELECT action, count(*)::int AS count FROM audit_events WHERE target_id = $1 AND action IN ('deployment.restart.rejected', 'deployment.rollback.rejected') GROUP BY action ORDER BY action", [deploymentId]))
+        .resolves.toMatchObject({ rows: [{ action: "deployment.restart.rejected", count: 1 }, { action: "deployment.rollback.rejected", count: 1 }] });
+    } finally {
+      await requirePool().query("UPDATE users SET role_id = (SELECT id FROM roles WHERE name = 'admin') WHERE email_normalized = $1", ["admin@example.test"]);
+      await app.close();
+    }
+  }, 30_000);
+
   it("projects real-agent running exactly once and rejects cancelled or stale leases without effects", async () => {
     const agentId = randomUUID();
     const projectId = randomUUID();
