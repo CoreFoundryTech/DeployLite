@@ -168,13 +168,18 @@ describe("DeployLite API scaffold", () => {
     const app = await buildApiApp({ corsOrigin: "http://localhost:3000" });
     const response = await app.inject({
       method: "OPTIONS",
-      url: "/api/v1/auth/login",
-      headers: { origin: "http://localhost:3000", "access-control-request-method": "POST" }
+      url: "/api/v1/deployments/deployment-1/logs/stream",
+      headers: {
+        origin: "http://localhost:3000",
+        "access-control-request-method": "GET",
+        "access-control-request-headers": "last-event-id"
+      }
     });
 
     expect(response.statusCode).toBe(204);
     expect(response.headers["access-control-allow-origin"]).toBe("http://localhost:3000");
     expect(response.headers["access-control-allow-credentials"]).toBe("true");
+    expect(response.headers["access-control-allow-headers"]).toContain("last-event-id");
   });
 
   it("uses the configured production CORS origin only for matching credentialed requests", async () => {
