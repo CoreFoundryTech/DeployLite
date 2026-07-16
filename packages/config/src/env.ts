@@ -63,9 +63,14 @@ function canonicalImage(input: string, allowlist: readonly string[], production:
   const host = match[1]!;
   const path = match[2]!;
   const tag = match[3];
+  if (!path.split("/").every(isValidImagePathSegment)) return deny("IMAGE_INVALID");
   if (isPrivateHost(host) || !allowlist.includes(host)) return deny("IMAGE_DENIED");
   if (production && (!tag || tag === "latest")) return deny("IMAGE_MUTABLE_TAG");
   return `${host}/${path}${tag ? `:${tag}` : ""}`;
+}
+
+function isValidImagePathSegment(segment: string): boolean {
+  return /^[a-z0-9]+(?:[._]|__|[-]*[a-z0-9]+)*$/.test(segment);
 }
 
 export function admitControlPlaneRequest(env: DeployLiteEnv, request: AdmissionRequest): { repositoryUrl: string; image: string } {

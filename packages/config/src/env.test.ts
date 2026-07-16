@@ -33,4 +33,22 @@ describe("control-plane admission", () => {
     expect(() => admitControlPlaneRequest(env, { ...base, image: "ghcr.io/owner/app:v1", concurrentCommands: 2 })).toThrow("CONCURRENCY_LIMIT_EXCEEDED");
     expect(() => admitControlPlaneRequest(env, { ...base, image: "ghcr.io/owner/app:v1", cpuCores: 3 })).toThrow("RESOURCE_LIMIT_EXCEEDED");
   });
+
+  it.each([
+    "ghcr.io/owner//app:v1",
+    "ghcr.io/owner/./app:v1",
+    "ghcr.io/owner/../app:v1",
+    "ghcr.io/owner/.app:v1",
+    "ghcr.io/owner/app-:v1"
+  ])("rejects image references with malformed repository segments: %s", (image) => {
+    expect(() => admitControlPlaneRequest(env, {
+      repositoryUrl: "https://github.com/owner/repo",
+      image,
+      payloadBytes: 1,
+      ratePerMinute: 1,
+      concurrentCommands: 1,
+      cpuCores: 1,
+      memoryMiB: 1
+    })).toThrow("IMAGE_INVALID");
+  });
 });
