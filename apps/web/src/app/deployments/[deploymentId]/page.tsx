@@ -7,6 +7,8 @@ import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card";
 import { Separator } from "@/components/ui/separator";
+import { DeploymentLifecycle } from "@/components/deployment-lifecycle";
+import { getAuthApiBaseUrl } from "../../../lib/auth-boundary";
 
 export const dynamic = "force-dynamic";
 
@@ -172,18 +174,10 @@ export default async function DeploymentLogsPage({ params }: { params: Promise<{
         <Card>
           <CardHeader>
             <CardTitle>Log events</CardTitle>
-            <CardDescription>
-              {events.length} event(s){lastEventId !== null ? ` · last event ID: ${lastEventId}` : ""}
-            </CardDescription>
+            <CardDescription>{events.length} event(s){lastEventId !== null ? ` · last event ID: ${lastEventId}` : ""}</CardDescription>
           </CardHeader>
           <CardContent>
-            {events.length === 0 ? (
-              <p className="text-sm text-muted-foreground" data-testid="log-empty-state">No log events are available yet.</p>
-            ) : (
-              <pre className="overflow-auto rounded-md bg-muted p-3 text-xs leading-relaxed">
-                {events.map((event) => `${event.sequence} ${event.level.toUpperCase()} ${event.message}`).join("\n")}
-              </pre>
-            )}
+            <DeploymentLifecycle deployment={deployment} initialLogs={events} apiBaseUrl={getAuthApiBaseUrl()} />
           </CardContent>
         </Card>
       </div>
