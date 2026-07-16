@@ -9,7 +9,7 @@ import { assertEnvMetadataHasNoValueColumns, toEnvVariableMetadataInsert } from 
 import { DbAuthUserRepository, DbRoleRepository, DbSessionRepository } from "./repositories/auth.js";
 import { DbAgentRepository, DbDeploymentRepository, DbProjectRepository } from "./repositories/deployment-data.js";
 import { DbControlCommandRepository } from "./repositories/control-plane.js";
-import { IdempotencyConflictError, createControlCommand, digestControlInput } from "@deploylite/domain";
+import { IdempotencyConflictError, createConfirmation, createControlCommand, digestControlInput } from "@deploylite/domain";
 
 const { Client } = pg;
 
@@ -230,12 +230,12 @@ describeIntegration("PostgreSQL auth foundation integration", () => {
       endpoint: "https://agent.integration.test",
       status: "online"
     });
-    await expect(requireDbProjectRepository().list()).resolves.toContainEqual({
+    expect(await requireDbProjectRepository().list()).toContainEqual(expect.objectContaining({
       id: projectId,
       name: "Integration project",
       repoUrl: "https://github.com/example/deploylite-integration",
       defaultBranch: "main"
-    });
+    }));
     await expect(requireDbDeploymentRepository().findById(deploymentId)).resolves.toMatchObject({
       id: deploymentId,
       projectId,
@@ -321,6 +321,36 @@ describeIntegration("PostgreSQL auth foundation integration", () => {
     await client.query("INSERT INTO control_commands (id, actor_user_id, action, scope_kind, scope_key, input_digest, idempotency_key, correlation_id, expires_at) VALUES ($1, $2, 'project.delete', 'project', $3, $4, 'rollback-key', 'corr-rollback', now())", [rolledBackId, actorId, randomUUID(), digestControlInput({ rollback: true })]);
     await client.query("ROLLBACK");
     await expect(client.query("SELECT id FROM control_commands WHERE id = $1", [rolledBackId])).resolves.toMatchObject({ rowCount: 0 });
+  });
+
+  it("atomically rejects mismatched, expired, and replayed confirmations with correlated audit evidence", async () => {
+    const client = requirePool();
+    const role = (await client.query<{ id: string }>("SELECT id FROM roles WHERE name = 'admin'")).rows[0];
+    if (!role) throw new Error("Canonical admin role was not seeded");
+    const actorId = randomUUID();
+    await client.query("INSERT INTO users (id, email, email_normalized, password_hash, role_id) VALUES ($1, $2, $2, $3, $4)", [actorId, `${actorId}@example.test`, "hash", role.id]);
+    const repo = new DbControlCommandRepository(requireDb());
+    const command = createControlCommand({ actorId, action: "project.delete", scope: { kind: "project", projectId: randomUUID() }, input: { project: "one" }, idempotencyKey: "confirmation-key", correlationId: "corr-confirmation" });
+    await repo.resolve(command);
+    const mismatchedActorId = randomUUID();
+    await client.query("INSERT INTO users (id, email, email_normalized, password_hash, role_id) VALUES ($1, $2, $2, $3, $4)", [mismatchedActorId, `${mismatchedActorId}@example.test`, "hash", role.id]);
+    const mismatched = { ...createConfirmation({ command, classification: "destructive" }), actorId: mismatchedActorId };
+    await repo.bind(mismatched);
+    await expect(repo.consume(command, mismatched)).resolves.toMatchObject({ accepted: false, reason: "confirmation_rejected" });
+    const validCommand = createControlCommand({ ...command, idempotencyKey: "confirmation-valid-key", input: { project: "valid" } });
+    await repo.resolve(validCommand);
+    const confirmation = createConfirmation({ command: validCommand, classification: "destructive" });
+    await repo.bind(confirmation);
+    const outcomes = await Promise.all([repo.consume(validCommand, confirmation), repo.consume(validCommand, confirmation)]);
+    expect(outcomes.filter((outcome) => outcome.accepted)).toHaveLength(1);
+    expect(outcomes.filter((outcome) => !outcome.accepted)).toHaveLength(1);
+    await expect(client.query("SELECT outcome, correlation_id FROM control_command_audits WHERE command_id = $1 ORDER BY created_at", [validCommand.id])).resolves.toMatchObject({ rowCount: 2, rows: expect.arrayContaining([expect.objectContaining({ outcome: "accepted", correlation_id: validCommand.correlationId }), expect.objectContaining({ outcome: "rejected", correlation_id: validCommand.correlationId })]) });
+
+    const expired = createControlCommand({ ...command, idempotencyKey: "expired-key", correlationId: "corr-expired", input: { project: "expired" } });
+    await repo.resolve(expired);
+    const expiredConfirmation = createConfirmation({ command: expired, classification: "destructive", expiresAt: new Date(0) });
+    await repo.bind(expiredConfirmation);
+    await expect(repo.consume(expired, expiredConfirmation)).resolves.toMatchObject({ accepted: false, reason: "confirmation_rejected" });
   });
 });
 

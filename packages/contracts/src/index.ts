@@ -41,6 +41,13 @@ export const controlPlaneScopeSchema = z.discriminatedUnion("kind", [
   z.object({ kind: z.literal("platform") }),
   z.object({ kind: z.literal("project"), projectId: idSchema })
 ]);
+export const confirmationClassificationSchema = z.enum(["destructive", "non-destructive"]);
+export const controlCommandStatusSchema = z.enum(["pending_confirmation", "eligible", "rejected", "completed"]);
+export const confirmationLifecycleResultSchema = z.object({
+  commandId: idSchema,
+  accepted: z.boolean(),
+  reason: z.string().min(1).nullable()
+}).strict();
 export const controlCommandRequestSchema = z.object({
   action: controlPlaneActionSchema,
   scope: controlPlaneScopeSchema,
@@ -229,6 +236,9 @@ export type CanonicalRole = z.infer<typeof canonicalRoleSchema>;
 export type ControlPlaneAction = z.infer<typeof controlPlaneActionSchema>;
 export type ControlPlaneScope = z.infer<typeof controlPlaneScopeSchema>;
 export type ControlCommandRequest = z.infer<typeof controlCommandRequestSchema>;
+export type ConfirmationClassification = z.infer<typeof confirmationClassificationSchema>;
+export type ControlCommandStatus = z.infer<typeof controlCommandStatusSchema>;
+export type ConfirmationLifecycleResult = z.infer<typeof confirmationLifecycleResultSchema>;
 export type SafeAuthUserDto = z.infer<typeof safeAuthUserSchema>;
 export type AuthResponse = z.infer<typeof authResponseSchema>;
 export type BootstrapStatus = z.infer<typeof bootstrapStatusSchema>;

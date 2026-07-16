@@ -1,11 +1,11 @@
-import { and, eq } from "drizzle-orm";
-import type { ControlCommand, ControlCommandRepository } from "@deploylite/domain";
+import { and, eq, gt, isNull } from "drizzle-orm";
+import type { ControlCommand, ControlCommandRepository, ControlConfirmation, ControlConfirmationRepository, ConfirmationOutcome } from "@deploylite/domain";
 import { IdempotencyConflictError, scopeKey } from "@deploylite/domain";
 
 import type { DeployLiteDb } from "../client.js";
-import { controlCommands, type ControlCommandRow } from "../schema.js";
+import { controlCommandAudits, controlCommandConfirmations, controlCommands, type ControlCommandRow } from "../schema.js";
 
-export class DbControlCommandRepository implements ControlCommandRepository {
+export class DbControlCommandRepository implements ControlCommandRepository, ControlConfirmationRepository {
   constructor(private readonly db: DeployLiteDb) {}
 
   async resolve(command: ControlCommand): Promise<{ command: ControlCommand; created: boolean }> {
@@ -25,8 +25,29 @@ export class DbControlCommandRepository implements ControlCommandRepository {
     if (existing.inputDigest !== command.inputDigest) throw new IdempotencyConflictError();
     return { command: toCommand(existing), created: false };
   }
+
+  async bind(confirmation: ControlConfirmation): Promise<void> {
+    await this.db.insert(controlCommandConfirmations).values({ id: confirmation.id, commandId: confirmation.commandId, actorUserId: confirmation.actorId, action: confirmation.action, scopeKind: confirmation.scope.kind, scopeKey: scopeKey(confirmation.scope), inputDigest: confirmation.inputDigest, classification: confirmation.classification, expiresAt: confirmation.expiresAt, consumedAt: confirmation.consumedAt });
+  }
+
+  async consume(command: ControlCommand, confirmation: ControlConfirmation, now = new Date()): Promise<ConfirmationOutcome> {
+    return this.db.transaction(async (tx) => {
+      const [consumed] = await tx.update(controlCommandConfirmations).set({ consumedAt: now }).where(and(eq(controlCommandConfirmations.id, confirmation.id), eq(controlCommandConfirmations.commandId, command.id), eq(controlCommandConfirmations.actorUserId, command.actorId), eq(controlCommandConfirmations.action, command.action), eq(controlCommandConfirmations.scopeKind, command.scope.kind), eq(controlCommandConfirmations.scopeKey, scopeKey(command.scope)), eq(controlCommandConfirmations.inputDigest, command.inputDigest), eq(controlCommandConfirmations.classification, "destructive"), isNull(controlCommandConfirmations.consumedAt), gt(controlCommandConfirmations.expiresAt, now))).returning();
+      if (!consumed) {
+        const [storedConfirmation] = await tx.select({ id: controlCommandConfirmations.id }).from(controlCommandConfirmations).where(eq(controlCommandConfirmations.id, confirmation.id)).limit(1);
+        await tx.insert(controlCommandAudits).values({ commandId: command.id, confirmationId: storedConfirmation?.id ?? null, correlationId: command.correlationId, outcome: "rejected", reason: "confirmation_rejected" });
+        const [current] = await tx.select().from(controlCommands).where(eq(controlCommands.id, command.id)).limit(1);
+        if (!current) throw new Error("Control command was not found");
+        return { command: toCommand(current), accepted: false, reason: "confirmation_rejected" };
+      }
+      const [eligible] = await tx.update(controlCommands).set({ status: "eligible", updatedAt: now }).where(eq(controlCommands.id, command.id)).returning();
+      await tx.insert(controlCommandAudits).values({ commandId: command.id, confirmationId: confirmation.id, correlationId: command.correlationId, outcome: "accepted", reason: null });
+      if (!eligible) throw new Error("Control command was not found");
+      return { command: toCommand(eligible), accepted: true, reason: null };
+    });
+  }
 }
 
 function toCommand(row: ControlCommandRow): ControlCommand {
-  return { id: row.id, actorId: row.actorUserId, action: row.action as ControlCommand["action"], scope: row.scopeKind === "platform" ? { kind: "platform" } : { kind: "project", projectId: row.scopeKey }, inputDigest: row.inputDigest, idempotencyKey: row.idempotencyKey, correlationId: row.correlationId, status: "pending", expiresAt: row.expiresAt };
+  return { id: row.id, actorId: row.actorUserId, action: row.action as ControlCommand["action"], scope: row.scopeKind === "platform" ? { kind: "platform" } : { kind: "project", projectId: row.scopeKey }, inputDigest: row.inputDigest, idempotencyKey: row.idempotencyKey, correlationId: row.correlationId, status: row.status as ControlCommand["status"], expiresAt: row.expiresAt };
 }
