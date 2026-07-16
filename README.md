@@ -1,16 +1,21 @@
 # DeployLite
 
-**DeployLite is a lightweight, self-hosted deployment control plane built for small teams, solo builders, and AI-assisted development workflows.** It aims to make a clean VPS feel like a simple deployment target: install once, create an owner account, connect a project, manage environment values safely, and let an agent handle the deployment work.
+**DeployLite is a lightweight, self-hosted, AI-native deployment platform for operating applications, Docker infrastructure, and services from one secure control plane.** It turns a clean VPS into a practical deployment target: install once, create an owner account, connect a project, and deploy or operate services with guided, auditable assistance from AI agents.
 
-DeployLite is intentionally smaller than a platform like Dokploy, Coolify, or a full Kubernetes stack. The goal is not to become another heavy platform. The goal is to provide a clear, hackable, AI-friendly deployment layer that is easy to inspect, easy to automate, and safe enough to run on a modest VPS.
+DeployLite is built for solo builders and small teams that want the power of containerized infrastructure without a heavy operational stack. Its direction is clear: a fast, inspectable, automation-friendly platform for applications, multi-service projects, and AI-assisted operations on infrastructure you control.
 
 ## Why DeployLite?
 
-- **Lightweight by default** — designed for one VPS, one Postgres database, and a small set of services.
-- **AI-first operations** — includes read-only MCP tooling and API boundaries that are safe for agents to inspect before they act.
-- **Self-hosted and transparent** — no hidden control plane; the code, migrations, installer, and runtime are in this repository.
-- **Operator-safe secrets** — environment values are stored encrypted, shown as metadata/fingerprints, and never returned as plaintext.
-- **Reviewable architecture** — TypeScript monorepo, shared contracts, explicit domain boundaries, and tests for every slice.
+- **AI-native operations** — agents and MCP integrations can inspect status, diagnose failures, and perform explicitly authorized actions with auditable boundaries.
+- **Lightweight self-hosting** — a practical VPS-first control plane that remains transparent, hackable, and easy to operate.
+- **Safe deployment foundations** — explicit lifecycle controls, encrypted environment values, audit trails, and isolated privileged execution paths.
+- **Projects and services** — a unified model for application deployments, Docker/Compose services, networks, volumes, domains, and runtime configuration.
+- **One-click building blocks** — a planned catalog of deployable templates for common open-source applications and multi-service stacks.
+- **Open automation** — Git providers, registries, CI/CD, webhooks, API access, and MCP are first-class integration points.
+
+## Product direction
+
+DeployLite is becoming an AI-native alternative to heavy deployment platforms: use the visual UI when you want direct control, or ask an agent to safely guide and automate deploys, diagnosis, configuration, and routine operations. The platform is designed to grow from a single VPS to multi-service projects and managed deployment targets without hiding the underlying infrastructure.
 
 ## Project status
 
