@@ -1,0 +1,67 @@
+name: Quality gate
+
+on:
+  pull_request:
+  push:
+    branches:
+      - main
+
+permissions:
+  contents: read
+
+jobs:
+  workspace:
+    name: Workspace checks
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 9.15.4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: pnpm
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+      - name: Run default quality gate
+        run: pnpm check
+
+  postgres-integration:
+    name: PostgreSQL lifecycle integration
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_DB: deploylite
+          POSTGRES_USER: deploylite
+          POSTGRES_PASSWORD: deploylite
+        options: >-
+          --health-cmd "pg_isready -U deploylite -d deploylite"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+        ports:
+          - 5432:5432
+    env:
+      DATABASE_URL: postgres://deploylite:deploylite@localhost:5432/deploylite
+      DEPLOYLITE_DB_INTEGRATION: "1"
+      DEPLOYLITE_API_POSTGRES_INTEGRATION: "1"
+    steps:
+      - uses: actions/checkout@v4
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 9.15.4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: pnpm
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+      - name: Build workspace dependencies
+        run: pnpm build
+      - name: Verify PostgreSQL repository integration
+        run: pnpm --filter @deploylite/db db:verify:integration
+      - name: Verify PostgreSQL API lifecycle, CORS, and SSE integration
+        run: pnpm --filter @deploylite/api db:verify:integration
