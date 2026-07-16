@@ -36,6 +36,19 @@ export const bootstrapInitialAdminRequestSchema = z.object({
 
 export const canonicalRoleSchema = z.enum(["admin", "operator", "read-only", "auditor"]);
 
+export const controlPlaneActionSchema = z.enum(["project.delete", "project.deploy", "project.update", "platform.agent.register"]);
+export const controlPlaneScopeSchema = z.discriminatedUnion("kind", [
+  z.object({ kind: z.literal("platform") }),
+  z.object({ kind: z.literal("project"), projectId: idSchema })
+]);
+export const controlCommandRequestSchema = z.object({
+  action: controlPlaneActionSchema,
+  scope: controlPlaneScopeSchema,
+  idempotencyKey: z.string().min(1).max(200),
+  inputDigest: z.string().regex(/^[a-f0-9]{64}$/),
+  correlationId: idSchema
+}).strict();
+
 export const safeAuthUserSchema = z.object({
   id: idSchema,
   email: z.string().email(),
@@ -213,6 +226,9 @@ export type EnvSecretValueDeleteRequest = z.infer<typeof envSecretValueDeleteReq
 export type DeployRequest = z.infer<typeof deployRequestSchema>;
 export type ScaffoldUser = z.infer<typeof scaffoldUserSchema>;
 export type CanonicalRole = z.infer<typeof canonicalRoleSchema>;
+export type ControlPlaneAction = z.infer<typeof controlPlaneActionSchema>;
+export type ControlPlaneScope = z.infer<typeof controlPlaneScopeSchema>;
+export type ControlCommandRequest = z.infer<typeof controlCommandRequestSchema>;
 export type SafeAuthUserDto = z.infer<typeof safeAuthUserSchema>;
 export type AuthResponse = z.infer<typeof authResponseSchema>;
 export type BootstrapStatus = z.infer<typeof bootstrapStatusSchema>;
