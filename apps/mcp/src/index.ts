@@ -1,4 +1,4 @@
-import { createCorrelationContext, redactSecrets } from "@deploylite/config";
+import { createCorrelationContext, createSafeProjection } from "@deploylite/config";
 import {
   agentSchema,
   deploymentSchema,
@@ -129,13 +129,19 @@ function asToolResponse<StructuredContent extends { requestId: string; correlati
   requestId: string;
   correlationId: string;
 } {
-  const safeStructuredContent = redactSecrets(structuredContent);
+  const safeStructuredContent = createSafeProjection("mcp", structuredContent) as StructuredContent;
   return {
     requestId: safeStructuredContent.requestId,
     correlationId: safeStructuredContent.correlationId,
     content: [{ type: "text", text: JSON.stringify(safeStructuredContent) }],
     structuredContent: safeStructuredContent
   };
+}
+
+/** MCP has no command mutation transport: advisory requests fail before clients run. */
+export function assertAdvisoryOnlyRequest(action: string): never {
+  if (["create", "confirm", "execute", "bypass"].includes(action.toLowerCase())) throw new Error("ADVISORY_ONLY");
+  throw new Error("ADVISORY_ACTION_UNKNOWN");
 }
 
 export function createDeployLiteMcpTools(apiClient: DeployLiteApiClient): DeployLiteMcpTools {

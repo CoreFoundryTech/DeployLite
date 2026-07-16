@@ -26,6 +26,7 @@ export const safeCommandEnvelopeSchema = z.object({
 });
 
 export type SafeCommandEnvelope = z.infer<typeof safeCommandEnvelopeSchema>;
+export type MockOnlyCapability = { commandId: string; expiresAt: string; confirmed: boolean };
 
 export type HeartbeatTransport = {
   sendHeartbeat(heartbeat: AgentHeartbeat): Promise<{ accepted: boolean; requestId: string }>;
@@ -84,6 +85,14 @@ export function assertNoHostMutationPath(envelope: SafeCommandEnvelope): true {
   if (!parsed.safety.mockOnly || parsed.safety.dockerSocketAccess || parsed.safety.hostShellExecution || parsed.safety.mutatesHost) {
     throw new Error("Unsafe agent command envelope rejected by scaffold boundary");
   }
+  return true;
+}
+
+export function verifyMockOnlyCapability(envelope: SafeCommandEnvelope, capability: MockOnlyCapability, now = new Date()): true {
+  assertNoHostMutationPath(envelope);
+  if (capability.commandId !== envelope.commandId) throw new Error("CAPABILITY_COMMAND_MISMATCH");
+  if (!capability.confirmed) throw new Error("CAPABILITY_UNCONFIRMED");
+  if (Number.isNaN(Date.parse(capability.expiresAt)) || Date.parse(capability.expiresAt) <= now.getTime()) throw new Error("CAPABILITY_EXPIRED");
   return true;
 }
 
