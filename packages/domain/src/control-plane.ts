@@ -48,7 +48,10 @@ export class IdempotencyConflictError extends Error {
   constructor() { super("Idempotency key was already used with different command input"); this.name = "IdempotencyConflictError"; }
 }
 
-export type ControlCommandRepository = { resolve(command: ControlCommand): Promise<{ command: ControlCommand; created: boolean }> };
+export type ControlCommandRepository = {
+  resolve(command: ControlCommand): Promise<{ command: ControlCommand; created: boolean }>;
+  complete(command: ControlCommand): Promise<ControlCommand>;
+};
 export type ControlConfirmationRepository = {
   bind(confirmation: ControlConfirmation): Promise<void>;
   consume(command: ControlCommand, confirmation: ControlConfirmation, now?: Date): Promise<ConfirmationOutcome>;

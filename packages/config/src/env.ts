@@ -18,7 +18,8 @@ export const deployLiteEnvSchema = z.object({
   DEPLOYLITE_SESSION_TTL_SECONDS: z.coerce.number().int().positive().default(60 * 60 * 8),
   DEPLOYLITE_SESSION_COOKIE_NAME: z.string().min(1).default("deploylite_session"),
   DEPLOYLITE_SESSION_COOKIE_SECURE: booleanString.optional(),
-  DEPLOYLITE_BCRYPT_COST: z.coerce.number().int().min(10).max(14).default(12)
+  DEPLOYLITE_BCRYPT_COST: z.coerce.number().int().min(10).max(14).default(12),
+  DEPLOYLITE_CONTROL_PLANE_CONFIRMED_DELETE: booleanString.default(false)
 });
 
 export type DeployLiteEnv = z.infer<typeof deployLiteEnvSchema>;

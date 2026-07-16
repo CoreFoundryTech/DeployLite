@@ -197,7 +197,7 @@ describe("DeployLite API scaffold", () => {
 
   it("selects DB auth repositories when DATABASE_URL is configured", async () => {
     const repositories = await createRuntimeRepositories(
-      { NODE_ENV: "test", DEPLOYLITE_API_URL: "http://localhost:3001", DEPLOYLITE_API_HOST: "127.0.0.1", DEPLOYLITE_API_PORT: 3001, DATABASE_URL: "postgres://user:pass@localhost:5432/deploylite", DEPLOYLITE_SECRET_KEY: testEnvSecretKey, DEPLOYLITE_SESSION_TTL_SECONDS: 3600, DEPLOYLITE_SESSION_COOKIE_NAME: "dl_test_session", DEPLOYLITE_BCRYPT_COST: 10 },
+      { NODE_ENV: "test", DEPLOYLITE_API_URL: "http://localhost:3001", DEPLOYLITE_API_HOST: "127.0.0.1", DEPLOYLITE_API_PORT: 3001, DATABASE_URL: "postgres://user:pass@localhost:5432/deploylite", DEPLOYLITE_SECRET_KEY: testEnvSecretKey, DEPLOYLITE_SESSION_TTL_SECONDS: 3600, DEPLOYLITE_SESSION_COOKIE_NAME: "dl_test_session", DEPLOYLITE_BCRYPT_COST: 10, DEPLOYLITE_CONTROL_PLANE_CONFIRMED_DELETE: false },
       { db: { pool: {} as never, client: {} as never } }
     );
 
@@ -905,6 +905,30 @@ describe("DeployLite API scaffold", () => {
     const list = await app.inject({ method: "GET", url: "/api/v1/projects", headers: { cookie } });
     expect(list.json().data.projects.find((p: { id: string }) => p.id === projectId)).toBeUndefined();
 
+    expect(audit.events.some((event) => event.action === "project.delete" && event.targetId === projectId)).toBe(true);
+  });
+
+  it("requires a bound confirmation for flagged project deletion and retries the completed command safely", async () => {
+    const { app, audit } = await authFixture({ env: { ...testEnv, DEPLOYLITE_CONTROL_PLANE_CONFIRMED_DELETE: "true" } });
+    const cookie = await loginCookie(app);
+    const create = await app.inject({ method: "POST", url: "/api/v1/projects", headers: { ...contentHeaders, cookie }, payload: { name: "Confirmed", repoUrl: "https://github.com/example/confirmed", defaultBranch: "main" } });
+    const projectId = create.json().data.project.id;
+    const headers = { cookie, "x-control-idempotency-key": "delete-confirmed-project" };
+
+    const pending = await app.inject({ method: "DELETE", url: `/api/v1/projects/${projectId}`, headers });
+    expect(pending.statusCode).toBe(202);
+    const { commandId, confirmationId } = pending.json().data;
+
+    const rejected = await app.inject({ method: "DELETE", url: `/api/v1/projects/${projectId}`, headers: { ...headers, "x-control-confirmation-id": "wrong-confirmation" } });
+    expect(rejected.statusCode).toBe(409);
+
+    const completed = await app.inject({ method: "DELETE", url: `/api/v1/projects/${projectId}`, headers: { ...headers, "x-control-confirmation-id": confirmationId } });
+    expect(completed.statusCode).toBe(200);
+    expect(completed.json().data).toMatchObject({ removed: true, commandId, idempotent: false });
+
+    const retry = await app.inject({ method: "DELETE", url: `/api/v1/projects/${projectId}`, headers: { ...headers, "x-control-confirmation-id": confirmationId } });
+    expect(retry.statusCode).toBe(200);
+    expect(retry.json().data).toMatchObject({ removed: true, commandId, idempotent: true });
     expect(audit.events.some((event) => event.action === "project.delete" && event.targetId === projectId)).toBe(true);
   });
 
