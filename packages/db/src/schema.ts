@@ -259,8 +259,30 @@ export const controlCommands = pgTable(
     index("control_commands_actor_user_id_idx").on(table.actorUserId),
     check("control_commands_action_valid", sql`${table.action} in ('project.delete', 'project.deploy', 'project.update', 'platform.agent.register')`),
     check("control_commands_scope_valid", sql`${table.scopeKind} in ('platform', 'project')`),
-    check("control_commands_status_valid", sql`${table.status} = 'pending'`)
+    check("control_commands_status_valid", sql`${table.status} in ('pending_confirmation', 'eligible', 'rejected', 'completed')`)
   ]
+);
+
+export const controlCommandConfirmations = pgTable(
+  "control_command_confirmations",
+  {
+    id: uuid("id").primaryKey(), commandId: uuid("command_id").notNull().unique().references(() => controlCommands.id, { onDelete: "restrict", onUpdate: "cascade" }),
+    actorUserId: uuid("actor_user_id").notNull().references(() => users.id, { onDelete: "restrict", onUpdate: "cascade" }), action: text("action").notNull(),
+    scopeKind: text("scope_kind").notNull(), scopeKey: text("scope_key").notNull(), inputDigest: text("input_digest").notNull(),
+    classification: text("classification").notNull(), expiresAt: timestamp("expires_at", { withTimezone: true }).notNull(), consumedAt: timestamp("consumed_at", { withTimezone: true }),
+    createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow()
+  },
+  (table) => [index("control_command_confirmations_actor_user_id_idx").on(table.actorUserId)]
+);
+
+export const controlCommandAudits = pgTable(
+  "control_command_audits",
+  {
+    id: uuid("id").primaryKey().defaultRandom(), commandId: uuid("command_id").notNull().references(() => controlCommands.id, { onDelete: "restrict", onUpdate: "cascade" }),
+    confirmationId: uuid("confirmation_id").references(() => controlCommandConfirmations.id, { onDelete: "restrict", onUpdate: "cascade" }), correlationId: text("correlation_id").notNull(),
+    outcome: text("outcome").notNull(), reason: text("reason"), createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow()
+  },
+  (table) => [index("control_command_audits_command_id_idx").on(table.commandId), index("control_command_audits_correlation_id_idx").on(table.correlationId)]
 );
 
 export const domains = pgTable(
@@ -320,3 +342,4 @@ export type NewEnvVariableMetadata = typeof envVariableMetadata.$inferInsert;
 export type EnvSecretValueRow = typeof envSecretValues.$inferSelect;
 export type NewEnvSecretValue = typeof envSecretValues.$inferInsert;
 export type ControlCommandRow = typeof controlCommands.$inferSelect;
+export type ControlCommandConfirmationRow = typeof controlCommandConfirmations.$inferSelect;
