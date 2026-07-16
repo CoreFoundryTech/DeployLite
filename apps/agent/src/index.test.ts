@@ -6,7 +6,8 @@ import {
   buildDeployEnvFile,
   createSafeCommandEnvelope,
   materializeMockDeploy,
-  redactEnvFileForLog
+  redactEnvFileForLog,
+  verifyMockOnlyCapability
 } from "./index.js";
 
 const SECRET_KEY = "deploylite-test-agent-secret-key-1234567890abcdef";
@@ -31,6 +32,15 @@ describe("mock agent boundary", () => {
       mutatesHost: false
     });
     expect(assertNoHostMutationPath(envelope)).toBe(true);
+  });
+
+  it("rejects expired, unconfirmed, or host-mutating command capabilities", () => {
+    const envelope = createSafeCommandEnvelope("agent_mock_1", "deploy.materialize", new Date("2026-01-01T00:00:00.000Z"));
+
+    expect(() => verifyMockOnlyCapability(envelope, { commandId: envelope.commandId, expiresAt: "2026-01-01T00:00:01.000Z", confirmed: true }, new Date("2026-01-01T00:00:02.000Z"))).toThrow("CAPABILITY_EXPIRED");
+    expect(() => verifyMockOnlyCapability(envelope, { commandId: envelope.commandId, expiresAt: "2026-01-01T00:01:00.000Z", confirmed: false }, new Date("2026-01-01T00:00:02.000Z"))).toThrow("CAPABILITY_UNCONFIRMED");
+    const unsafeEnvelope = { ...envelope, safety: { ...envelope.safety, mutatesHost: true } } as unknown as typeof envelope;
+    expect(() => verifyMockOnlyCapability(unsafeEnvelope, { commandId: envelope.commandId, expiresAt: "2026-01-01T00:01:00.000Z", confirmed: true }, new Date("2026-01-01T00:00:02.000Z"))).toThrow();
   });
 
   it("sends heartbeat contracts through an injected transport only", async () => {

@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { createMockDeployLiteApiClient, deployLiteMcpToolDefinitions, deployLiteMcpTools } from "./index.js";
+import { assertAdvisoryOnlyRequest, createMockDeployLiteApiClient, deployLiteMcpToolDefinitions, deployLiteMcpTools } from "./index.js";
 
 describe("DeployLite MCP read-only scaffold", () => {
   it("defines only read-only and non-destructive tools", () => {
@@ -54,5 +54,11 @@ describe("DeployLite MCP read-only scaffold", () => {
 
     expect(status.requestId).toBe("req_cross_surface_1");
     expect(logs.events.every((event) => event.requestId === "req_cross_surface_1")).toBe(true);
+  });
+
+  it("denies create, confirm, execute, and bypass requests before an API client is invoked", () => {
+    for (const action of ["create", "confirm", "execute", "bypass"]) {
+      expect(() => assertAdvisoryOnlyRequest(action)).toThrow("ADVISORY_ONLY");
+    }
   });
 });

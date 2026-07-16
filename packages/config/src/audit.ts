@@ -1,5 +1,5 @@
 import type { CorrelationContext } from "./ids.js";
-import { redactSecrets } from "./redaction.js";
+import { createSafeProjection } from "./redaction.js";
 
 export type AuditLogInput = CorrelationContext & {
   actorId: string;
@@ -14,5 +14,5 @@ export type AuditLogRecord = AuditLogInput & {
 };
 
 export function createAuditLogRecord(input: AuditLogInput, now = new Date()): AuditLogRecord {
-  return redactSecrets({ ...input, timestamp: now.toISOString() }) as AuditLogRecord;
+  return createSafeProjection("log", { ...input, timestamp: now.toISOString() }) as AuditLogRecord;
 }

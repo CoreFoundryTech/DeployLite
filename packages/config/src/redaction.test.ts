@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 import { createAuditLogRecord } from "./audit.js";
-import { redactLogMessage, redactSecrets } from "./redaction.js";
+import { createSafeProjection, redactLogMessage, redactSecrets } from "./redaction.js";
 
 describe("redaction helpers", () => {
   it("masks secret-like object keys recursively", () => {
@@ -23,7 +23,7 @@ describe("redaction helpers", () => {
     );
   });
 
-  it("redacts audit metadata before serialization", () => {
+  it("omits unclassified audit metadata before serialization", () => {
     const record = createAuditLogRecord({
       actorId: "scaffold-user",
       action: "deployment.read",
@@ -34,7 +34,7 @@ describe("redaction helpers", () => {
       metadata: { authorization: "Bearer dl_1234567890abcdef" }
     });
 
-    expect(record.metadata).toEqual({ authorization: "[REDACTED]" });
+    expect(record.metadata).toEqual({});
   });
 
   it("preserves non-reversible identifiers such as hex fingerprints, checksums, and UUIDs", () => {
@@ -57,5 +57,20 @@ describe("redaction helpers", () => {
       deploymentId: uuid,
       unrelated: "[REDACTED]"
     });
+  });
+
+  it("omits unclassified secret-bearing fields for every external projection surface", () => {
+    for (const surface of ["api", "log", "sse", "mcp", "ai"] as const) {
+      const projected = createSafeProjection(surface, {
+        requestId: "req_1",
+        correlationId: "req_1",
+        action: "deployment.read",
+        token: "dl_1234567890abcdef",
+        environment: { DATABASE_URL: "postgres://user:password@private.example.test/app" },
+        certificate: "-----BEGIN PRIVATE KEY-----"
+      });
+
+      expect(projected).toEqual({ requestId: "req_1", correlationId: "req_1", action: "deployment.read" });
+    }
   });
 });
