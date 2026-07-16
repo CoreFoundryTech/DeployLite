@@ -239,6 +239,30 @@ export const envSecretValues = pgTable(
   ]
 );
 
+export const controlCommands = pgTable(
+  "control_commands",
+  {
+    id: uuid("id").primaryKey().defaultRandom(),
+    actorUserId: uuid("actor_user_id").notNull().references(() => users.id, { onDelete: "restrict", onUpdate: "cascade" }),
+    action: text("action").notNull(),
+    scopeKind: text("scope_kind").notNull(),
+    scopeKey: text("scope_key").notNull(),
+    inputDigest: text("input_digest").notNull(),
+    idempotencyKey: text("idempotency_key").notNull(),
+    correlationId: text("correlation_id").notNull(),
+    status: text("status").notNull().default("pending"),
+    expiresAt: timestamp("expires_at", { withTimezone: true }).notNull(),
+    ...timestamps
+  },
+  (table) => [
+    uniqueIndex("control_commands_idempotency_unique").on(table.actorUserId, table.action, table.scopeKey, table.idempotencyKey),
+    index("control_commands_actor_user_id_idx").on(table.actorUserId),
+    check("control_commands_action_valid", sql`${table.action} in ('project.delete', 'project.deploy', 'project.update', 'platform.agent.register')`),
+    check("control_commands_scope_valid", sql`${table.scopeKind} in ('platform', 'project')`),
+    check("control_commands_status_valid", sql`${table.status} = 'pending'`)
+  ]
+);
+
 export const domains = pgTable(
   "domains",
   {
@@ -295,3 +319,4 @@ export type NewDeploymentLogRow = typeof deploymentLogs.$inferInsert;
 export type NewEnvVariableMetadata = typeof envVariableMetadata.$inferInsert;
 export type EnvSecretValueRow = typeof envSecretValues.$inferSelect;
 export type NewEnvSecretValue = typeof envSecretValues.$inferInsert;
+export type ControlCommandRow = typeof controlCommands.$inferSelect;

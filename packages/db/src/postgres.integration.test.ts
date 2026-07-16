@@ -8,6 +8,8 @@ import { createDbClient, createDbPool, closeDbPool, type DeployLiteDb } from "./
 import { assertEnvMetadataHasNoValueColumns, toEnvVariableMetadataInsert } from "./env-metadata.js";
 import { DbAuthUserRepository, DbRoleRepository, DbSessionRepository } from "./repositories/auth.js";
 import { DbAgentRepository, DbDeploymentRepository, DbProjectRepository } from "./repositories/deployment-data.js";
+import { DbControlCommandRepository } from "./repositories/control-plane.js";
+import { IdempotencyConflictError, createControlCommand, digestControlInput } from "@deploylite/domain";
 
 const { Client } = pg;
 
@@ -38,7 +40,7 @@ describeIntegration("PostgreSQL auth foundation integration", () => {
 
     await applyMigrations(databaseUrl);
 
-    pool = createDbPool(databaseUrl, { max: 1 });
+    pool = createDbPool(databaseUrl, { max: 2 });
     db = createDbClient(pool);
   }, 30_000);
 
@@ -107,7 +109,7 @@ describeIntegration("PostgreSQL auth foundation integration", () => {
     });
 
     await closeDbPool(requirePool());
-    pool = createDbPool(databaseUrl, { max: 1 });
+    pool = createDbPool(databaseUrl, { max: 2 });
     db = createDbClient(pool);
 
     await expect(requireDbAuthUserRepository().findByEmail("admin@example.test")).resolves.toMatchObject({
@@ -299,6 +301,26 @@ describeIntegration("PostgreSQL auth foundation integration", () => {
         value: "plain-text-secret"
       } as Parameters<typeof toEnvVariableMetadataInsert>[0])
     ).toThrow("Environment variable metadata cannot include secret value field");
+  });
+
+  it("resolves concurrent idempotency retries once, rejects mismatched reuse, and rolls back a command", async () => {
+    const client = requirePool();
+    const role = (await client.query<{ id: string }>("SELECT id FROM roles WHERE name = 'admin'")).rows[0];
+    if (!role) throw new Error("Canonical admin role was not seeded");
+    const actorId = randomUUID();
+    await client.query("INSERT INTO users (id, email, email_normalized, password_hash, role_id) VALUES ($1, $2, $2, $3, $4)", [actorId, `${actorId}@example.test`, "hash", role.id]);
+    const command = createControlCommand({ actorId, action: "project.delete", scope: { kind: "project", projectId: randomUUID() }, input: { project: "one" }, idempotencyKey: "retry-key", correlationId: "corr-command" });
+    const repo = new DbControlCommandRepository(requireDb());
+    const retries = await Promise.all([repo.resolve(command), repo.resolve({ ...command, id: randomUUID() })]);
+    expect(retries.filter((result) => result.created)).toHaveLength(1);
+    expect(new Set(retries.map((result) => result.command.id))).toEqual(new Set([retries.find((result) => result.created)?.command.id]));
+    await expect(repo.resolve({ ...command, id: randomUUID(), inputDigest: digestControlInput({ project: "other" }) })).rejects.toBeInstanceOf(IdempotencyConflictError);
+
+    const rolledBackId = randomUUID();
+    await client.query("BEGIN");
+    await client.query("INSERT INTO control_commands (id, actor_user_id, action, scope_kind, scope_key, input_digest, idempotency_key, correlation_id, expires_at) VALUES ($1, $2, 'project.delete', 'project', $3, $4, 'rollback-key', 'corr-rollback', now())", [rolledBackId, actorId, randomUUID(), digestControlInput({ rollback: true })]);
+    await client.query("ROLLBACK");
+    await expect(client.query("SELECT id FROM control_commands WHERE id = $1", [rolledBackId])).resolves.toMatchObject({ rowCount: 0 });
   });
 });
 

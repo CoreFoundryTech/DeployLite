@@ -1,6 +1,8 @@
 import type { Agent, AgentHeartbeat, Deployment, EnvSecretValue, EnvVariableMetadata, LogEvent, Project, ScaffoldUser } from "@deploylite/contracts";
 import { redactLogMessage } from "@deploylite/config";
 
+export * from "./control-plane.js";
+
 export const canonicalRoleNames = ["admin", "operator", "read-only", "auditor"] as const;
 export type CanonicalRoleName = (typeof canonicalRoleNames)[number];
 export type AuthUserStatus = "active" | "disabled";
