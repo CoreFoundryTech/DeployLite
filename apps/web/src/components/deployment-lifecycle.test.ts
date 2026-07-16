@@ -1,10 +1,12 @@
 import { renderToStaticMarkup } from "react-dom/server";
 import React from "react";
-import { describe, expect, it } from "vitest";
+import type { Deployment } from "@deploylite/contracts";
+import { describe, expect, it, vi } from "vitest";
 import {
   DeploymentLifecycle,
   deploymentStreamUrl,
   orderDeploymentLogs,
+  openDeploymentLifecycleStream,
   redactDeploymentLogMessage,
   runDeploymentControl,
   streamReconnectDelay
@@ -31,6 +33,17 @@ const log = (sequence: number, message: string) => ({
   requestId: "request-1",
   correlationId: "request-1"
 });
+
+class TestEventSource {
+  closed = false;
+  onopen: (() => void) | null = null;
+  onerror: (() => void) | null = null;
+  private readonly listeners = new Map<string, (event: { data: string }) => void>();
+
+  addEventListener(type: string, listener: (event: { data: string }) => void) { this.listeners.set(type, listener); }
+  close() { this.closed = true; }
+  emit(type: string, data: string) { this.listeners.get(type)?.({ data }); }
+}
 
 describe("deployment lifecycle", () => {
   it("orders logs, redacts credential-shaped values, and resumes after the last sequence", () => {
@@ -61,6 +74,65 @@ describe("deployment lifecycle", () => {
       fetchImpl: async () => new Response(JSON.stringify({ data: null, error: { code: "EXECUTOR_CAPABILITY_UNAVAILABLE", message: "Restart unavailable" }, requestId: "request-3" }), { status: 409 })
     });
     expect(unavailable).toEqual({ kind: "unavailable", message: "Restart unavailable" });
+  });
+
+  it("keeps EventSource open for malformed or non-terminal terminal frames and accepts later authoritative updates", () => {
+    const source = new TestEventSource();
+    const statuses: string[] = [];
+    const notices: string[] = [];
+    const deployments: Array<Partial<Deployment>> = [];
+    const stop = openDeploymentLifecycleStream({
+      apiBaseUrl: "https://api.example.test",
+      deploymentId: deployment.id,
+      afterSequence: null,
+      eventSourceFactory: () => source,
+      onLog: vi.fn(),
+      onStatus: (next) => deployments.push(next),
+      onTerminal: vi.fn(),
+      onNotice: (message) => notices.push(message),
+      onState: (state) => statuses.push(state)
+    });
+
+    source.emit("deployment.terminal", "not-json");
+    source.emit("deployment.terminal", JSON.stringify({ status: "running" }));
+    source.emit("deployment.status", JSON.stringify({ status: "canceling" }));
+
+    expect(source.closed).toBe(false);
+    expect(statuses).not.toContain("complete");
+    expect(notices).toEqual([
+      "A lifecycle terminal frame was ignored because it was invalid.",
+      "A lifecycle terminal frame was ignored because it was invalid."
+    ]);
+    expect(deployments).toEqual([{ status: "canceling" }]);
+    stop();
+  });
+
+  it("shows reconnecting state and schedules a replacement EventSource after an error", () => {
+    const sources: TestEventSource[] = [];
+    const states: string[] = [];
+    let scheduled: (() => void) | undefined;
+    const schedule = vi.fn((callback: () => void) => { scheduled = callback; return 1 as unknown as ReturnType<typeof setTimeout>; });
+    const stop = openDeploymentLifecycleStream({
+      apiBaseUrl: "https://api.example.test",
+      deploymentId: deployment.id,
+      afterSequence: 3,
+      eventSourceFactory: () => { const source = new TestEventSource(); sources.push(source); return source; },
+      onLog: vi.fn(),
+      onStatus: vi.fn(),
+      onTerminal: vi.fn(),
+      onNotice: vi.fn(),
+      onState: (state) => states.push(state),
+      schedule
+    });
+
+    sources[0]?.onerror?.();
+    scheduled?.();
+
+    expect(sources[0]?.closed).toBe(true);
+    expect(schedule).toHaveBeenCalledWith(expect.any(Function), 1000);
+    expect(sources).toHaveLength(2);
+    expect(states).toEqual(["connecting", "reconnecting", "reconnecting"]);
+    stop();
   });
 
   it("renders an accessible cancel control and transparent unavailable actions", () => {

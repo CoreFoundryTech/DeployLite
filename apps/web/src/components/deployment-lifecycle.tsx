@@ -18,6 +18,28 @@ type ControlResult =
   | { kind: "unavailable"; message: string }
   | { kind: "error"; message: string };
 
+type DeploymentStreamEvent = { data: string };
+type DeploymentEventSource = {
+  close: () => void;
+  onopen: ((event: Event) => void) | null;
+  onerror: ((event: Event) => void) | null;
+  addEventListener: (type: string, listener: (event: DeploymentStreamEvent) => void) => void;
+};
+
+type DeploymentStreamOptions = {
+  apiBaseUrl: string;
+  deploymentId: string;
+  afterSequence: number | null;
+  onLog: (log: LogEvent) => void;
+  onStatus: (deployment: Partial<Deployment>) => void;
+  onTerminal: (deployment: Partial<Deployment>) => void;
+  onNotice: (message: string) => void;
+  onState: (state: StreamState) => void;
+  eventSourceFactory?: (url: string, init: EventSourceInit) => DeploymentEventSource;
+  schedule?: (callback: () => void, delay: number) => ReturnType<typeof setTimeout>;
+  clearSchedule?: (timer: ReturnType<typeof setTimeout>) => void;
+};
+
 const terminalStatuses = new Set(["succeeded", "failed", "canceled"]);
 
 export function orderDeploymentLogs(logs: LogEvent[]): LogEvent[] {
@@ -38,6 +60,60 @@ export function deploymentStreamUrl(apiBaseUrl: string, deploymentId: string, af
 
 export function streamReconnectDelay(attempt: number): number {
   return Math.min(10_000, 500 * 2 ** Math.min(attempt, 4));
+}
+
+export function openDeploymentLifecycleStream({
+  apiBaseUrl,
+  deploymentId,
+  afterSequence,
+  onLog,
+  onStatus,
+  onTerminal,
+  onNotice,
+  onState,
+  eventSourceFactory = (url, init) => new EventSource(url, init),
+  schedule = setTimeout,
+  clearSchedule = clearTimeout
+}: DeploymentStreamOptions): () => void {
+  let source: DeploymentEventSource | null = null;
+  let retry: ReturnType<typeof setTimeout> | null = null;
+  let closed = false;
+  let attempts = 0;
+
+  const connect = () => {
+    if (closed) return;
+    onState(attempts === 0 ? "connecting" : "reconnecting");
+    source = eventSourceFactory(deploymentStreamUrl(apiBaseUrl, deploymentId, afterSequence), { withCredentials: true });
+    source.onopen = () => { attempts = 0; onState("connected"); };
+    source.addEventListener("deployment.log", (event) => {
+      try {
+        const next = JSON.parse(event.data) as LogEvent;
+        onLog({ ...next, message: redactDeploymentLogMessage(next.message), redactionApplied: true });
+      } catch { onNotice("A lifecycle log frame was ignored because it was invalid."); }
+    });
+    source.addEventListener("deployment.status", (event) => {
+      try { onStatus(JSON.parse(event.data) as Partial<Deployment>); } catch { onNotice("A lifecycle status frame was ignored because it was invalid."); }
+    });
+    source.addEventListener("deployment.terminal", (event) => {
+      try {
+        const next = JSON.parse(event.data) as Partial<Deployment>;
+        if (!next || typeof next !== "object" || !terminalStatuses.has(next.status ?? "")) throw new Error("Invalid terminal deployment status");
+        onTerminal(next);
+        onState("complete");
+        source?.close();
+      } catch { onNotice("A lifecycle terminal frame was ignored because it was invalid."); }
+    });
+    source.onerror = () => {
+      source?.close();
+      if (closed) return;
+      attempts += 1;
+      onState("reconnecting");
+      retry = schedule(connect, streamReconnectDelay(attempts));
+    };
+  };
+
+  connect();
+  return () => { closed = true; source?.close(); if (retry) clearSchedule(retry); };
 }
 
 export async function runDeploymentControl({
@@ -81,38 +157,16 @@ export function DeploymentLifecycle({ deployment: initialDeployment, initialLogs
 
   useEffect(() => {
     if (!apiBaseUrl || terminal || typeof EventSource === "undefined") return;
-    let source: EventSource | null = null;
-    let retry: ReturnType<typeof setTimeout> | null = null;
-    let closed = false;
-    let attempts = 0;
-
-    const connect = () => {
-      if (closed) return;
-      setStreamState(attempts === 0 ? "connecting" : "reconnecting");
-      source = new EventSource(deploymentStreamUrl(apiBaseUrl, deployment.id, lastSequence), { withCredentials: true });
-      source.onopen = () => { attempts = 0; setStreamState("connected"); };
-      source.addEventListener("deployment.log", (event) => {
-        try {
-          const next = JSON.parse(event.data) as LogEvent;
-          setLogs((current) => orderDeploymentLogs([...current, { ...next, message: redactDeploymentLogMessage(next.message), redactionApplied: true }]));
-        } catch { setNotice("A lifecycle log frame was ignored because it was invalid."); }
-      });
-      source.addEventListener("deployment.status", (event) => {
-        try { setDeployment((current) => ({ ...current, ...(JSON.parse(event.data) as Partial<Deployment>) })); } catch { setNotice("A lifecycle status frame was ignored because it was invalid."); }
-      });
-      source.addEventListener("deployment.terminal", (event) => {
-        try { setDeployment((current) => ({ ...current, ...(JSON.parse(event.data) as Partial<Deployment>) })); } finally { setStreamState("complete"); source?.close(); }
-      });
-      source.onerror = () => {
-        source?.close();
-        if (closed) return;
-        attempts += 1;
-        setStreamState("reconnecting");
-        retry = setTimeout(connect, streamReconnectDelay(attempts));
-      };
-    };
-    connect();
-    return () => { closed = true; source?.close(); if (retry) clearTimeout(retry); };
+    return openDeploymentLifecycleStream({
+      apiBaseUrl,
+      deploymentId: deployment.id,
+      afterSequence: lastSequence,
+      onLog: (next) => setLogs((current) => orderDeploymentLogs([...current, next])),
+      onStatus: (next) => setDeployment((current) => ({ ...current, ...next })),
+      onTerminal: (next) => setDeployment((current) => ({ ...current, ...next })),
+      onNotice: setNotice,
+      onState: setStreamState
+    });
   }, [apiBaseUrl, deployment.id, lastSequence, terminal]);
 
   const orderedLogs = useMemo(() => orderDeploymentLogs(logs), [logs]);
