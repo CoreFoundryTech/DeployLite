@@ -15,7 +15,7 @@ export class PolicyEvaluator {
   evaluate(request: PolicyRequest): PolicyDecision {
     if (readOnlyRoles.has(request.role)) return { allowed: false, code: "ROLE_DENIED", correlationId: request.correlationId };
     const actionGrants = request.grants.filter((grant) => grant.actorId === request.actorId && grant.action === request.action);
-    const grant = actionGrants.find((candidate) => grantApplies(candidate.scope, request.scope));
+    const grant = actionGrants.find((candidate) => grantApplies(candidate.scope, request.scope, request.role));
     if (grant) return { allowed: true, grantId: grant.id, correlationId: request.correlationId };
     return { allowed: false, code: actionGrants.length ? "SCOPE_DENIED" : "FORBIDDEN", correlationId: request.correlationId };
   }
@@ -64,8 +64,9 @@ function scopesEqual(left: ControlPlaneScope, right: ControlPlaneScope): boolean
   return left.kind === right.kind && (left.kind === "platform" || left.projectId === (right as Extract<ControlPlaneScope, { kind: "project" }>).projectId);
 }
 
-function grantApplies(grantScope: ControlPlaneScope, requestedScope: ControlPlaneScope): boolean {
-  return grantScope.kind === "platform" || scopesEqual(grantScope, requestedScope);
+function grantApplies(grantScope: ControlPlaneScope, requestedScope: ControlPlaneScope, role: CanonicalRole): boolean {
+  if (grantScope.kind === "platform") return role === "admin";
+  return scopesEqual(grantScope, requestedScope);
 }
 
 function stableJson(value: unknown): string {

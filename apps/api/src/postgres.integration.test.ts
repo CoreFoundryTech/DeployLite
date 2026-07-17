@@ -153,14 +153,14 @@ describeIntegration("DeployLite API PostgreSQL integration", () => {
     await restartedApp.close();
   }, 30_000);
 
-  it("persists the confirmed delete command and correlated audit while making replay idempotent", async () => {
+  it("allows an admin platform grant to persist the confirmed delete command and correlated audit while making replay idempotent", async () => {
     const app = await createPostgresApp();
     const login = await app.inject({ method: "POST", url: "/api/v1/auth/login", headers: contentHeaders, payload: { email: "admin@example.test", password: adminPassword } });
     const cookie = login.headers["set-cookie"] as string;
     const actorId = login.json().data.user.id as string;
     const projectId = randomUUID();
     await new DbProjectRepository(requireDb()).save({ id: projectId, name: "Confirmed PostgreSQL project", repoUrl: "https://github.com/example/confirmed-postgres", defaultBranch: "main", buildCommand: null, runCommand: null, port: null, description: null, imageTag: null });
-    await requirePool().query("INSERT INTO control_grants (actor_user_id, action, scope_kind, scope_key) VALUES ($1, 'project.delete', 'project', $2)", [actorId, projectId]);
+    await requirePool().query("INSERT INTO control_grants (actor_user_id, action, scope_kind, scope_key) VALUES ($1, 'project.delete', 'platform', 'platform')", [actorId]);
     const headers = { cookie, "x-control-idempotency-key": "postgres-confirmed-delete" };
 
     const pending = await app.inject({ method: "DELETE", url: `/api/v1/projects/${projectId}`, headers });
@@ -178,7 +178,7 @@ describeIntegration("DeployLite API PostgreSQL integration", () => {
     await app.close();
   }, 30_000);
 
-  it("uses persisted grants to deny cross-project operator deletes before command creation and preserve the denial correlation", async () => {
+  it("uses persisted platform and project grants to deny cross-project operator deletes while allowing the exact project scope", async () => {
     const app = await createPostgresApp();
     const operatorId = randomUUID();
     const projectA = randomUUID();
@@ -189,7 +189,7 @@ describeIntegration("DeployLite API PostgreSQL integration", () => {
     await requirePool().query("INSERT INTO users (id, email, email_normalized, password_hash, role_id) VALUES ($1, $2, $2, $3, $4)", [operatorId, `${operatorId}@example.test`, passwordHash, operatorRole.id]);
     await new DbProjectRepository(requireDb()).save({ id: projectA, name: "Granted project", repoUrl: "https://github.com/example/granted", defaultBranch: "main", buildCommand: null, runCommand: null, port: null, description: null, imageTag: null });
     await new DbProjectRepository(requireDb()).save({ id: projectB, name: "Denied project", repoUrl: "https://github.com/example/denied", defaultBranch: "main", buildCommand: null, runCommand: null, port: null, description: null, imageTag: null });
-    await requirePool().query("INSERT INTO control_grants (actor_user_id, action, scope_kind, scope_key) VALUES ($1, 'project.delete', 'project', $2)", [operatorId, projectA]);
+    await requirePool().query("INSERT INTO control_grants (actor_user_id, action, scope_kind, scope_key) VALUES ($1, 'project.delete', 'platform', 'platform'), ($1, 'project.delete', 'project', $2)", [operatorId, projectA]);
     const login = await app.inject({ method: "POST", url: "/api/v1/auth/login", headers: contentHeaders, payload: { email: `${operatorId}@example.test`, password: adminPassword } });
     const denied = await app.inject({ method: "DELETE", url: `/api/v1/projects/${projectB}`, headers: { cookie: login.headers["set-cookie"] as string, "x-control-idempotency-key": "cross-project-denial", "x-request-id": "req_cross_project_denial" } });
 
@@ -198,6 +198,8 @@ describeIntegration("DeployLite API PostgreSQL integration", () => {
     await expect(requirePool().query("SELECT action, correlation_id, metadata FROM audit_events WHERE actor_user_id = $1 AND target_id = $2", [operatorId, projectB])).resolves.toMatchObject({
       rows: [expect.objectContaining({ action: "project.delete.rejected", correlation_id: expect.any(String), metadata: { reason: "SCOPE_DENIED" } })]
     });
+    const allowed = await app.inject({ method: "DELETE", url: `/api/v1/projects/${projectA}`, headers: { cookie: login.headers["set-cookie"] as string, "x-control-idempotency-key": "exact-project-allow" } });
+    expect(allowed.statusCode).toBe(202);
     await app.close();
   }, 30_000);
 });
