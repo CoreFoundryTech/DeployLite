@@ -16,8 +16,10 @@ This directory contains local-development infrastructure and the first reviewabl
 
 - `postgres` uses `postgres:16-alpine` with a durable named volume.
 - `migrate` runs the existing hand-authored SQL migrations once before the API starts.
-- `api` builds `apps/api/Dockerfile`, binds internally to `0.0.0.0:3001`, and is temporarily exposed on host `:3001`.
-- `web` builds `apps/web/Dockerfile`, serves Next.js on container `:3000`, and is temporarily exposed on host `:80`.
+- `traefik` is the only published service (`:80` and `:443`); API and Web remain on the internal network.
+- `api` is routed at `Host(deploylite.com) && PathPrefix(/api)`.
+- `web` is routed at `Host(deploylite.com)`.
+- `traefik-acme` is a persistent named volume reserved for ACME state.
 - Health checks gate API/Web startup where Compose supports dependency conditions.
 
 For local review, render the configuration without starting services:
@@ -30,32 +32,28 @@ During installation, `scripts/install.sh` copies this Compose file to `/opt/depl
 
 ## VPS installer runbook
 
-Bootstrap from the reviewed GitHub `main` branch on a clean supported VPS:
+Bootstrap requires an immutable, reviewed 40-character Git commit SHA. It intentionally rejects mutable branches and tags and makes no signed-release provenance claim:
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/CoreFoundryTech/DeployLite/main/scripts/bootstrap.sh | sudo bash
+curl -fsSL https://raw.githubusercontent.com/CoreFoundryTech/DeployLite/<commit-sha>/scripts/bootstrap.sh | sudo DEPLOYLITE_VERSION=<commit-sha> bash
 ```
 
-For a stable public IP or hostname, pass it through the environment:
-
-```bash
-curl -fsSL https://raw.githubusercontent.com/CoreFoundryTech/DeployLite/main/scripts/bootstrap.sh | sudo DEPLOYLITE_PUBLIC_HOST=<ip-or-host> bash
-```
-
-Set `DEPLOYLITE_VERSION=<branch-tag-or-sha>` to download a specific GitHub ref. The bootstrapper downloads a GitHub tarball, extracts it under a temporary directory, preserves `DEPLOYLITE_*` environment variables when invoking the installer, and cleans temporary files on exit. It does not print secret values.
+Set the same `DEPLOYLITE_VERSION=<40-character-commit-sha>` used in the bootstrap URL. The bootstrapper downloads that GitHub tarball, extracts it under a temporary directory, preserves `DEPLOYLITE_*` environment variables when invoking the installer, and cleans temporary files on exit. It does not print secret values.
 
 Alternatively, run from a reviewed source checkout:
 
 ```bash
-sudo DEPLOYLITE_PUBLIC_HOST=203.0.113.10 bash scripts/install.sh
+sudo bash scripts/install.sh
 ```
 
-The installer supports Ubuntu 20.04/22.04/24.04 and Debian 11/12 on x86_64 or arm64. It requires root or sudo, verifies ports `80` and `3001`, installs/verifies Docker Engine and the Compose plugin through `apt` when missing, starts Postgres/migrations/API/Web through Compose, waits for API/Web health, and prints the final HTTP URL.
+The installer defaults to an interactive prerequisite-only TUI; use `--noninteractive` for automation. It supports Ubuntu 20.04/22.04/24.04 and Debian 11/12 on x86_64 or arm64, verifies ports `80` and `443`, installs/verifies Docker Engine and the Compose plugin through `apt` with bounded timeouts, creates private runtime secrets once, and renders the deployment definition. It does not start application services or request a domain, application settings, or ACME email.
 
-After completion, open the printed `http://<host>/` URL and create the first owner account in the browser. No default admin user or password is created.
+Functional configuration is web-owned. `DEPLOYLITE_DOMAIN` defaults to `deploylite.com` in Compose so the runtime has a deterministic route without an installer prompt. The current blocker for TLS is a web-owned `DEPLOYLITE_ACME_EMAIL` setting and DNS for that domain. Until those exist, the base Compose file is an explicit HTTP fallback; it still publishes only Traefik ports `80` and `443`.
 
 On failure, the installer reports changed steps with secret redaction, stops newly started containers where safe, and preserves `/opt/deploylite/.env` plus named volumes.
 
-### HTTP-first limits
+### TLS activation
 
-This slice intentionally uses plain HTTP for reviewability: Web `:80`, API `:3001`, `DEPLOYLITE_SESSION_COOKIE_SECURE=false`, and credentialed CORS only for `DEPLOYLITE_CORS_ORIGIN`. It does not configure Traefik, ACME, domains, HTTPS, firewall rules, backups, upgrades, uninstall/reset, Dokploy, or a deployment agent/server Docker socket. The first owner/admin is still created only in the browser while the user table is empty; no default admin is seeded or documented.
+Once the web-owned settings provide `DEPLOYLITE_DOMAIN`, `DEPLOYLITE_ACME_EMAIL`, and working public DNS, start with both files: `docker compose -f compose.yml -f compose.tls.yml --env-file .env up -d`. The TLS overlay configures Traefik's Let's Encrypt HTTP-01 ACME resolver and persistent `/acme/acme.json` storage. It is deliberately not enabled by bootstrap because no installer prompt may collect business configuration. Set `DEPLOYLITE_SESSION_COOKIE_SECURE=true` with TLS.
+
+This boundary does not configure firewall rules, backups, upgrades, uninstall/reset, Dokploy, or a deployment agent/server Docker socket. The first owner/admin is still created only in the browser while the user table is empty; no default admin is seeded or documented.

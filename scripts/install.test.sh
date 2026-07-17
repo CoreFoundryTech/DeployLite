@@ -48,7 +48,7 @@ test_unsupported_host_fails_without_mutation() {
   detect_os() { fail 'Unsupported host: expected Ubuntu 20.04/22.04/24.04 or Debian 11/12.' 2; }
   detect_arch() { :; }
   port_available() { :; }
-  command_exists() { [[ "$1" == "sudo" ]]; }
+  command_exists() { [[ "$1" == "sudo" || "$1" == "timeout" ]]; }
   output="$(preflight 2>&1)" && status=0 || status=$?
   [[ "$status" -eq 2 ]]
   assert_contains "$output" 'Unsupported host'
@@ -60,7 +60,7 @@ test_occupied_port_fails_actionably() {
   local output status
   detect_os() { :; }
   detect_arch() { :; }
-  command_exists() { [[ "$1" == "sudo" ]]; }
+  command_exists() { [[ "$1" == "sudo" || "$1" == "timeout" ]]; }
   port_available() { [[ "$1" != "80" ]]; }
   output="$(preflight 2>&1)" && status=0 || status=$?
   [[ "$status" -eq 2 ]]
@@ -77,7 +77,7 @@ test_install_docker_uses_docker_apt_repo_when_missing() {
     esac
   }
   install_docker_apt_repository() { calls+=("install_docker_apt_repository"); }
-  as_root() { calls+=("$*"); [[ "$*" == apt-get\ install* ]] && docker_ready=1; return 0; }
+  as_root() { calls+=("$*"); [[ "$*" == *"apt-get install"* ]] && docker_ready=1; return 0; }
   install_docker
   [[ " ${calls[*]} " == *" install_docker_apt_repository "* ]]
   [[ " ${calls[*]} " == *" apt-get update "* ]]
@@ -102,20 +102,20 @@ test_prepare_install_dir_preserves_existing_secret() {
   rm -rf "$tmp"
 }
 
-test_write_env_generates_once_with_private_permissions() {
+test_write_env_generates_runtime_secrets_without_business_configuration() {
   local tmp saved
   tmp="$(mktemp -d)"
   INSTALL_DIR="${tmp}/install"
   ENV_FILE="${INSTALL_DIR}/.env"
   mkdir -p "$INSTALL_DIR"
-  DEPLOYLITE_PUBLIC_HOST="198.51.100.10"
   as_root() { "$@"; }
   random_secret() { printf 'generated-secret'; }
   write_env
   saved="$(cat "$ENV_FILE")"
-  assert_contains "$saved" 'DEPLOYLITE_PUBLIC_WEB_ORIGIN=http://198.51.100.10'
-  assert_contains "$saved" 'DEPLOYLITE_PUBLIC_API_ORIGIN=http://198.51.100.10:3001'
   assert_contains "$saved" 'POSTGRES_PASSWORD=generated-secret'
+  assert_contains "$saved" 'DEPLOYLITE_SECRET_KEY=generated-secret'
+  assert_not_contains "$saved" 'DEPLOYLITE_DOMAIN='
+  assert_not_contains "$saved" 'DEPLOYLITE_ACME_EMAIL='
   [[ "$(stat -f '%Lp' "$ENV_FILE" 2>/dev/null || stat -c '%a' "$ENV_FILE")" == "600" ]]
   rm -rf "$tmp"
 }
@@ -152,17 +152,14 @@ test_failure_cleanup_preserves_config_and_uses_compose_down_only() {
   rm -rf "$tmp"
 }
 
-test_final_url_output_points_to_first_owner_setup() {
+test_success_output_defers_business_configuration_to_web() {
   local tmp output
   tmp="$(mktemp -d)"
   INSTALL_DIR="${tmp}/install"
   ENV_FILE="${INSTALL_DIR}/.env"
   mkdir -p "$INSTALL_DIR"
-  printf 'DEPLOYLITE_PUBLIC_HOST=203.0.113.55\n' >"$ENV_FILE"
   output="$(print_success)"
-  assert_contains "$output" 'DeployLite URL: http://203.0.113.55'
-  assert_contains "$output" 'create the first owner account'
-  assert_contains "$output" 'No default admin credentials'
+  assert_contains "$output" 'No application, domain, or ACME configuration was requested.'
   rm -rf "$tmp"
 }
 
@@ -207,87 +204,19 @@ test_redact_stream_removes_postgres_passwords_and_key_value_secrets() {
   assert_contains "$output" 'plain line' || { printf 'plain line lost in stream: %s\n' "$output"; return 1; }
 }
 
-test_write_env_uses_prompted_public_host_in_interactive_mode() {
-  local tmp saved
-  tmp="$(mktemp -d)"
-  INSTALL_DIR="${tmp}/install"
-  ENV_FILE="${INSTALL_DIR}/.env"
-  mkdir -p "$INSTALL_DIR"
-  # Provide a default via env so detect_public_host_inner returns it.
-  DEPLOYLITE_PUBLIC_HOST="198.51.100.10"
-  INTERACTIVE=1
-  as_root() { "$@"; }
-  random_secret() { printf 'generated-secret'; }
-  # Pipe an override value; the function must use it in the env file.
-  write_env <<<'203.0.113.99'
-  saved="$(cat "$ENV_FILE")"
-  assert_contains "$saved" 'DEPLOYLITE_PUBLIC_HOST=203.0.113.99' || { printf 'expected prompted host, got: %s\n' "$saved"; rm -rf "$tmp"; return 1; }
-  assert_contains "$saved" 'DEPLOYLITE_PUBLIC_WEB_ORIGIN=http://203.0.113.99' || { printf 'expected web origin, got: %s\n' "$saved"; rm -rf "$tmp"; return 1; }
-  assert_contains "$saved" 'DEPLOYLITE_PUBLIC_API_ORIGIN=http://203.0.113.99:3001' || { printf 'expected api origin, got: %s\n' "$saved"; rm -rf "$tmp"; return 1; }
-  rm -rf "$tmp"
-}
-
-test_write_env_in_interactive_mode_uses_empty_default_when_detection_fails() {
-  local tmp saved
-  tmp="$(mktemp -d)"
-  INSTALL_DIR="${tmp}/install"
-  ENV_FILE="${INSTALL_DIR}/.env"
-  mkdir -p "$INSTALL_DIR"
-  unset DEPLOYLITE_PUBLIC_HOST
-  INTERACTIVE=1
-  as_root() { "$@"; }
-  random_secret() { printf 'generated-secret'; }
-  # Stub detect_public_host_inner to return empty (no network, no env).
-  detect_public_host_inner() { :; }
-  # Provide a value via the prompt.
-  write_env <<<'198.51.100.42'
-  saved="$(cat "$ENV_FILE")"
-  assert_contains "$saved" 'DEPLOYLITE_PUBLIC_HOST=198.51.100.42' || { printf 'expected prompted host with empty default, got: %s\n' "$saved"; rm -rf "$tmp"; return 1; }
-  rm -rf "$tmp"
-}
-
-test_write_env_in_noninteractive_mode_hard_fails_when_no_host() {
-  local tmp status fail_called=0
-  tmp="$(mktemp -d)"
-  INSTALL_DIR="${tmp}/install"
-  ENV_FILE="${INSTALL_DIR}/.env"
-  mkdir -p "$INSTALL_DIR"
-  unset DEPLOYLITE_PUBLIC_HOST
-  INTERACTIVE=0
-  as_root() { "$@"; }
-  random_secret() { printf 'generated-secret'; }
-  # Stub detect_public_host to return empty (simulating a host that
-  # cannot be detected) WITHOUT calling the real fail() — that would
-  # exit the test runner. The hard-fail path in write_env must then
-  # call fail() itself. We stub fail() to record the call and return
-  # a non-zero status instead of exiting; the real fail() would call
-  # exit, which is the behavior we are exercising the guard for.
-  detect_public_host() { :; }
-  fail() { fail_called=1; return 2; }
-  set +e
-  write_env >/dev/null 2>&1
-  status=$?
-  set -e
-  [[ "$fail_called" -eq 1 ]] || { printf 'expected fail() to be called when no host available, got status=%s fail_called=%s\n' "$status" "$fail_called"; rm -rf "$tmp"; return 1; }
-  rm -rf "$tmp"
-}
-
 run_test 'redaction masks secrets' test_redaction_masks_database_url_and_secret_assignments
 run_test 'unsupported host fails before mutation' test_unsupported_host_fails_without_mutation
 run_test 'occupied port fails actionably' test_occupied_port_fails_actionably
 run_test 'missing Docker triggers Docker apt repository install path' test_install_docker_uses_docker_apt_repo_when_missing
 run_test 'rerun preserves existing secret' test_prepare_install_dir_preserves_existing_secret
-run_test 'env generation writes private config' test_write_env_generates_once_with_private_permissions
+run_test 'env generation writes only runtime secrets' test_write_env_generates_runtime_secrets_without_business_configuration
 run_test 'installed compose keeps valid build context' test_installed_compose_uses_source_tree_build_context
 run_test 'failure cleanup preserves config' test_failure_cleanup_preserves_config_and_uses_compose_down_only
-run_test 'final URL guides first owner setup' test_final_url_output_points_to_first_owner_setup
+run_test 'success output defers business configuration to web' test_success_output_defers_business_configuration_to_web
 run_test 'prompt_value returns default in noninteractive mode' test_prompt_value_returns_default_in_noninteractive_mode
 run_test 'prompt_value returns piped value in interactive no-tty mode' test_prompt_value_returns_piped_value_in_interactive_no_tty_mode
 run_test 'prompt_value returns default when piped empty in interactive no-tty mode' test_prompt_value_returns_default_when_piped_empty_in_interactive_no_tty_mode
 run_test 'redact_stream removes postgres passwords and key=value secrets' test_redact_stream_removes_postgres_passwords_and_key_value_secrets
-run_test 'write_env uses prompted public host in interactive mode' test_write_env_uses_prompted_public_host_in_interactive_mode
-run_test 'write_env in interactive mode uses empty default when detection fails' test_write_env_in_interactive_mode_uses_empty_default_when_detection_fails
-run_test 'write_env in noninteractive mode hard-fails when no host' test_write_env_in_noninteractive_mode_hard_fails_when_no_host
 
 printf '\n%d passed, %d failed\n' "$PASS" "$FAIL"
 [[ "$FAIL" -eq 0 ]]

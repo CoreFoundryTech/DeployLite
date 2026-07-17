@@ -9,7 +9,7 @@ STATE_DIR="${INSTALL_DIR}/.state"
 DEFAULT_LOG_FILE="/var/log/deploylite/install.log"
 INSTALL_LOG="${DEPLOYLITE_INSTALL_LOG:-$DEFAULT_LOG_FILE}"
 INSTALL_LOG_DIR="${DEPLOYLITE_INSTALL_LOG_DIR:-$(dirname "$INSTALL_LOG")}"
-INTERACTIVE=0
+INTERACTIVE=1
 NOOP=0
 CHANGED_STEPS=()
 CREATED_RUNTIME=0
@@ -63,11 +63,11 @@ print_usage() {
 Usage: install.sh [options]
 
 Options:
-  --interactive, -i   Prompt for install values (TUI when available, read fallback).
+  --interactive, -i   Use the prerequisite-only installer TUI (default).
+  --noninteractive    Disable TUI output for automation.
   --help, -h          Show this help and exit.
 
 Environment:
-  DEPLOYLITE_PUBLIC_HOST=<ip-or-host>  Public host for the runtime.
   DEPLOYLITE_INSTALL_DIR=<path>        Install directory (default: /opt/deploylite).
   DEPLOYLITE_INSTALL_LOG=<path>        Install log file (default: /var/log/deploylite/install.log).
   DEPLOYLITE_INSTALL_LOG_DIR=<path>    Install log directory (default: parent of DEPLOYLITE_INSTALL_LOG).
@@ -83,15 +83,16 @@ parse_args() {
   while (( $# > 0 )); do
     case "$1" in
       --interactive|-i) INTERACTIVE=1; shift ;;
+      --noninteractive) INTERACTIVE=0; shift ;;
       --noop) NOOP=1; shift ;;
       --help|-h) print_usage; exit 0 ;;
       --)
         shift
         while (( $# > 0 )); do
-          fail "Unknown argument: $1. Use --interactive or --help." 2
+          fail "Unknown argument: $1. Use --interactive, --noninteractive, or --help." 2
         done
         ;;
-      *) fail "Unknown argument: $1. Use --interactive or --help." 2 ;;
+      *) fail "Unknown argument: $1. Use --interactive, --noninteractive, or --help." 2 ;;
     esac
   done
 }
@@ -198,6 +199,12 @@ prompt_value() {
   fi
 }
 
+show_prerequisite_tui() {
+  if [[ "${INTERACTIVE}" == "1" ]] && command_exists whiptail && [[ -t 0 ]]; then
+    whiptail --msgbox "DeployLite will install and verify system prerequisites only. Application, domain, and ACME settings are configured from the web flow." 10 72 --title "DeployLite prerequisites" || true
+  fi
+}
+
 as_root() {
   if [[ "${EUID}" -eq 0 ]]; then
     run "$@"
@@ -247,11 +254,12 @@ preflight() {
   info "Running preflight checks."
   detect_os
   detect_arch
+  command_exists timeout || fail "Missing required dependency: timeout." 2
   if [[ "${EUID}" -ne 0 ]] && ! command_exists sudo; then
     fail "Root or sudo is required. Re-run as root or install sudo." 2
   fi
   port_available 80 || fail "Port 80 is already in use. Stop the conflicting service before installing." 2
-  port_available 3001 || fail "Port 3001 is already in use. Stop the conflicting service before installing." 2
+  port_available 443 || fail "Port 443 is already in use. Stop the conflicting service before installing." 2
 }
 
 install_docker() {
@@ -259,17 +267,17 @@ install_docker() {
     info "Skipping Docker install (DEPLOYLITE_SKIP_DOCKER_INSTALL=1)."
     return 0
   fi
-  if command_exists docker && as_root docker compose version >/dev/null 2>&1; then
+  if command_exists docker && as_root timeout 20 docker compose version >/dev/null 2>&1; then
     info "Docker Engine and Compose plugin already installed; skipping apt install."
     return
   fi
   command_exists apt-get || fail "Docker is missing and automatic install requires apt-get." 2
   info "Installing Docker Engine and Compose plugin through Docker's official apt repository."
   install_docker_apt_repository
-  as_root apt-get update
-  as_root apt-get install -y docker-ce docker-ce-cli containerd.io docker-buildx-plugin docker-compose-plugin
+  as_root timeout 300 apt-get update
+  as_root timeout 300 apt-get install -y docker-ce docker-ce-cli containerd.io docker-buildx-plugin docker-compose-plugin
   command_exists docker || fail "Docker installation did not provide docker CLI." 2
-  as_root docker compose version >/dev/null 2>&1 || fail "Docker Compose plugin is unavailable after install." 2
+  as_root timeout 20 docker compose version >/dev/null 2>&1 || fail "Docker Compose plugin is unavailable after install." 2
   record_change "docker-installed-or-updated"
 }
 
@@ -289,7 +297,7 @@ install_docker_apt_repository() {
   repo_file="/etc/apt/sources.list.d/docker.list"
   as_root install -m 0755 -d /etc/apt/keyrings
   if [[ ! -s "$signed_by" ]]; then
-    curl -fsSL "https://download.docker.com/linux/${ID}/gpg" | as_root tee "$signed_by" >/dev/null
+    curl -fsSL --connect-timeout 10 --max-time 60 "https://download.docker.com/linux/${ID}/gpg" | as_root tee "$signed_by" >/dev/null
     as_root chmod a+r "$signed_by"
   fi
   printf 'deb [arch=%s signed-by=%s] https://download.docker.com/linux/%s %s stable\n' "$arch" "$signed_by" "${ID}" "$codename" \
@@ -335,33 +343,19 @@ env_get() {
 }
 
 write_env() {
-  local host postgres_password tmp detected interactive_host
-  if [[ "${INTERACTIVE}" == "1" ]]; then
-    # Offer a sensible default to the prompt without aborting the
-    # installer on detection failure. The detect helper caps its own
-    # network call (curl --max-time 3) so an unreachable ipify endpoint
-    # cannot stall the installer. The user can accept the detected
-    # value by pressing enter or override it. In non-interactive mode
-    # this branch is skipped entirely and the hard-fail path runs.
-    detected="$(detect_public_host_inner)"
-    interactive_host="$(prompt_value 'Public host (IP or hostname) for the runtime' "$detected")"
-    host="${interactive_host:-$detected}"
-  else
-    host="$(detect_public_host)"
-  fi
-  [[ -n "${host:-}" ]] || fail "Could not determine the public host. Set DEPLOYLITE_PUBLIC_HOST=<ip-or-host> and retry." 2
+  local postgres_password secret_key tmp
   postgres_password="$(env_get POSTGRES_PASSWORD || true)"
   [[ -n "$postgres_password" ]] || postgres_password="$(random_secret)"
+  secret_key="$(env_get DEPLOYLITE_SECRET_KEY || true)"
+  [[ -n "$secret_key" ]] || secret_key="$(random_secret)"
   tmp="$(mktemp)"
   umask 077
   cat >"$tmp" <<EOF
 COMPOSE_PROJECT_NAME=deploylite
-DEPLOYLITE_PUBLIC_HOST=${host}
-DEPLOYLITE_PUBLIC_WEB_ORIGIN=http://${host}
-DEPLOYLITE_PUBLIC_API_ORIGIN=http://${host}:3001
 POSTGRES_PASSWORD=${postgres_password}
 POSTGRES_DB=deploylite
 POSTGRES_USER=deploylite
+DEPLOYLITE_SECRET_KEY=${secret_key}
 DEPLOYLITE_SESSION_TTL_SECONDS=28800
 DEPLOYLITE_SESSION_COOKIE_NAME=deploylite_session
 DEPLOYLITE_SESSION_COOKIE_SECURE=false
@@ -369,9 +363,6 @@ DEPLOYLITE_BCRYPT_COST=12
 EOF
   as_root install -m 600 "$tmp" "$ENV_FILE"
   rm -f "$tmp"
-  if [[ "${INTERACTIVE}" == "1" ]]; then
-    info "Public host confirmed: ${host}"
-  fi
 }
 
 prepare_install_dir() {
@@ -403,15 +394,10 @@ install_compose_file() {
 compose() { as_root docker compose -f "$COMPOSE_FILE" --env-file "$ENV_FILE" --project-directory "$INSTALL_DIR" "$@"; }
 compose_down_safe() { compose down --remove-orphans; }
 
-start_runtime() {
+verify_runtime_definition() {
   info "Rendering Compose configuration."
-  compose config >/dev/null
-  info "Building and starting DeployLite runtime."
-  compose up -d --build postgres
-  CREATED_RUNTIME=1
-  compose up --build migrate
-  compose up -d --build api web
-  record_change "runtime-started"
+  as_root timeout 60 docker compose -f "$COMPOSE_FILE" --env-file "$ENV_FILE" --project-directory "$INSTALL_DIR" config >/dev/null
+  info "Deployment definition is ready; services were not started."
 }
 
 wait_for_url() {
@@ -432,24 +418,20 @@ wait_for_health() {
 }
 
 print_success() {
-  local host web api
-  host="$(env_get DEPLOYLITE_PUBLIC_HOST)"
-  web="http://${host}"
-  api="http://${host}:3001"
-  info "DeployLite is ready."
-  printf '\nDeployLite URL: %s\n' "$web"
-  printf 'API URL: %s\n' "$api"
-  printf 'Open the DeployLite URL in a browser and create the first owner account from the setup screen.\n'
-  printf 'No default admin credentials were created. Keep %s private.\n' "$ENV_FILE"
+  info "System prerequisites and deployment files are ready."
+  printf '\nNo application, domain, or ACME configuration was requested.\n'
+  printf 'Configure and start the runtime from the DeployLite web-owned configuration flow.\n'
+  printf 'Keep %s private.\n' "$ENV_FILE"
 }
 
 main() {
   parse_args "$@"
   install_log_setup
   if [[ "${INTERACTIVE}" == "1" ]]; then
-    info "Interactive mode: prompts enabled (TUI when available, read fallback)."
+    info "Interactive prerequisite-only mode: no application configuration prompts."
+    show_prerequisite_tui
   else
-    info "Running in non-interactive mode; use --interactive to enable prompts."
+    info "Running in non-interactive mode; use --interactive to enable the TUI status screen."
   fi
   if [[ "${NOOP}" == "1" ]]; then
     info "Noop mode: skipping preflight, Docker install, and runtime."
@@ -457,13 +439,8 @@ main() {
   fi
   preflight
   install_docker
-  if [[ "${DEPLOYLITE_SKIP_RUNTIME:-0}" == "1" ]]; then
-    info "Skipping runtime install (DEPLOYLITE_SKIP_RUNTIME=1)."
-    return 0
-  fi
   prepare_install_dir
-  start_runtime
-  wait_for_health
+  verify_runtime_definition
   print_success
 }
 

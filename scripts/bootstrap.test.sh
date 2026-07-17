@@ -31,16 +31,16 @@ run_test() {
   fi
 }
 
-test_tarball_url_defaults_to_main() {
+test_tarball_url_uses_immutable_commit() {
   DEPLOYLITE_REPO="CoreFoundryTech/DeployLite"
-  DEPLOYLITE_VERSION="main"
-  [[ "$(tarball_url)" == "https://codeload.github.com/CoreFoundryTech/DeployLite/tar.gz/main" ]]
+  DEPLOYLITE_VERSION="0123456789012345678901234567890123456789"
+  [[ "$(tarball_url)" == "https://codeload.github.com/CoreFoundryTech/DeployLite/tar.gz/0123456789012345678901234567890123456789" ]]
 }
 
 test_invalid_repo_fails_actionably() {
   local output status
   DEPLOYLITE_REPO="https://github.com/CoreFoundryTech/DeployLite"
-  DEPLOYLITE_VERSION="main"
+  DEPLOYLITE_VERSION="0123456789012345678901234567890123456789"
   output="$(validate_config 2>&1)" && status=0 || status=$?
   [[ "$status" -eq 2 ]]
   assert_contains "$output" "Invalid DEPLOYLITE_REPO"
@@ -51,7 +51,7 @@ test_download_uses_curl_without_printing_secret_values() {
   tmp="$(mktemp -d)"
   TARBALL_PATH="${tmp}/deploylite.tar.gz"
   command_exists() { [[ "$1" == "curl" ]]; }
-  curl() { printf 'fake archive' >"$4"; }
+  curl() { printf 'fake archive' >"${!#}"; }
   DEPLOYLITE_SECRET_TOKEN="super-secret-value"
   output="$(download_tarball "https://example.invalid/archive.tar.gz" 2>&1)"
   [[ -f "$TARBALL_PATH" ]]
@@ -104,7 +104,7 @@ test_cleanup_removes_temp_root() {
   [[ ! -e "$tmp" ]]
 }
 
-run_test 'tarball URL defaults to main' test_tarball_url_defaults_to_main
+run_test 'tarball URL uses immutable commit' test_tarball_url_uses_immutable_commit
 run_test 'invalid repo fails actionably' test_invalid_repo_fails_actionably
 run_test 'download uses curl without secret output' test_download_uses_curl_without_printing_secret_values
 run_test 'extract finds installer with mocked tar' test_extract_finds_installer_without_network_or_real_tar

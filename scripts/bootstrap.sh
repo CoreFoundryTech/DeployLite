@@ -3,10 +3,9 @@ set -Eeuo pipefail
 IFS=$'\n\t'
 
 readonly DEFAULT_REPO="CoreFoundryTech/DeployLite"
-readonly DEFAULT_VERSION="main"
 
 DEPLOYLITE_REPO="${DEPLOYLITE_REPO:-$DEFAULT_REPO}"
-DEPLOYLITE_VERSION="${DEPLOYLITE_VERSION:-$DEFAULT_VERSION}"
+DEPLOYLITE_VERSION="${DEPLOYLITE_VERSION:-}"
 
 TMP_ROOT=""
 TARBALL_PATH=""
@@ -34,7 +33,7 @@ command_exists() { command -v "$1" >/dev/null 2>&1; }
 
 require_root() {
   if [[ "${EUID}" -ne 0 ]]; then
-    fail "Root execution is required. Re-run with: curl -fsSL <bootstrap-url> | sudo DEPLOYLITE_PUBLIC_HOST=<ip-or-host> bash" 2
+    fail "Root execution is required. Re-run with: curl -fsSL <bootstrap-url> | sudo DEPLOYLITE_VERSION=<40-char-commit-sha> bash" 2
   fi
 }
 
@@ -45,7 +44,7 @@ require_dependency() {
 
 validate_config() {
   [[ "$DEPLOYLITE_REPO" =~ ^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$ ]] || fail "Invalid DEPLOYLITE_REPO. Expected owner/repo." 2
-  [[ "$DEPLOYLITE_VERSION" =~ ^[A-Za-z0-9._/@+-]+$ ]] || fail "Invalid DEPLOYLITE_VERSION/ref. Use a branch, tag, or commit ref." 2
+  [[ "$DEPLOYLITE_VERSION" =~ ^[0-9a-fA-F]{40}$ ]] || fail "DEPLOYLITE_VERSION must be an explicit 40-character Git commit SHA; mutable branches and tags are not accepted." 2
 }
 
 preflight() {
@@ -65,7 +64,7 @@ tarball_url() {
 download_tarball() {
   local url="$1"
   if command_exists curl; then
-    curl -fsSL "$url" -o "$TARBALL_PATH"
+    curl -fsSL --connect-timeout 10 --max-time 120 "$url" -o "$TARBALL_PATH"
   else
     wget -qO "$TARBALL_PATH" "$url"
   fi
@@ -89,7 +88,11 @@ export_deploylite_environment() {
 
 run_installer() {
   export_deploylite_environment
-  bash "$SOURCE_DIR/scripts/install.sh" "$@"
+  if (( $# == 0 )); then
+    bash "$SOURCE_DIR/scripts/install.sh" --interactive
+  else
+    bash "$SOURCE_DIR/scripts/install.sh" "$@"
+  fi
 }
 
 main() {

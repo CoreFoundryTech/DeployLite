@@ -181,12 +181,12 @@ test_parse_args_accepts_interactive_short_and_long_form() {
   local tmp runner
   tmp="$(mktemp -d)"
   runner="$(build_runner "$tmp")"
-  if ! "$runner" --interactive >/dev/null 2>&1; then
-    printf '--interactive long form was rejected\n'
+  if ! "$runner" --interactive --noop >/dev/null 2>&1; then
+    printf '%s\n' '--interactive long form was rejected'
     rm -rf "$tmp"
     return 1
   fi
-  if ! "$runner" -i >/dev/null 2>&1; then
+  if ! "$runner" -i --noop >/dev/null 2>&1; then
     printf '-i short form was rejected\n'
     rm -rf "$tmp"
     return 1
@@ -237,7 +237,7 @@ test_noninteractive_automation_mode_still_works_without_tty() {
   local tmp runner output
   tmp="$(mktemp -d)"
   runner="$(build_runner "$tmp")"
-  output="$("$runner" --noop 2>&1 || true)"
+  output="$("$runner" --noninteractive --noop 2>&1 || true)"
   assert_contains "$output" 'non-interactive' || { printf 'expected non-interactive log marker, got: %s\n' "$output"; rm -rf "$tmp"; return 1; }
   rm -rf "$tmp"
 }

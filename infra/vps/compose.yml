@@ -1,6 +1,22 @@
 name: deploylite
 
 services:
+  traefik:
+    image: traefik:v3.1
+    restart: unless-stopped
+    command:
+      - --providers.docker=true
+      - --providers.docker.exposedbydefault=false
+      - --entrypoints.web.address=:80
+      - --entrypoints.websecure.address=:443
+    ports:
+      - "80:80"
+      - "443:443"
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+      - traefik-acme:/acme
+    networks:
+      - deploylite
   postgres:
     image: postgres:16-alpine
     restart: unless-stopped
@@ -50,13 +66,18 @@ services:
       DEPLOYLITE_API_HOST: 0.0.0.0
       DEPLOYLITE_API_PORT: 3001
       DEPLOYLITE_API_URL: http://api:3001
-      DEPLOYLITE_CORS_ORIGIN: ${DEPLOYLITE_PUBLIC_WEB_ORIGIN:?DEPLOYLITE_PUBLIC_WEB_ORIGIN is required}
+      DEPLOYLITE_CORS_ORIGIN: ${DEPLOYLITE_PUBLIC_WEB_ORIGIN:-http://deploylite.com}
+      DEPLOYLITE_SECRET_KEY: ${DEPLOYLITE_SECRET_KEY:?DEPLOYLITE_SECRET_KEY is required}
       DEPLOYLITE_SESSION_TTL_SECONDS: ${DEPLOYLITE_SESSION_TTL_SECONDS:-28800}
       DEPLOYLITE_SESSION_COOKIE_NAME: ${DEPLOYLITE_SESSION_COOKIE_NAME:-deploylite_session}
       DEPLOYLITE_SESSION_COOKIE_SECURE: ${DEPLOYLITE_SESSION_COOKIE_SECURE:-false}
       DEPLOYLITE_BCRYPT_COST: ${DEPLOYLITE_BCRYPT_COST:-12}
-    ports:
-      - "3001:3001"
+    labels:
+      - traefik.enable=true
+      - traefik.http.routers.deploylite-api.rule=Host(`${DEPLOYLITE_DOMAIN:-deploylite.com}`) && PathPrefix(`/api`)
+      - traefik.http.routers.deploylite-api.entrypoints=web
+      - traefik.http.routers.deploylite-api.priority=100
+      - traefik.http.services.deploylite-api.loadbalancer.server.port=3001
     networks:
       - deploylite
     healthcheck:
@@ -76,10 +97,11 @@ services:
         condition: service_healthy
     environment:
       NODE_ENV: production
-      DEPLOYLITE_WEB_API_BASE_URL: ${DEPLOYLITE_PUBLIC_API_ORIGIN:?DEPLOYLITE_PUBLIC_API_ORIGIN is required}
-      NEXT_PUBLIC_DEPLOYLITE_API_URL: ${DEPLOYLITE_PUBLIC_API_ORIGIN:?DEPLOYLITE_PUBLIC_API_ORIGIN is required}
-    ports:
-      - "80:3000"
+    labels:
+      - traefik.enable=true
+      - traefik.http.routers.deploylite-web.rule=Host(`${DEPLOYLITE_DOMAIN:-deploylite.com}`)
+      - traefik.http.routers.deploylite-web.entrypoints=web
+      - traefik.http.services.deploylite-web.loadbalancer.server.port=3000
     networks:
       - deploylite
     healthcheck:
@@ -90,6 +112,7 @@ services:
 
 volumes:
   postgres-data:
+  traefik-acme:
 
 networks:
   deploylite:

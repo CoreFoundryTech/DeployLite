@@ -1,0 +1,25 @@
+services:
+  traefik:
+    command:
+      - --providers.docker=true
+      - --providers.docker.exposedbydefault=false
+      - --entrypoints.web.address=:80
+      - --entrypoints.websecure.address=:443
+      - --certificatesresolvers.letsencrypt.acme.email=${DEPLOYLITE_ACME_EMAIL:?DEPLOYLITE_ACME_EMAIL is required for TLS}
+      - --certificatesresolvers.letsencrypt.acme.storage=/acme/acme.json
+      - --certificatesresolvers.letsencrypt.acme.httpchallenge.entrypoint=web
+
+  api:
+    labels:
+      - traefik.http.routers.deploylite-api-tls.rule=Host(`${DEPLOYLITE_DOMAIN:-deploylite.com}`) && PathPrefix(`/api`)
+      - traefik.http.routers.deploylite-api-tls.entrypoints=websecure
+      - traefik.http.routers.deploylite-api-tls.tls=true
+      - traefik.http.routers.deploylite-api-tls.tls.certresolver=letsencrypt
+      - traefik.http.routers.deploylite-api-tls.priority=100
+
+  web:
+    labels:
+      - traefik.http.routers.deploylite-web-tls.rule=Host(`${DEPLOYLITE_DOMAIN:-deploylite.com}`)
+      - traefik.http.routers.deploylite-web-tls.entrypoints=websecure
+      - traefik.http.routers.deploylite-web-tls.tls=true
+      - traefik.http.routers.deploylite-web-tls.tls.certresolver=letsencrypt
