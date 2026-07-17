@@ -527,7 +527,7 @@ class InMemoryControlDeleteRepository implements ControlDeleteRepository {
     const confirmationBefore = stored ? structuredClone(stored) : null;
     const commandBefore = current ? structuredClone(current) : null;
     const outcome = await this.consume(command, confirmation);
-    if (!outcome.accepted || outcome.command.status === "completed") return { ...outcome, removed: outcome.command.status === "completed", auditRecorded: false, alreadyCompleted: outcome.command.status === "completed" };
+    if (!outcome.accepted || outcome.command.status === "completed") return { ...outcome, removed: outcome.command.status === "completed", auditRecorded: outcome.command.status === "completed", alreadyCompleted: outcome.command.status === "completed" };
     try {
       if (!await this.projects.remove(projectId)) throw new Error("Project was not found for confirmed deletion");
       const completed = await this.complete(outcome.command);
