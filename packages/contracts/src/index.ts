@@ -178,10 +178,29 @@ export const runtimeConfigurationSchema = z.object({
   runtimeSecretConfigured: z.boolean()
 });
 
+export const runtimeActivationProfileSchema = z.enum(["runtime"]);
+export const runtimeActivationActionSchema = z.enum(["apply"]);
+export const runtimeActivationStatusSchema = z.enum(["capability_unavailable", "queued", "succeeded", "failed"]);
+
+// This is intentionally a closed command, not a remote shell interface. The
+// configuration reference is opaque to the API consumer and never contains a secret.
+export const runtimeActivationCommandSchema = z.object({
+  commandId: idSchema,
+  correlationId: idSchema,
+  idempotencyKey: idSchema,
+  projectId: idSchema,
+  configurationRef: idSchema,
+  domain: hostnameSchema,
+  profile: runtimeActivationProfileSchema,
+  action: runtimeActivationActionSchema
+}).strict();
+
 export const runtimeActivationSchema = z.object({
   id: idSchema,
-  status: z.literal("capability_unavailable"),
-  capability: z.literal("safe_runtime_executor")
+  commandId: idSchema,
+  status: runtimeActivationStatusSchema,
+  capability: z.literal("safe_runtime_executor"),
+  output: z.string().max(8_192).nullable()
 });
 
 export const deployRequestSchema = z.object({
@@ -236,6 +255,7 @@ export type EnvSecretValueWriteRequest = z.infer<typeof envSecretValueWriteReque
 export type EnvSecretValueDeleteRequest = z.infer<typeof envSecretValueDeleteRequestSchema>;
 export type RuntimeConfiguration = z.infer<typeof runtimeConfigurationSchema>;
 export type RuntimeConfigurationWriteRequest = z.infer<typeof runtimeConfigurationWriteRequestSchema>;
+export type RuntimeActivationCommand = z.infer<typeof runtimeActivationCommandSchema>;
 export type RuntimeActivation = z.infer<typeof runtimeActivationSchema>;
 export type DeployRequest = z.infer<typeof deployRequestSchema>;
 export type ScaffoldUser = z.infer<typeof scaffoldUserSchema>;

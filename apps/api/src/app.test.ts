@@ -1054,14 +1054,39 @@ describe("DeployLite API scaffold", () => {
 
     const first = await app.inject({ method: "POST", url: "/api/v1/projects/project_mock_1/runtime-activation", headers: { ...contentHeaders, cookie }, payload: {} });
     const second = await app.inject({ method: "POST", url: "/api/v1/projects/project_mock_1/runtime-activation", headers: { ...contentHeaders, cookie }, payload: {} });
-    expect(first.json().data.activation).toMatchObject({ status: "capability_unavailable", capability: "safe_runtime_executor" });
+    expect(first.json().data.activation).toMatchObject({ status: "capability_unavailable", capability: "safe_runtime_executor", output: null });
     expect(second.json().data.activation.id).toBe(first.json().data.activation.id);
     expect(audit.events.filter((event) => event.action === "runtime.activation.requested")).toHaveLength(2);
 
     const readOnly = await authFixture({ user: { role: "read-only" } });
     const readOnlyCookie = await loginCookie(readOnly.app);
-    const denied = await readOnly.app.inject({ method: "GET", url: "/api/v1/projects/project_mock_1/runtime-configuration", headers: { cookie: readOnlyCookie } });
+    const denied = await readOnly.app.inject({ method: "POST", url: "/api/v1/projects/project_mock_1/runtime-activation", headers: { ...contentHeaders, cookie: readOnlyCookie }, payload: {} });
     expect(denied.statusCode).toBe(403);
+  });
+
+  it("dispatches a closed activation command to an injected safe executor and audits the terminal result", async () => {
+    const commands: unknown[] = [];
+    const dispatcher = {
+      available: () => true,
+      async dispatch(command: { commandId: string; idempotencyKey: string; projectId: string; domain: string }) {
+        commands.push(command);
+        return { id: command.idempotencyKey, commandId: command.commandId, status: "succeeded" as const, capability: "safe_runtime_executor" as const, output: "TOKEN=dispatch-secret\nready" };
+      }
+    };
+    const { app, audit } = await authFixture({ state: { runtimeActivationDispatcher: dispatcher } });
+    const cookie = await loginCookie(app);
+    const payload = { domain: "app.example.test", acmeEmail: "ops@example.test", databasePassword: "database-password-123", runtimeSecret: "runtime-secret-value" };
+    await app.inject({ method: "PUT", url: "/api/v1/projects/project_mock_1/runtime-configuration", headers: { ...contentHeaders, cookie }, payload });
+
+    const response = await app.inject({ method: "POST", url: "/api/v1/projects/project_mock_1/runtime-activation", headers: { ...contentHeaders, cookie, "x-request-id": "req_runtime_dispatch_1" }, payload: {} });
+
+    expect(response.statusCode).toBe(200);
+    expect(response.json().data.activation).toMatchObject({ status: "succeeded", output: "TOKEN=[REDACTED]\n[REDACTED]" });
+    expect(JSON.stringify(commands)).not.toContain(payload.databasePassword);
+    expect(JSON.stringify(commands)).not.toContain(payload.runtimeSecret);
+    expect(commands[0]).toMatchObject({ profile: "runtime", action: "apply", domain: payload.domain });
+    expect(audit.inputs.map((event) => event.action)).toEqual(expect.arrayContaining(["runtime.activation.requested", "runtime.activation.dispatched", "runtime.activation.succeeded"]));
+    expect(JSON.stringify(audit.inputs)).not.toContain("dispatch-secret");
   });
 
   it("returns SECRET_KEY_UNAVAILABLE for env value writes when DEPLOYLITE_SECRET_KEY is missing or invalid", async () => {

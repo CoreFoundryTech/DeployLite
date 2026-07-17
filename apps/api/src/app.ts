@@ -1,4 +1,4 @@
-import { createAuditLogRecord, createCorrelationContext, createRequestId, parseDeployLiteEnv, type DeployLiteEnv, createEnvSecretCipher, EnvSecretKeyInvalidError, EnvSecretKeyMissingError, ENCRYPTION_KEY_VERSION, loadEnvSecretKey, type EnvSecretCipher } from "@deploylite/config";
+import { createAuditLogRecord, createCorrelationContext, createRequestId, parseDeployLiteEnv, redactSecrets, type DeployLiteEnv, createEnvSecretCipher, EnvSecretKeyInvalidError, EnvSecretKeyMissingError, ENCRYPTION_KEY_VERSION, loadEnvSecretKey, type EnvSecretCipher } from "@deploylite/config";
 import { materializeMockDeploy, redactEnvFileForLog, type EncryptedEnvRecord } from "@deploylite/agent";
 import {
   agentRegistrationSchema,
@@ -15,6 +15,7 @@ import {
   projectSchema,
   projectUpdateRequestSchema,
   runtimeActivationSchema,
+  runtimeActivationCommandSchema,
   runtimeConfigurationSchema,
   runtimeConfigurationWriteRequestSchema,
   resourceSnapshotSchema,
@@ -22,7 +23,9 @@ import {
   type Deployment,
   type EnvSecretValue,
   type EnvVariableMetadata,
-  type Project
+  type Project,
+  type RuntimeActivation,
+  type RuntimeActivationCommand
 } from "@deploylite/contracts";
 import { BcryptPasswordHasher, bootstrapInitialAdmin, closeDbPool, createDbClient, createDbPool, createOpaqueSessionToken, DbAgentRepository, DbAuditRepository, DbAuthUserRepository, DbDeploymentRepository, DbEnvSecretValueRepository, DbEnvVariableMetadataRepository, DbProjectRepository, DbSessionRepository, hashSessionToken, type DeployLiteDb } from "@deploylite/db";
 import {
@@ -435,6 +438,7 @@ type PlatformRepositoryOptions = {
   envMetadata?: EnvVariableMetadataRepository;
   envSecretValues?: EnvSecretValueRepository;
   envSecretCipher?: EnvSecretCipher;
+  runtimeActivationDispatcher?: RuntimeActivationDispatcher;
 };
 
 type PlatformRepositories = PlatformRepositoryOptions & {
@@ -443,7 +447,29 @@ type PlatformRepositories = PlatformRepositoryOptions & {
   envSecretValues: EnvSecretValueRepository;
   envSecretCipher: EnvSecretCipher;
   deployRunner: DeployRunner;
+  runtimeActivationDispatcher: RuntimeActivationDispatcher;
 };
+
+export type RuntimeActivationDispatcher = {
+  available(): boolean;
+  dispatch(command: RuntimeActivationCommand): Promise<RuntimeActivation>;
+};
+
+class UnavailableRuntimeActivationDispatcher implements RuntimeActivationDispatcher {
+  available(): boolean {
+    return false;
+  }
+
+  async dispatch(command: RuntimeActivationCommand): Promise<RuntimeActivation> {
+    return runtimeActivationSchema.parse({
+      id: command.idempotencyKey,
+      commandId: command.commandId,
+      status: "capability_unavailable",
+      capability: "safe_runtime_executor",
+      output: null
+    });
+  }
+}
 
 type EnvSecretKeySource = NodeJS.ProcessEnv | Record<string, string | number | boolean | undefined>;
 
@@ -468,9 +494,10 @@ function createApiState(env: EnvSecretKeySource, overrides: Partial<PlatformRepo
   const envMetadata = overrides.envMetadata ?? new InMemoryEnvVariableMetadataRepository();
   const envSecretValues = overrides.envSecretValues ?? new InMemoryEnvSecretValueRepository();
   const envSecretCipher = overrides.envSecretCipher ?? createLazyEnvSecretCipher(env);
+  const runtimeActivationDispatcher = overrides.runtimeActivationDispatcher ?? new UnavailableRuntimeActivationDispatcher();
   const agentStatus = new AgentStatusService(agents);
   const deployRunner = new DeployRunner(deployments, envMetadata, agentStatus, envSecretCipher);
-  return { agents, deployments, projects, envMetadata, envSecretValues, envSecretCipher, agentStatus, deployRunner };
+  return { agents, deployments, projects, envMetadata, envSecretValues, envSecretCipher, agentStatus, deployRunner, runtimeActivationDispatcher };
 }
 
 /**
@@ -779,6 +806,13 @@ function isAllowedCorsRequest(request: FastifyRequest, corsOrigin: string | null
   return Boolean(corsOrigin && getHeaderValue(request, "origin") === corsOrigin);
 }
 
+function redactRuntimeActivationOutput(output: string | null): string | null {
+  if (output === null) return null;
+  return redactSecrets(redactEnvFileForLog(output))
+    .replace(/\b(password|secret|token|authorization)\s*[:=]\s*\S+/gi, "$1=[REDACTED]")
+    .replace(/:\/\/[^\s/:]+:[^\s@]+@/g, "://[REDACTED]@");
+}
+
 const runtimeSecretKeys = {
   domain: "DEPLOYLITE_RUNTIME_DOMAIN",
   acmeEmail: "DEPLOYLITE_ACME_EMAIL",
@@ -1062,8 +1096,32 @@ function registerRoutes(app: FastifyInstance, state: PlatformRepositories, adapt
       return reply.code(409).send(errorEnvelope(request, "RUNTIME_CONFIGURATION_INCOMPLETE", "Runtime configuration is incomplete."));
     }
     const configurationFingerprint = (await state.envSecretValues.listByProject(params.projectId)).filter((value) => Object.values(runtimeSecretKeys).includes(value.key as never)).map((value) => value.valueFingerprint).sort().join(":");
-    const activation = runtimeActivationSchema.parse({ id: `runtime_${state.envSecretCipher.fingerprint(configurationFingerprint).slice(0, 24)}`, status: "capability_unavailable", capability: "safe_runtime_executor" });
-    await appendAudit(adapters.audit, request, { actorUserId: request.auth!.user.id, action: "runtime.activation.requested", targetType: "runtime", targetId: activation.id, metadata: { projectId: params.projectId, capability: activation.capability } });
+    const idempotencyKey = `runtime_${state.envSecretCipher.fingerprint(configurationFingerprint).slice(0, 24)}`;
+    const command = runtimeActivationCommandSchema.parse({
+      commandId: `runtime_command_${idempotencyKey.slice("runtime_".length)}`,
+      correlationId: request.correlationContext.correlationId,
+      idempotencyKey,
+      projectId: params.projectId,
+      configurationRef: idempotencyKey,
+      domain: configuration.domain,
+      profile: "runtime",
+      action: "apply"
+    });
+    await appendAudit(adapters.audit, request, { actorUserId: request.auth!.user.id, action: "runtime.activation.requested", targetType: "runtime", targetId: command.commandId, metadata: { projectId: params.projectId, capability: "safe_runtime_executor", commandId: command.commandId } });
+    if (state.runtimeActivationDispatcher.available()) {
+      await appendAudit(adapters.audit, request, { actorUserId: request.auth!.user.id, action: "runtime.activation.dispatched", targetType: "runtime", targetId: command.commandId, metadata: { projectId: params.projectId, commandId: command.commandId } });
+    }
+    let dispatched: RuntimeActivation;
+    try {
+      dispatched = await state.runtimeActivationDispatcher.dispatch(command);
+    } catch {
+      await appendAudit(adapters.audit, request, { actorUserId: request.auth!.user.id, action: "runtime.activation.failed", targetType: "runtime", targetId: command.commandId, metadata: { projectId: params.projectId, commandId: command.commandId, reason: "dispatch-failed" } });
+      return reply.code(502).send(errorEnvelope(request, "RUNTIME_EXECUTOR_FAILED", "Runtime executor failed."));
+    }
+    const activation = runtimeActivationSchema.parse({ ...dispatched, output: redactRuntimeActivationOutput(dispatched.output) });
+    if (activation.status === "succeeded" || activation.status === "failed") {
+      await appendAudit(adapters.audit, request, { actorUserId: request.auth!.user.id, action: `runtime.activation.${activation.status}`, targetType: "runtime", targetId: command.commandId, metadata: { projectId: params.projectId, commandId: command.commandId, status: activation.status, output: activation.output } });
+    }
     return ok(request, { activation });
   });
   app.post(`${API_PREFIX}/projects/:projectId/env-values`, { preHandler: [requireAuth, requireMutationRole] }, async (request, reply) => {
