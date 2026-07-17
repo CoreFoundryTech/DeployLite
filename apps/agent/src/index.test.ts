@@ -66,7 +66,7 @@ describe("mock agent boundary", () => {
 
 describe("materializeMockDeploy / buildDeployEnvFile", () => {
   it("round-trips an encrypted env value back to plaintext and writes it to the in-memory .env", () => {
-    const database = "postgres://user:hunter2@db.local:5432/app";
+    const database = "postgres://test_fixture_user:test_fixture_password@fixture.invalid:5432/test_fixture_database";
 
     const entry = materializeMockDeploy({
       projectId: "project_alpha",
@@ -87,8 +87,8 @@ describe("materializeMockDeploy / buildDeployEnvFile", () => {
       projectId: "project_alpha",
       agentId: "agent_mock_1",
       records: [
-        encrypted("API_KEY", "sk_test_abcdefghij"),
-        encrypted("DATABASE_URL", "postgres://u:p@h/d")
+        encrypted("API_KEY", "sk_fixture_token_abcdefghij"),
+        encrypted("DATABASE_URL", "postgres://test_fixture_user:test_fixture_password@fixture.invalid/test_fixture_database")
       ],
       cipher
     });
@@ -96,13 +96,13 @@ describe("materializeMockDeploy / buildDeployEnvFile", () => {
     // The deterministic order is by key (locale-aware) so a re-materialize
     // produces a stable byte-for-byte output. API_KEY < DATABASE_URL.
     expect(result.lines).toEqual([
-      "API_KEY=sk_test_abcdefghij",
-      "DATABASE_URL=postgres://u:p@h/d"
+      "API_KEY=sk_fixture_token_abcdefghij",
+      "DATABASE_URL=postgres://test_fixture_user:test_fixture_password@fixture.invalid/test_fixture_database"
     ]);
   });
 
   it("buildDeployEnvFile returns the rendered string and never returns the per-key plaintext as a separate field", () => {
-    const secret = "sk_test_abcdefghijklmnop";
+    const secret = "sk_fixture_token_abcdefghijklmnop";
     const built = buildDeployEnvFile([encrypted("API_KEY", secret)], cipher);
 
     expect(built.lines).toEqual([`API_KEY=${secret}`]);
@@ -120,11 +120,11 @@ describe("materializeMockDeploy / buildDeployEnvFile", () => {
   });
 
   it("refuses to materialize a deploy when the cipher cannot decrypt a row", () => {
-    const wrongCipher = createEnvSecretCipher(loadEnvSecretKey("another-deploylite-secret-key-zzz1234567890"));
+    const wrongCipher = createEnvSecretCipher(loadEnvSecretKey("test_fixture_wrong_cipher_key_zzz1234567890"));
     expect(() => materializeMockDeploy({
       projectId: "project_alpha",
       agentId: "agent_mock_1",
-      records: [encrypted("DATABASE_URL", "postgres://u:p@h/d")],
+      records: [encrypted("DATABASE_URL", "postgres://test_fixture_user:test_fixture_password@fixture.invalid/test_fixture_database")],
       cipher: wrongCipher
     })).toThrow(/Env secret encryption failed|authentication tag/i);
   });
@@ -132,11 +132,11 @@ describe("materializeMockDeploy / buildDeployEnvFile", () => {
 
 describe("redactEnvFileForLog", () => {
   it("strips every line's value, leaving only the key list, so logs never echo plaintext", () => {
-    const rendered = `DATABASE_URL=postgres://u:p@h/d\nAPI_KEY=sk_test_abcdefghijklmnop`;
+    const rendered = `DATABASE_URL=postgres://test_fixture_user:test_fixture_password@fixture.invalid/test_fixture_database\nAPI_KEY=sk_fixture_token_abcdefghijklmnop`;
     const redacted = redactEnvFileForLog(rendered);
 
-    expect(redacted).not.toContain("postgres://u:p@h/d");
-    expect(redacted).not.toContain("sk_test_abcdefghijklmnop");
+    expect(redacted).not.toContain("postgres://test_fixture_user:test_fixture_password@fixture.invalid/test_fixture_database");
+    expect(redacted).not.toContain("sk_fixture_token_abcdefghijklmnop");
     // Keys stay visible so the operator can confirm what was wired up.
     expect(redacted).toContain("DATABASE_URL");
     expect(redacted).toContain("API_KEY");
@@ -153,7 +153,7 @@ describe("redactEnvFileForLog", () => {
     // The first `=` splits the line. The key is kept; everything after
     // becomes [REDACTED]. Any token-shaped value after the first `=` is
     // scrubbed.
-    const sample = "user=alice; token=sk_test_abcdef0123456789";
+    const sample = "user=alice; token=sk_fixture_token_abcdef0123456789";
     const redacted = redactEnvFileForLog(sample);
     expect(redacted).toBe("user=[REDACTED]");
   });
@@ -169,7 +169,7 @@ describe("redactEnvFileForLog", () => {
       "MIIEvAIBADANBgkqhkiG9w0BAQEFAASCBKYwggSiAgEAAoIBAQ",
       "Cj4x3p7cQ4y2VCHl8pF8n6fL3T2gUw0c1A2b3C4d5E6F7G8H9I0J1K2L3M4N5O6",
       "-----END PRIVATE KEY-----",
-      "API_KEY=sk_test_abcdefghijklmnop"
+      "API_KEY=sk_fixture_token_abcdefghijklmnop"
     ].join("\n");
 
     const redacted = redactEnvFileForLog(rendered);
@@ -226,7 +226,7 @@ describe("redactEnvFileForLog", () => {
     // through to the platform's pattern-based scrubber. This keeps
     // comments and stray log lines readable while guaranteeing that
     // continuation chunks of a secret value are dropped entirely.
-    const rendered = "user=alice\n# next: rotate TOKEN sk_test_abcdefghijklmnop every 30d";
+    const rendered = "user=alice\n# next: rotate TOKEN sk_fixture_token_abcdefghijklmnop every 30d";
     const redacted = redactEnvFileForLog(rendered);
     // The KEY= line is fully redacted; the comment line keeps its
     // structure but the token-shaped substring is replaced.
@@ -237,7 +237,7 @@ describe("redactEnvFileForLog", () => {
 describe("EnvMaterializedEntry shape", () => {
   it("never exposes decrypted values as a structured field — only the rendered .env string", () => {
     const records: Parameters<typeof buildDeployEnvFile>[0] = [
-      encrypted("API_KEY", "sk_test_abcdefghijklmnop")
+      encrypted("API_KEY", "sk_fixture_token_abcdefghijklmnop")
     ];
     const built = buildDeployEnvFile(records, cipher);
     const asRecord: Record<string, unknown> = built as unknown as Record<string, unknown>;
@@ -248,7 +248,7 @@ describe("EnvMaterializedEntry shape", () => {
     const entry = materializeMockDeploy({
       projectId: "project_alpha",
       agentId: "agent_mock_1",
-      records: [encrypted("API_KEY", "sk_test_abcdefghij")],
+      records: [encrypted("API_KEY", "sk_fixture_token_abcdefghij")],
       cipher
     });
     expect(entry.projectId).toBe("project_alpha");

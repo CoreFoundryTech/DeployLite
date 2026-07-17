@@ -17,8 +17,9 @@ import { describe, expect, it } from "vitest";
 import { buildApiApp, createRuntimeRepositories, InMemoryAuditRepository, InMemoryAuthUserRepository, InMemorySessionRepository } from "./app.js";
 
 const contentHeaders = { "content-type": "application/json" };
-const password = "correct horse battery staple";
-const testEnvSecretKey = "deploylite-test-env-secret-key-1234567890";
+const password = "test_fixture_password_primary";
+const testEnvSecretKey = "test_fixture_env_secret_key_1234567890";
+const testDatabaseUrl = "postgres://test_fixture_user:test_fixture_password@localhost:5432/test_fixture_database";
 const testEnvSecretCipher = createEnvSecretCipher(loadEnvSecretKey(testEnvSecretKey));
 const testEnv: NodeJS.ProcessEnv = { ...process.env, DEPLOYLITE_SECRET_KEY: testEnvSecretKey };
 
@@ -70,7 +71,7 @@ async function authFixture(options: AuthFixtureOptions = {}) {
     authConfig: { cookieName: "dl_test_session", cookieSecure: false, sessionTtlSeconds: 3600 },
     db: options.dbMode ? { pool: {} as never, client: {} as never } : undefined,
     env: options.env ?? (options.dbMode
-      ? { ...testEnv, NODE_ENV: "test", DATABASE_URL: "postgres://user:pass@localhost:5432/deploylite" }
+      ? { ...testEnv, NODE_ENV: "test", DATABASE_URL: testDatabaseUrl }
       : testEnv),
     state
   });
@@ -199,7 +200,7 @@ describe("DeployLite API scaffold", () => {
 
   it("selects DB auth repositories when DATABASE_URL is configured", async () => {
     const repositories = await createRuntimeRepositories(
-      { NODE_ENV: "test", DEPLOYLITE_API_URL: "http://localhost:3001", DEPLOYLITE_API_HOST: "127.0.0.1", DEPLOYLITE_API_PORT: 3001, DATABASE_URL: "postgres://user:pass@localhost:5432/deploylite", DEPLOYLITE_SECRET_KEY: testEnvSecretKey, DEPLOYLITE_SESSION_TTL_SECONDS: 3600, DEPLOYLITE_SESSION_COOKIE_NAME: "dl_test_session", DEPLOYLITE_BCRYPT_COST: 10, DEPLOYLITE_CONTROL_PLANE_CONFIRMED_DELETE: false },
+      { NODE_ENV: "test", DEPLOYLITE_API_URL: "http://localhost:3001", DEPLOYLITE_API_HOST: "127.0.0.1", DEPLOYLITE_API_PORT: 3001, DATABASE_URL: testDatabaseUrl, DEPLOYLITE_SECRET_KEY: testEnvSecretKey, DEPLOYLITE_SESSION_TTL_SECONDS: 3600, DEPLOYLITE_SESSION_COOKIE_NAME: "dl_test_session", DEPLOYLITE_BCRYPT_COST: 10, DEPLOYLITE_CONTROL_PLANE_CONFIRMED_DELETE: false },
       { db: { pool: {} as never, client: {} as never } }
     );
 
@@ -210,7 +211,7 @@ describe("DeployLite API scaffold", () => {
   it("closes owned DB pools when the app closes", async () => {
     let closed = false;
     const app = await buildApiApp({
-      env: { ...process.env, NODE_ENV: "test", DATABASE_URL: "postgres://user:pass@localhost:5432/deploylite" },
+      env: { ...process.env, NODE_ENV: "test", DATABASE_URL: testDatabaseUrl },
       db: {
         createPool: () => ({}) as never,
         client: {} as never,
@@ -230,11 +231,11 @@ describe("DeployLite API scaffold", () => {
     const users = new InMemoryAuthUserRepository();
     const app = await buildApiApp({
       auth: { audit, users, sessions: new InMemorySessionRepository(), hasher: new BcryptPasswordHasher(10) },
-      env: { ...process.env, NODE_ENV: "test", DATABASE_URL: "postgres://user:pass@localhost:5432/deploylite" },
+      env: { ...process.env, NODE_ENV: "test", DATABASE_URL: testDatabaseUrl },
       db: { pool: {} as never, client: {} as never }
     });
 
-    const login = await app.inject({ method: "POST", url: "/api/v1/auth/login", headers: contentHeaders, payload: { email: "admin@example.test", password: "deploylite-admin-password" } });
+    const login = await app.inject({ method: "POST", url: "/api/v1/auth/login", headers: contentHeaders, payload: { email: "admin@example.test", password: "test_fixture_db_admin_password" } });
     const projects = await app.inject({ method: "GET", url: "/api/v1/projects" });
 
     expect(login.statusCode).toBe(401);
@@ -257,7 +258,7 @@ describe("DeployLite API scaffold", () => {
     expect(before.statusCode).toBe(200);
     expect(before.json().data).toEqual({ setupRequired: true });
 
-    const created = await app.inject({ method: "POST", url: "/api/v1/bootstrap/initial-admin", headers: contentHeaders, payload: { email: "first@example.test", password: "long-enough-password" } });
+    const created = await app.inject({ method: "POST", url: "/api/v1/bootstrap/initial-admin", headers: contentHeaders, payload: { email: "first@example.test", password: "test_fixture_bootstrap_password" } });
     expect(created.statusCode).toBe(200);
 
     const after = await app.inject({ method: "GET", url: "/api/v1/bootstrap/status" });
@@ -270,7 +271,7 @@ describe("DeployLite API scaffold", () => {
   it("creates the first admin and records an audit event", async () => {
     const audit = new InMemoryAuditRepository();
     const app = await buildApiApp({ auth: { audit, users: new InMemoryAuthUserRepository() } });
-    const response = await app.inject({ method: "POST", url: "/api/v1/bootstrap/initial-admin", headers: { ...contentHeaders, "x-request-id": "req_bootstrap_1" }, payload: { email: "first@example.test", password: "long-enough-password" } });
+    const response = await app.inject({ method: "POST", url: "/api/v1/bootstrap/initial-admin", headers: { ...contentHeaders, "x-request-id": "req_bootstrap_1" }, payload: { email: "first@example.test", password: "test_fixture_bootstrap_password" } });
 
     expect(response.statusCode).toBe(200);
     expect(response.json().data.user).toEqual(expect.objectContaining({ email: "first@example.test", role: "admin", status: "active" }));
@@ -280,7 +281,7 @@ describe("DeployLite API scaffold", () => {
   it("records the first-owner bootstrap audit with an anonymous actor", async () => {
     const audit = new InMemoryAuditRepository();
     const app = await buildApiApp({ auth: { audit, users: new InMemoryAuthUserRepository() } });
-    const response = await app.inject({ method: "POST", url: "/api/v1/bootstrap/initial-admin", headers: { ...contentHeaders, "x-request-id": "req_bootstrap_anon_1" }, payload: { email: "first@example.test", password: "long-enough-password" } });
+    const response = await app.inject({ method: "POST", url: "/api/v1/bootstrap/initial-admin", headers: { ...contentHeaders, "x-request-id": "req_bootstrap_anon_1" }, payload: { email: "first@example.test", password: "test_fixture_bootstrap_password" } });
 
     expect(response.statusCode).toBe(200);
     const created = audit.events.find((event) => event.action === "bootstrap.initial-admin" && event.requestId === "req_bootstrap_anon_1");
@@ -301,7 +302,7 @@ describe("DeployLite API scaffold", () => {
 
   it("rejects bootstrap after setup is locked and audits the rejection", async () => {
     const { app, audit } = await authFixture();
-    const response = await app.inject({ method: "POST", url: "/api/v1/bootstrap/initial-admin", headers: contentHeaders, payload: { email: "second@example.test", password: "long-enough-password" } });
+    const response = await app.inject({ method: "POST", url: "/api/v1/bootstrap/initial-admin", headers: contentHeaders, payload: { email: "second@example.test", password: "test_fixture_bootstrap_password" } });
 
     expect(response.statusCode).toBe(409);
     expect(audit.inputs.some((event) => event.action === "bootstrap.initial-admin.rejected" && event.metadata?.["reason"] === "locked")).toBe(true);
@@ -309,7 +310,7 @@ describe("DeployLite API scaffold", () => {
 
   it("never persists the submitted password in bootstrap audit metadata", async () => {
     const audit = new InMemoryAuditRepository();
-    const submitted = "first-owner-very-secret-password-123";
+    const submitted = "test_fixture_bootstrap_secret_marker";
     const users = new InMemoryAuthUserRepository();
 
     const created = await buildApiApp({ auth: { audit, users, hasher: new BcryptPasswordHasher(10) } });
@@ -356,8 +357,8 @@ describe("DeployLite API scaffold", () => {
     const app = await buildApiApp({ auth: { audit, users, hasher: new BcryptPasswordHasher(10) } });
 
     const [first, second] = await Promise.all([
-      app.inject({ method: "POST", url: "/api/v1/bootstrap/initial-admin", headers: contentHeaders, payload: { email: "first@example.test", password: "long-enough-password" } }),
-      app.inject({ method: "POST", url: "/api/v1/bootstrap/initial-admin", headers: contentHeaders, payload: { email: "second@example.test", password: "long-enough-password" } })
+      app.inject({ method: "POST", url: "/api/v1/bootstrap/initial-admin", headers: contentHeaders, payload: { email: "first@example.test", password: "test_fixture_bootstrap_password" } }),
+      app.inject({ method: "POST", url: "/api/v1/bootstrap/initial-admin", headers: contentHeaders, payload: { email: "second@example.test", password: "test_fixture_bootstrap_password" } })
     ]);
 
     expect([first.statusCode, second.statusCode].sort()).toEqual([200, 409]);
@@ -1070,7 +1071,7 @@ describe("DeployLite API scaffold", () => {
   it("stores an env secret value as encrypted ciphertext, returns only the valueFingerprint, and audits the write without leaking the raw value", async () => {
     const { app, audit } = await authFixture();
     const cookie = await loginCookie(app);
-    const rawValue = "super-secret-token-abcdef1234567890";
+    const rawValue = "fixture_token_raw_marker_abcdef1234567890";
 
     const project = (await app.inject({
       method: "POST",
@@ -1141,7 +1142,7 @@ describe("DeployLite API scaffold", () => {
         method: "POST",
         url: `/api/v1/projects/${project.id}/env-values`,
         headers: { ...contentHeaders, cookie, "x-request-id": `req_secret_key_${name}` },
-        payload: { key: "API_KEY", value: "must-not-persist" }
+        payload: { key: "API_KEY", value: "fixture_secret_must_not_persist" }
       });
 
       expect(write.statusCode).toBe(503);
@@ -1155,7 +1156,7 @@ describe("DeployLite API scaffold", () => {
 
       const rejectedAudit = audit.inputs.find((event) => event.action === "project.env-value.upsert.rejected" && event.requestId === `req_secret_key_${name}`);
       expect(rejectedAudit?.metadata).toMatchObject({ reason: "secret-key-unavailable" });
-      expect(JSON.stringify(rejectedAudit?.metadata ?? {})).not.toContain("must-not-persist");
+      expect(JSON.stringify(rejectedAudit?.metadata ?? {})).not.toContain("fixture_secret_must_not_persist");
     }
   });
 
@@ -1173,7 +1174,7 @@ describe("DeployLite API scaffold", () => {
       method: "POST",
       url: `/api/v1/projects/${project.id}/env-values`,
       headers: { ...contentHeaders, cookie },
-      payload: { key: "API_KEY", value: "token-1" }
+      payload: { key: "API_KEY", value: "fixture_token_1" }
     });
     const fingerprint = write.json().data.envValue.valueFingerprint;
 
@@ -1197,7 +1198,7 @@ describe("DeployLite API scaffold", () => {
       method: "POST",
       url: `/api/v1/projects/${project.id}/env-values`,
       headers: { ...contentHeaders, cookie },
-      payload: { key: "API_KEY", value: "token-1" }
+      payload: { key: "API_KEY", value: "fixture_token_1" }
     });
     expect(write.statusCode).toBe(200);
     const fingerprint = write.json().data.envValue.valueFingerprint;
@@ -1243,7 +1244,7 @@ describe("DeployLite API scaffold", () => {
       method: "POST",
       url: `/api/v1/projects/${project.id}/env-values`,
       headers: { ...contentHeaders, cookie },
-      payload: { key: "API_KEY", value: "token-1" }
+      payload: { key: "API_KEY", value: "fixture_token_1" }
     });
     expect(write.statusCode).toBe(200);
 
@@ -1266,13 +1267,13 @@ describe("DeployLite API scaffold", () => {
       method: "POST",
       url: `/api/v1/projects/${project.id}/env-values`,
       headers: { ...contentHeaders, cookie },
-      payload: { key: "API_KEY", value: "first-secret" }
+      payload: { key: "API_KEY", value: "fixture_secret_first" }
     });
     const second = await app.inject({
       method: "POST",
       url: `/api/v1/projects/${project.id}/env-values`,
       headers: { ...contentHeaders, cookie },
-      payload: { key: "API_KEY", value: "second-secret" }
+      payload: { key: "API_KEY", value: "fixture_secret_second" }
     });
     expect(first.statusCode).toBe(200);
     expect(second.statusCode).toBe(200);
@@ -1298,7 +1299,7 @@ describe("DeployLite API scaffold", () => {
       method: "POST",
       url: `/api/v1/projects/${project.id}/env-values`,
       headers: { ...contentHeaders, cookie },
-      payload: { key: "API_KEY", value: "deletable-secret-987654321" }
+      payload: { key: "API_KEY", value: "fixture_secret_deletable_987654321" }
     });
 
     const remove = await app.inject({
@@ -1318,7 +1319,7 @@ describe("DeployLite API scaffold", () => {
 
     const deleteAudit = audit.inputs.find((event) => event.action === "project.env-value.delete" && event.requestId === "req_envv_delete_1");
     expect(deleteAudit).toBeDefined();
-    expect(JSON.stringify(deleteAudit?.metadata ?? {})).not.toContain("deletable-secret-987654321");
+    expect(JSON.stringify(deleteAudit?.metadata ?? {})).not.toContain("fixture_secret_deletable_987654321");
   });
 
   it("preserves existing env metadata policy fields when a secret value is deleted", async () => {
@@ -1648,15 +1649,15 @@ describe("DeployLite API scaffold", () => {
 
     it("denies read-only callers because audit events are operator/admin scoped", async () => {
       const users = new InMemoryAuthUserRepository([
-        { id: "user_readonly_1", email: "reader@example.test", emailNormalized: "reader@example.test", passwordHash: "x", role: "read-only", status: "active", createdAt: new Date(), updatedAt: new Date() }
+        { id: "user_readonly_1", email: "reader@example.test", emailNormalized: "reader@example.test", passwordHash: "test_fixture_password_stub", role: "read-only", status: "active", createdAt: new Date(), updatedAt: new Date() }
       ]);
-      // Stub the hasher so the password "x" validates against the in-memory
+      // Stub the hasher so the fixture password validates against the in-memory
       // user record without needing a real bcrypt roundtrip here.
       const { default: _ignored } = { default: null } as never;
       void _ignored;
       const hasher = {
-        hash: async () => "x",
-        verify: async (password: string, hash: string) => password === "x" && hash === "x"
+        hash: async () => "test_fixture_password_stub",
+        verify: async (password: string, hash: string) => password === "test_fixture_password_stub" && hash === "test_fixture_password_stub"
       } as unknown as BcryptPasswordHasher;
       const audit = new InMemoryAuditRepository();
       const sessions = new InMemorySessionRepository();
@@ -1665,7 +1666,7 @@ describe("DeployLite API scaffold", () => {
         authConfig: { cookieName: "dl_test_session", cookieSecure: false, sessionTtlSeconds: 3600 },
         env: testEnv
       });
-      const login = await app.inject({ method: "POST", url: "/api/v1/auth/login", headers: contentHeaders, payload: { email: "reader@example.test", password: "x" } });
+      const login = await app.inject({ method: "POST", url: "/api/v1/auth/login", headers: contentHeaders, payload: { email: "reader@example.test", password: "test_fixture_password_stub" } });
       const cookie = login.headers["set-cookie"] as string;
       const list = await app.inject({ method: "GET", url: "/api/v1/audit-events", headers: { cookie } });
       expect(list.statusCode).toBe(403);

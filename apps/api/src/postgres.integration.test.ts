@@ -7,11 +7,11 @@ import { afterAll, beforeAll, describe, expect, it } from "vitest";
 
 import { buildApiApp } from "./app.js";
 
-const localDatabaseUrl = "postgres://deploylite:deploylite@localhost:55433/deploylite";
+const localDatabaseUrl = "postgres://test_fixture_user:test_fixture_password@localhost:55433/test_fixture_database";
 const integrationEnabled = process.env.DEPLOYLITE_API_POSTGRES_INTEGRATION === "1";
 const describeIntegration = integrationEnabled ? describe : describe.skip;
 const contentHeaders = { "content-type": "application/json" };
-const adminPassword = "correct horse battery staple";
+const adminPassword = "test_fixture_admin_password";
 
 let maintenancePool: ReturnType<typeof createDbPool> | null = null;
 let pool: ReturnType<typeof createDbPool> | null = null;
@@ -118,7 +118,7 @@ describeIntegration("DeployLite API PostgreSQL integration", () => {
       deploymentId,
       sequence: 1,
       level: "info",
-      message: "PostgreSQL integration log token dl_1234567890abcdef should be redacted",
+      message: "PostgreSQL integration log token dl_fixture_token_1234567890abcdef should be redacted",
       timestamp: new Date().toISOString(),
       redactionApplied: false,
       requestId: "req_api_pg_integration",
@@ -143,7 +143,7 @@ describeIntegration("DeployLite API PostgreSQL integration", () => {
     expect(logs.json().data.events).toEqual([
       expect.objectContaining({ deploymentId, sequence: 1, message: expect.stringContaining("[REDACTED]"), redactionApplied: true })
     ]);
-    expect(JSON.stringify(logs.json())).not.toContain("dl_1234567890abcdef");
+    expect(JSON.stringify(logs.json())).not.toContain("dl_fixture_token_1234567890abcdef");
 
     const logout = await restartedApp.inject({ method: "POST", url: "/api/v1/auth/logout", headers: { cookie } });
     expect(logout.statusCode).toBe(200);

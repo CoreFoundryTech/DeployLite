@@ -61,7 +61,7 @@ describe("contracts", () => {
   });
 
   it("validates initial admin bootstrap payloads", () => {
-    expect(bootstrapInitialAdminRequestSchema.safeParse({ email: "admin@example.test", password: "long-enough-password" }).success).toBe(true);
+    expect(bootstrapInitialAdminRequestSchema.safeParse({ email: "admin@example.test", password: "test_fixture_bootstrap_password" }).success).toBe(true);
     expect(bootstrapInitialAdminRequestSchema.safeParse({ email: "not-email", password: "short" }).success).toBe(false);
   });
 
@@ -166,12 +166,12 @@ describe("contracts", () => {
     const parsed = envSecretValueWriteRequestSchema.parse({
       key: "DATABASE_URL",
       scope: "project",
-      value: "postgres://user:pass@db:5432/app"
+      value: "postgres://test_fixture_user:test_fixture_password@fixture.invalid:5432/test_fixture_database"
     });
     expect(parsed).toEqual({
       key: "DATABASE_URL",
       scope: "project",
-      value: "postgres://user:pass@db:5432/app"
+      value: "postgres://test_fixture_user:test_fixture_password@fixture.invalid:5432/test_fixture_database"
     });
   });
 

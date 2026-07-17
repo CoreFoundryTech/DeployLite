@@ -13,7 +13,7 @@ import { IdempotencyConflictError, createConfirmation, createControlCommand, dig
 
 const { Client } = pg;
 
-const localDatabaseUrl = "postgres://deploylite:deploylite@localhost:55433/deploylite";
+const localDatabaseUrl = "postgres://test_fixture_user:test_fixture_password@localhost:55433/test_fixture_database";
 const integrationEnabled = process.env.DEPLOYLITE_DB_INTEGRATION === "1";
 const describeIntegration = integrationEnabled ? describe : describe.skip;
 

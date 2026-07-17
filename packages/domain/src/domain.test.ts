@@ -51,7 +51,7 @@ describe("domain foundation", () => {
       deploymentId: "dep_1",
       sequence: 1,
       level: "info",
-      message: "deployed with token dl_1234567890abcdef",
+      message: "deployed with token dl_fixture_token_1234567890abcdef",
       timestamp: now.toISOString(),
       redactionApplied: false,
       requestId: "req_1",

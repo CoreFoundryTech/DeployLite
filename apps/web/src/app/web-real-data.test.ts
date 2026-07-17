@@ -37,7 +37,7 @@ describe("local first-admin login rendering", () => {
     expect(html).toContain("Normal sign-in stays unavailable until setup creates the first local admin");
     expect(html).toContain("Create first admin");
     expect(html).toContain('aria-label="Create first admin"');
-    expect(html).not.toContain("very-secret-admin-password");
+    expect(html).not.toContain("test_fixture_admin_password");
   });
 
   it("renders setup-complete sign-in guidance", async () => {
@@ -65,7 +65,7 @@ describe("local first-admin login rendering", () => {
 
     expect(html).toContain("Bootstrap status unavailable");
     expect(html).toContain("The local API rejected bootstrap status with status 503");
-    expect(html).not.toContain("very-secret-admin-password");
+    expect(html).not.toContain("test_fixture_admin_password");
   });
 
   it("renders authenticated dashboard guidance when a session exists", async () => {
@@ -89,7 +89,7 @@ describe("initial admin setup client interactions", () => {
     const result = await submitInitialAdminSetup({
       apiBaseUrl,
       email: "admin@example.test",
-      password: "very-secret-admin-password",
+      password: "test_fixture_admin_password",
       fetchImpl: async (url: string | URL | Request, init?: RequestInit) => {
         calls.push({ url: String(url), init });
         return new Response(JSON.stringify({ data: { user: userFixture }, error: null, requestId: "req_admin_1" }), { status: 200 });
@@ -99,26 +99,26 @@ describe("initial admin setup client interactions", () => {
     expect(result.kind).toBe("success");
     expect(result.kind === "success" && result.message).toContain("First admin created");
     expect(new URL(calls[0]?.url ?? "").pathname).toBe("/api/v1/bootstrap/initial-admin");
-    expect(JSON.stringify(result)).not.toContain("very-secret-admin-password");
+    expect(JSON.stringify(result)).not.toContain("test_fixture_admin_password");
   });
 
   it("reports validation/rejection failures without rendering submitted passwords", async () => {
     const result = await submitInitialAdminSetup({
       apiBaseUrl,
       email: "admin@example.test",
-      password: "very-secret-admin-password",
+      password: "test_fixture_admin_password",
       fetchImpl: async () => new Response(JSON.stringify({ data: null, error: { code: "VALIDATION_ERROR", message: "Invalid", correlationId: "req_invalid" }, requestId: "req_invalid" }), { status: 422 })
     });
 
     expect(result).toEqual({ kind: "rejected", error: "Initial admin setup failed. Use a valid email and a password with at least 12 characters." });
-    expect(JSON.stringify(result)).not.toContain("very-secret-admin-password");
+    expect(JSON.stringify(result)).not.toContain("test_fixture_admin_password");
   });
 
   it("reports locked setup submissions as sign-in guidance", async () => {
     const result = await submitInitialAdminSetup({
       apiBaseUrl,
       email: "admin@example.test",
-      password: "very-secret-admin-password",
+      password: "test_fixture_admin_password",
       fetchImpl: async () => new Response(JSON.stringify({ data: null, error: { code: "BOOTSTRAP_LOCKED", message: "Locked", correlationId: "req_locked" }, requestId: "req_locked" }), { status: 409 })
     });
 
@@ -160,7 +160,7 @@ describe("initial admin setup client interactions", () => {
     expect(html).toContain("Open the dashboard");
     expect(html).toContain("/dashboard");
     expect(html).toContain("aria-live=\"polite\"");
-    expect(html).not.toContain("very-secret-admin-password");
+    expect(html).not.toContain("test_fixture_admin_password");
   });
 });
 
