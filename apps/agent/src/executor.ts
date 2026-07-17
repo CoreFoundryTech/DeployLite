@@ -19,7 +19,7 @@ export type ControlledRuntimePlan = {
 
 export type RuntimeCommandRunner = {
   run(plan: ControlledRuntimePlan, options: { timeoutMs: number; signal: AbortSignal }): Promise<{ output: string }>;
-  rollback(plan: ControlledRuntimePlan): Promise<{ output: string }>;
+  rollback(plan: ControlledRuntimePlan, options: { timeoutMs: number; signal: AbortSignal }): Promise<{ output: string }>;
 };
 
 export type SafeRuntimeExecutorCapability = {
@@ -29,6 +29,17 @@ export type SafeRuntimeExecutorCapability = {
 };
 
 const DEFAULT_TIMEOUT_MS = 30_000;
+
+class RuntimeOperationTimeoutError extends Error {}
+
+function withTimeout<T>(operation: (signal: AbortSignal) => Promise<T>, timeoutMs: number): Promise<T> {
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), timeoutMs);
+  return Promise.race([
+    operation(controller.signal),
+    new Promise<never>((_, reject) => controller.signal.addEventListener("abort", () => reject(new RuntimeOperationTimeoutError()), { once: true }))
+  ]).finally(() => clearTimeout(timeout));
+}
 
 export function renderControlledRuntimePlan(input: RuntimeActivationCommand): ControlledRuntimePlan {
   const command = runtimeActivationCommandSchema.parse(input);
@@ -76,29 +87,18 @@ export class SafeRuntimeExecutor {
     }
 
     const plan = renderControlledRuntimePlan(command);
-    const controller = new AbortController();
     const timeoutMs = this.capability.timeoutMs ?? DEFAULT_TIMEOUT_MS;
-    let timedOut = false;
-    const timeout = setTimeout(() => {
-      timedOut = true;
-      controller.abort();
-    }, timeoutMs);
     try {
-      const result = await Promise.race([
-        this.capability.runner.run(plan, { timeoutMs, signal: controller.signal }),
-        new Promise<never>((_, reject) => controller.signal.addEventListener("abort", () => reject(new Error("runtime execution timed out")), { once: true }))
-      ]);
+      const result = await withTimeout((signal) => this.capability.runner!.run(plan, { timeoutMs, signal }), timeoutMs);
       return this.remember(command, "succeeded", redactRuntimeOutput(result.output));
     } catch (error) {
-      const reason = timedOut ? "Runtime execution timed out." : "Runtime execution failed.";
+      const reason = error instanceof RuntimeOperationTimeoutError ? "Runtime execution timed out." : "Runtime execution failed.";
       try {
-        const rollback = await this.capability.runner.rollback(plan);
+        const rollback = await withTimeout((signal) => this.capability.runner!.rollback(plan, { timeoutMs, signal }), timeoutMs);
         return this.remember(command, "failed", `${reason} Rollback: ${redactRuntimeOutput(rollback.output)}`);
-      } catch {
-        return this.remember(command, "failed", `${reason} Rollback failed.`);
+      } catch (rollbackError) {
+        return this.remember(command, "failed", `${reason} ${rollbackError instanceof RuntimeOperationTimeoutError ? "Rollback timed out." : "Rollback failed."}`);
       }
-    } finally {
-      clearTimeout(timeout);
     }
   }
 

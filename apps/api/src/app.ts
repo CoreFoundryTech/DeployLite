@@ -1096,7 +1096,8 @@ function registerRoutes(app: FastifyInstance, state: PlatformRepositories, adapt
       return reply.code(409).send(errorEnvelope(request, "RUNTIME_CONFIGURATION_INCOMPLETE", "Runtime configuration is incomplete."));
     }
     const configurationFingerprint = (await state.envSecretValues.listByProject(params.projectId)).filter((value) => Object.values(runtimeSecretKeys).includes(value.key as never)).map((value) => value.valueFingerprint).sort().join(":");
-    const idempotencyKey = `runtime_${state.envSecretCipher.fingerprint(configurationFingerprint).slice(0, 24)}`;
+    const activationRevision = state.envSecretCipher.fingerprint(`${params.projectId}:${configurationFingerprint}:${request.correlationContext.requestId}`);
+    const idempotencyKey = `runtime_${activationRevision.slice(0, 24)}`;
     const command = runtimeActivationCommandSchema.parse({
       commandId: `runtime_command_${idempotencyKey.slice("runtime_".length)}`,
       correlationId: request.correlationContext.correlationId,

@@ -285,6 +285,17 @@ describe("SafeRuntimeExecutor", () => {
     expect(runner.run).toHaveBeenCalledTimes(1);
   });
 
+  it("does not collide cached results across projects and permits a later activation revision", async () => {
+    const runner = { run: vi.fn().mockResolvedValue({ output: "ready" }), rollback: vi.fn() };
+    const executor = new SafeRuntimeExecutor({ available: true, runner });
+
+    await executor.execute(command);
+    await executor.execute({ ...command, projectId: "project_2", idempotencyKey: "runtime_config_2", configurationRef: "runtime_config_2" });
+    await executor.execute({ ...command, correlationId: "req_runtime_3", idempotencyKey: "runtime_config_3", configurationRef: "runtime_config_3" });
+
+    expect(runner.run).toHaveBeenCalledTimes(3);
+  });
+
   it("coalesces concurrent requests with the same idempotency key", async () => {
     let complete!: (value: { output: string }) => void;
     const runner = { run: vi.fn().mockImplementation(() => new Promise<{ output: string }>((resolve) => { complete = resolve; })), rollback: vi.fn() };
@@ -309,6 +320,27 @@ describe("SafeRuntimeExecutor", () => {
     const result = await new SafeRuntimeExecutor({ available: true, runner, timeoutMs: 5 }).execute(command);
     expect(result.status).toBe("failed");
     expect(result.output).toContain("timed out");
+    expect(runner.rollback).toHaveBeenCalledTimes(1);
+  });
+
+  it("terminates a stalled rollback, aborts it, and returns a cached terminal result", async () => {
+    let rollbackSignal: AbortSignal | undefined;
+    const runner = {
+      run: vi.fn().mockRejectedValue(new Error("failed")),
+      rollback: vi.fn().mockImplementation((_plan, options: { signal: AbortSignal }) => {
+        rollbackSignal = options.signal;
+        return new Promise(() => undefined);
+      })
+    };
+    const executor = new SafeRuntimeExecutor({ available: true, runner, timeoutMs: 5 });
+
+    const result = await executor.execute(command);
+    const replay = await executor.execute(command);
+
+    expect(result).toEqual(replay);
+    expect(result.status).toBe("failed");
+    expect(result.output).toBe("Runtime execution failed. Rollback timed out.");
+    expect(rollbackSignal?.aborted).toBe(true);
     expect(runner.rollback).toHaveBeenCalledTimes(1);
   });
 });
