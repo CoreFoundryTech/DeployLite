@@ -19,7 +19,7 @@ import { buildApiApp, createRuntimeRepositories, InMemoryAuditRepository, InMemo
 const contentHeaders = { "content-type": "application/json" };
 const password = "test_fixture_password_primary";
 const testEnvSecretKey = "test_fixture_env_secret_key_1234567890";
-const testDatabaseUrl = "postgres://test_fixture_user:test_fixture_password@localhost:5432/test_fixture_database";
+const testDatabaseUrl = "postgres://fixture.invalid/test_fixture_database";
 const testEnvSecretCipher = createEnvSecretCipher(loadEnvSecretKey(testEnvSecretKey));
 const testEnv: NodeJS.ProcessEnv = { ...process.env, DEPLOYLITE_SECRET_KEY: testEnvSecretKey };
 

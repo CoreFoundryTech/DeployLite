@@ -7,9 +7,9 @@ import { afterAll, beforeAll, describe, expect, it } from "vitest";
 
 import { buildApiApp } from "./app.js";
 
-const localDatabaseUrl = "postgres://test_fixture_user:test_fixture_password@localhost:55433/test_fixture_database";
 const integrationEnabled = process.env.DEPLOYLITE_API_POSTGRES_INTEGRATION === "1";
 const describeIntegration = integrationEnabled ? describe : describe.skip;
+const configuredDatabaseUrl = integrationEnabled ? requireIntegrationDatabaseUrl() : "";
 const contentHeaders = { "content-type": "application/json" };
 const adminPassword = "test_fixture_admin_password";
 
@@ -21,15 +21,14 @@ let databaseUrl = "";
 
 describeIntegration("DeployLite API PostgreSQL integration", () => {
   beforeAll(async () => {
-    const configuredUrl = process.env.DATABASE_URL ?? localDatabaseUrl;
     databaseName = `deploylite_api_verify_${randomUUID().replaceAll("-", "_")}`;
 
-    const maintenanceUrl = new URL(configuredUrl);
+    const maintenanceUrl = new URL(configuredDatabaseUrl);
     maintenanceUrl.pathname = "/postgres";
     maintenancePool = createDbPool(maintenanceUrl.toString(), { max: 1 });
     await maintenancePool.query(`CREATE DATABASE ${quoteIdentifier(databaseName)}`);
 
-    const testDatabaseUrl = new URL(configuredUrl);
+    const testDatabaseUrl = new URL(configuredDatabaseUrl);
     testDatabaseUrl.pathname = `/${databaseName}`;
     databaseUrl = testDatabaseUrl.toString();
 
@@ -204,6 +203,15 @@ describeIntegration("DeployLite API PostgreSQL integration", () => {
     await app.close();
   }, 30_000);
 });
+
+function requireIntegrationDatabaseUrl(): string {
+  const databaseUrl = process.env.DATABASE_URL;
+  if (!databaseUrl) {
+    throw new Error("DATABASE_URL must be set when DEPLOYLITE_API_POSTGRES_INTEGRATION=1.");
+  }
+
+  return databaseUrl;
+}
 
 async function createPostgresApp(): Promise<FastifyInstance> {
   return buildApiApp({

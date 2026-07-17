@@ -13,9 +13,9 @@ import { IdempotencyConflictError, createConfirmation, createControlCommand, dig
 
 const { Client } = pg;
 
-const localDatabaseUrl = "postgres://test_fixture_user:test_fixture_password@localhost:55433/test_fixture_database";
 const integrationEnabled = process.env.DEPLOYLITE_DB_INTEGRATION === "1";
 const describeIntegration = integrationEnabled ? describe : describe.skip;
+const configuredDatabaseUrl = integrationEnabled ? requireIntegrationDatabaseUrl() : "";
 
 let maintenanceClient: pg.Client | null = null;
 let databaseName = "";
@@ -25,16 +25,15 @@ let db: DeployLiteDb | null = null;
 
 describeIntegration("PostgreSQL auth foundation integration", () => {
   beforeAll(async () => {
-    const configuredUrl = process.env.DATABASE_URL ?? localDatabaseUrl;
     databaseName = `deploylite_verify_${randomUUID().replaceAll("-", "_")}`;
 
-    const maintenanceUrl = new URL(configuredUrl);
+    const maintenanceUrl = new URL(configuredDatabaseUrl);
     maintenanceUrl.pathname = "/postgres";
     maintenanceClient = new Client({ connectionString: maintenanceUrl.toString() });
     await maintenanceClient.connect();
     await maintenanceClient.query(`CREATE DATABASE ${quoteIdentifier(databaseName)}`);
 
-    const testDatabaseUrl = new URL(configuredUrl);
+    const testDatabaseUrl = new URL(configuredDatabaseUrl);
     testDatabaseUrl.pathname = `/${databaseName}`;
     databaseUrl = testDatabaseUrl.toString();
 
@@ -402,6 +401,15 @@ describeIntegration("PostgreSQL auth foundation integration", () => {
     }
   }, 30_000);
 });
+
+function requireIntegrationDatabaseUrl(): string {
+  const databaseUrl = process.env.DATABASE_URL;
+  if (!databaseUrl) {
+    throw new Error("DATABASE_URL must be set when DEPLOYLITE_DB_INTEGRATION=1.");
+  }
+
+  return databaseUrl;
+}
 
 function requirePool(): pg.Pool {
   if (!pool) {
