@@ -932,6 +932,35 @@ describe("DeployLite API scaffold", () => {
     expect(audit.events.some((event) => event.action === "project.delete" && event.targetId === projectId)).toBe(true);
   });
 
+  it("rolls back an in-memory confirmed delete when audit injection fails and completes on retry", async () => {
+    const { app, audit } = await authFixture({ env: { ...testEnv, DEPLOYLITE_CONTROL_PLANE_CONFIRMED_DELETE: "true" } });
+    const append = audit.append.bind(audit);
+    let failAudit = true;
+    audit.append = async (input) => {
+      if (failAudit && input.action === "project.delete") {
+        failAudit = false;
+        throw new Error("injected audit failure");
+      }
+      return append(input);
+    };
+    const cookie = await loginCookie(app);
+    const create = await app.inject({ method: "POST", url: "/api/v1/projects", headers: { ...contentHeaders, cookie }, payload: { name: "Atomic in memory", repoUrl: "https://github.com/example/atomic-in-memory", defaultBranch: "main" } });
+    const projectId = create.json().data.project.id;
+    const headers = { cookie, "x-control-idempotency-key": "atomic-in-memory-delete" };
+    const pending = await app.inject({ method: "DELETE", url: `/api/v1/projects/${projectId}`, headers });
+    const { confirmationId } = pending.json().data;
+
+    const failed = await app.inject({ method: "DELETE", url: `/api/v1/projects/${projectId}`, headers: { ...headers, "x-control-confirmation-id": confirmationId } });
+    expect(failed.statusCode).toBe(500);
+    expect(audit.events.some((event) => event.action === "project.delete" && event.targetId === projectId)).toBe(false);
+    await expect(app.inject({ method: "GET", url: `/api/v1/projects/${projectId}`, headers: { cookie } })).resolves.toMatchObject({ statusCode: 200 });
+
+    const retry = await app.inject({ method: "DELETE", url: `/api/v1/projects/${projectId}`, headers: { ...headers, "x-control-confirmation-id": confirmationId } });
+    expect(retry.statusCode).toBe(200);
+    expect(retry.json().data).toMatchObject({ removed: true, idempotent: false });
+    expect(audit.events.filter((event) => event.action === "project.delete" && event.targetId === projectId)).toHaveLength(1);
+  });
+
   it("rejects DELETE for read-only callers, missing projects, and unauthenticated requests", async () => {
     const { app, audit } = await authFixture();
     const adminCookie = await loginCookie(app);

@@ -467,7 +467,7 @@ function createLazyEnvSecretCipher(env: EnvSecretKeySource): EnvSecretCipher {
   };
 }
 
-function createApiState(env: EnvSecretKeySource, overrides: Partial<PlatformRepositoryOptions> = {}): PlatformRepositories {
+function createApiState(env: EnvSecretKeySource, overrides: Partial<PlatformRepositoryOptions> = {}, audit?: AuditRepository): PlatformRepositories {
   const agents = overrides.agents ?? new InMemoryAgentRepository();
   const deployments = overrides.deployments ?? new InMemoryDeploymentRepository();
   const projects = overrides.projects ?? new InMemoryProjectRepository();
@@ -476,7 +476,7 @@ function createApiState(env: EnvSecretKeySource, overrides: Partial<PlatformRepo
   const envSecretCipher = overrides.envSecretCipher ?? createLazyEnvSecretCipher(env);
   const agentStatus = new AgentStatusService(agents);
   const deployRunner = new DeployRunner(deployments, envMetadata, agentStatus, envSecretCipher);
-  return { agents, deployments, projects, envMetadata, envSecretValues, envSecretCipher, agentStatus, deployRunner, controlDeletes: overrides.controlDeletes ?? new InMemoryControlDeleteRepository(projects) };
+  return { agents, deployments, projects, envMetadata, envSecretValues, envSecretCipher, agentStatus, deployRunner, controlDeletes: overrides.controlDeletes ?? new InMemoryControlDeleteRepository(projects, audit ?? new InMemoryAuditRepository()) };
 }
 
 class InMemoryControlDeleteRepository implements ControlDeleteRepository {
@@ -519,14 +519,29 @@ class InMemoryControlDeleteRepository implements ControlDeleteRepository {
     return structuredClone(current);
   }
 
-  async executeConfirmedProjectDelete({ command, confirmation, projectId }: Parameters<ControlDeleteRepository["executeConfirmedProjectDelete"]>[0]) {
+  async executeConfirmedProjectDelete({ command, confirmation, projectId, requestId }: Parameters<ControlDeleteRepository["executeConfirmedProjectDelete"]>[0]) {
+    const project = await this.projects.findById(projectId);
+    if (!project) throw new Error("Project was not found for confirmed deletion");
+    const stored = this.#confirmations.get(confirmation.id);
+    const current = [...this.#commands.values()].find((candidate) => candidate.id === command.id);
+    const confirmationBefore = stored ? structuredClone(stored) : null;
+    const commandBefore = current ? structuredClone(current) : null;
     const outcome = await this.consume(command, confirmation);
     if (!outcome.accepted || outcome.command.status === "completed") return { ...outcome, removed: outcome.command.status === "completed", auditRecorded: false, alreadyCompleted: outcome.command.status === "completed" };
-    if (!await this.projects.remove(projectId)) throw new Error("Project was not found for confirmed deletion");
-    return { command: await this.complete(outcome.command), accepted: true, reason: null, removed: true, auditRecorded: false, alreadyCompleted: false };
+    try {
+      if (!await this.projects.remove(projectId)) throw new Error("Project was not found for confirmed deletion");
+      const completed = await this.complete(outcome.command);
+      await this.audit.append({ actorUserId: command.actorId, action: "project.delete", targetType: "project", targetId: projectId, requestId, correlationId: command.correlationId, metadata: { commandId: command.id, confirmationId: confirmation.id } });
+      return { command: completed, accepted: true, reason: null, removed: true, auditRecorded: true, alreadyCompleted: false };
+    } catch (error) {
+      if (confirmationBefore) this.#confirmations.set(confirmation.id, confirmationBefore);
+      if (commandBefore && current) Object.assign(current, commandBefore);
+      await this.projects.save(project);
+      throw error;
+    }
   }
 
-  constructor(private readonly projects: ProjectRepository) {}
+  constructor(private readonly projects: ProjectRepository, private readonly audit: AuditRepository) {}
 }
 
 /**
@@ -743,10 +758,11 @@ async function createRuntimeRepositories(env: DeployLiteEnv, options: BuildApiAp
     return { ...repositories, auth: { ...repositories.auth, ...options.auth } };
   }
 
+  const auth = { ...(await createSeededInMemoryAuthAdapters(env)), ...options.auth };
   return {
-    auth: { ...(await createSeededInMemoryAuthAdapters(env)), ...options.auth },
+    auth,
     shouldSeedMockData: true,
-    state: createApiState(env, options.state)
+    state: createApiState(env, options.state, auth.audit)
   };
 }
 
