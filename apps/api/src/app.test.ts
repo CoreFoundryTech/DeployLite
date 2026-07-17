@@ -1042,6 +1042,28 @@ describe("DeployLite API scaffold", () => {
     expect(JSON.stringify(list.json())).not.toContain(rawValue);
   });
 
+  it("stores runtime configuration encrypted, redacts operational values, restricts it to admins, and records an idempotent unavailable activation", async () => {
+    const { app, audit } = await authFixture();
+    const cookie = await loginCookie(app);
+    const payload = { domain: "app.example.test", acmeEmail: "ops@example.test", databasePassword: "database-password-123", runtimeSecret: "runtime-secret-value" };
+    const write = await app.inject({ method: "PUT", url: "/api/v1/projects/project_mock_1/runtime-configuration", headers: { ...contentHeaders, cookie }, payload });
+    expect(write.statusCode).toBe(200);
+    expect(JSON.stringify(write.json())).not.toContain(payload.acmeEmail);
+    expect(JSON.stringify(write.json())).not.toContain(payload.databasePassword);
+    expect(write.json().data.runtimeConfiguration).toEqual({ domain: payload.domain, acmeEmailConfigured: true, databasePasswordConfigured: true, runtimeSecretConfigured: true });
+
+    const first = await app.inject({ method: "POST", url: "/api/v1/projects/project_mock_1/runtime-activation", headers: { ...contentHeaders, cookie }, payload: {} });
+    const second = await app.inject({ method: "POST", url: "/api/v1/projects/project_mock_1/runtime-activation", headers: { ...contentHeaders, cookie }, payload: {} });
+    expect(first.json().data.activation).toMatchObject({ status: "capability_unavailable", capability: "safe_runtime_executor" });
+    expect(second.json().data.activation.id).toBe(first.json().data.activation.id);
+    expect(audit.events.filter((event) => event.action === "runtime.activation.requested")).toHaveLength(2);
+
+    const readOnly = await authFixture({ user: { role: "read-only" } });
+    const readOnlyCookie = await loginCookie(readOnly.app);
+    const denied = await readOnly.app.inject({ method: "GET", url: "/api/v1/projects/project_mock_1/runtime-configuration", headers: { cookie: readOnlyCookie } });
+    expect(denied.statusCode).toBe(403);
+  });
+
   it("returns SECRET_KEY_UNAVAILABLE for env value writes when DEPLOYLITE_SECRET_KEY is missing or invalid", async () => {
     const cases: Array<{ name: string; env: NodeJS.ProcessEnv }> = [
       {

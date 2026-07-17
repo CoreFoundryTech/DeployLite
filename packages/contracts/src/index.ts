@@ -160,6 +160,30 @@ export const envSecretValueDeleteRequestSchema = z.object({
   scope: z.enum(["project", "deployment"]).default("project")
 }).strict();
 
+const hostnameSchema = z.string().trim().toLowerCase().regex(/^(?=.{1,253}$)(?!-)[a-z0-9-]+(?:\.[a-z0-9-]+)+$/);
+
+// All runtime values are write-only except the public hostname. The ACME
+// contact remains operationally sensitive, so reads expose only its marker.
+export const runtimeConfigurationWriteRequestSchema = z.object({
+  domain: hostnameSchema,
+  acmeEmail: z.string().trim().email().max(320),
+  databasePassword: z.string().min(16).max(8192),
+  runtimeSecret: z.string().min(16).max(8192)
+}).strict();
+
+export const runtimeConfigurationSchema = z.object({
+  domain: hostnameSchema.nullable(),
+  acmeEmailConfigured: z.boolean(),
+  databasePasswordConfigured: z.boolean(),
+  runtimeSecretConfigured: z.boolean()
+});
+
+export const runtimeActivationSchema = z.object({
+  id: idSchema,
+  status: z.literal("capability_unavailable"),
+  capability: z.literal("safe_runtime_executor")
+});
+
 export const deployRequestSchema = z.object({
   agentId: idSchema.optional(),
   commitSha: z.string().regex(/^[a-f0-9]{7,40}$/).optional()
@@ -210,6 +234,9 @@ export type EnvVariableMetadataUpsertRequest = z.infer<typeof envVariableMetadat
 export type EnvSecretValue = z.infer<typeof envSecretValueSchema>;
 export type EnvSecretValueWriteRequest = z.infer<typeof envSecretValueWriteRequestSchema>;
 export type EnvSecretValueDeleteRequest = z.infer<typeof envSecretValueDeleteRequestSchema>;
+export type RuntimeConfiguration = z.infer<typeof runtimeConfigurationSchema>;
+export type RuntimeConfigurationWriteRequest = z.infer<typeof runtimeConfigurationWriteRequestSchema>;
+export type RuntimeActivation = z.infer<typeof runtimeActivationSchema>;
 export type DeployRequest = z.infer<typeof deployRequestSchema>;
 export type ScaffoldUser = z.infer<typeof scaffoldUserSchema>;
 export type CanonicalRole = z.infer<typeof canonicalRoleSchema>;

@@ -14,6 +14,9 @@ import {
   projectCreateRequestSchema,
   projectSchema,
   projectUpdateRequestSchema,
+  runtimeActivationSchema,
+  runtimeConfigurationSchema,
+  runtimeConfigurationWriteRequestSchema,
   resourceSnapshotSchema,
   type Agent,
   type Deployment,
@@ -776,6 +779,47 @@ function isAllowedCorsRequest(request: FastifyRequest, corsOrigin: string | null
   return Boolean(corsOrigin && getHeaderValue(request, "origin") === corsOrigin);
 }
 
+const runtimeSecretKeys = {
+  domain: "DEPLOYLITE_RUNTIME_DOMAIN",
+  acmeEmail: "DEPLOYLITE_ACME_EMAIL",
+  databasePassword: "POSTGRES_PASSWORD",
+  runtimeSecret: "DEPLOYLITE_RUNTIME_SECRET"
+} as const;
+
+async function readRuntimeConfiguration(state: PlatformRepositories, projectId: string) {
+  const values = await state.envSecretValues.listEncryptedByProject(projectId);
+  const byKey = new Map(values.map((value) => [value.key, value]));
+  const domainValue = byKey.get(runtimeSecretKeys.domain);
+  let domain: string | null = null;
+  if (domainValue) {
+    try {
+      domain = state.envSecretCipher.decrypt(Buffer.from(domainValue.encryptedValue).toString("base64"));
+    } catch {
+      domain = null;
+    }
+  }
+  return runtimeConfigurationSchema.parse({
+    domain,
+    acmeEmailConfigured: byKey.has(runtimeSecretKeys.acmeEmail),
+    databasePasswordConfigured: byKey.has(runtimeSecretKeys.databasePassword),
+    runtimeSecretConfigured: byKey.has(runtimeSecretKeys.runtimeSecret)
+  });
+}
+
+async function writeRuntimeConfiguration(state: PlatformRepositories, projectId: string, values: Record<keyof typeof runtimeSecretKeys, string>) {
+  for (const [name, key] of Object.entries(runtimeSecretKeys) as [keyof typeof runtimeSecretKeys, string][]) {
+    const value = values[name];
+    await state.envSecretValues.upsert({
+      projectId,
+      key,
+      scope: "project",
+      encryptedValue: Buffer.from(state.envSecretCipher.encrypt(value), "base64"),
+      valueFingerprint: state.envSecretCipher.fingerprint(value),
+      keyVersion: ENCRYPTION_KEY_VERSION
+    });
+  }
+}
+
 function registerCoreHooks(app: FastifyInstance, corsOrigin: string | null): void {
   app.addHook("onRequest", async (request) => {
     const inboundRequestId = getHeaderValue(request, "x-request-id");
@@ -801,7 +845,7 @@ function registerCoreHooks(app: FastifyInstance, corsOrigin: string | null): voi
         .header("access-control-allow-origin", corsOrigin)
         .header("access-control-allow-credentials", "true")
         .header("access-control-allow-headers", "content-type,x-request-id")
-        .header("access-control-allow-methods", "GET,POST,PATCH,DELETE,OPTIONS")
+        .header("access-control-allow-methods", "GET,POST,PUT,PATCH,DELETE,OPTIONS")
         .header("vary", "Origin")
         .code(204)
         .send();
@@ -818,6 +862,7 @@ function registerCoreHooks(app: FastifyInstance, corsOrigin: string | null): voi
 function registerRoutes(app: FastifyInstance, state: PlatformRepositories, adapters: AuthAdapters, authConfig: AuthConfig): void {
   const requireAuth = createAuthPreHandler(adapters, authConfig);
   const requireMutationRole = createRolePreHandler(adapters, ["admin", "operator"]);
+  const requireAdminRole = createRolePreHandler(adapters, ["admin"]);
   // Audit history is an operator/admin concern. Read-only sessions are denied
   // by design so a passive role cannot enumerate every project + key change.
   const requireAuditReadRole = createRolePreHandler(adapters, ["admin", "operator"]);
@@ -990,6 +1035,36 @@ function registerRoutes(app: FastifyInstance, state: PlatformRepositories, adapt
     }
     const records = await state.envSecretValues.listByProject(params.projectId);
     return ok(request, { envValues: records.map((record) => envSecretValueSchema.parse(record)) });
+  });
+  app.get(`${API_PREFIX}/projects/:projectId/runtime-configuration`, { preHandler: [requireAuth, requireAdminRole] }, async (request, reply) => {
+    const params = z.object({ projectId: z.string().min(1) }).parse(request.params);
+    if (!await state.projects.findById(params.projectId)) return reply.code(404).send(errorEnvelope(request, "NOT_FOUND", "Project not found."));
+    return ok(request, { runtimeConfiguration: await readRuntimeConfiguration(state, params.projectId) });
+  });
+  app.put(`${API_PREFIX}/projects/:projectId/runtime-configuration`, { preHandler: [requireAuth, requireAdminRole] }, async (request, reply) => {
+    const params = z.object({ projectId: z.string().min(1) }).parse(request.params);
+    if (!await state.projects.findById(params.projectId)) return reply.code(404).send(errorEnvelope(request, "NOT_FOUND", "Project not found."));
+    const body = parseBody(runtimeConfigurationWriteRequestSchema, request.body);
+    try {
+      await writeRuntimeConfiguration(state, params.projectId, body);
+    } catch (error) {
+      if (error instanceof EnvSecretKeyMissingError || error instanceof EnvSecretKeyInvalidError) return reply.code(503).send(errorEnvelope(request, "SECRET_KEY_UNAVAILABLE", "Env secret encryption is not configured."));
+      throw error;
+    }
+    await appendAudit(adapters.audit, request, { actorUserId: request.auth!.user.id, action: "runtime.configuration.upsert", targetType: "runtime", targetId: params.projectId, metadata: { projectId: params.projectId } });
+    return ok(request, { runtimeConfiguration: await readRuntimeConfiguration(state, params.projectId) });
+  });
+  app.post(`${API_PREFIX}/projects/:projectId/runtime-activation`, { preHandler: [requireAuth, requireAdminRole] }, async (request, reply) => {
+    const params = z.object({ projectId: z.string().min(1) }).parse(request.params);
+    if (!await state.projects.findById(params.projectId)) return reply.code(404).send(errorEnvelope(request, "NOT_FOUND", "Project not found."));
+    const configuration = await readRuntimeConfiguration(state, params.projectId);
+    if (!configuration.domain || !configuration.acmeEmailConfigured || !configuration.databasePasswordConfigured || !configuration.runtimeSecretConfigured) {
+      return reply.code(409).send(errorEnvelope(request, "RUNTIME_CONFIGURATION_INCOMPLETE", "Runtime configuration is incomplete."));
+    }
+    const configurationFingerprint = (await state.envSecretValues.listByProject(params.projectId)).filter((value) => Object.values(runtimeSecretKeys).includes(value.key as never)).map((value) => value.valueFingerprint).sort().join(":");
+    const activation = runtimeActivationSchema.parse({ id: `runtime_${state.envSecretCipher.fingerprint(configurationFingerprint).slice(0, 24)}`, status: "capability_unavailable", capability: "safe_runtime_executor" });
+    await appendAudit(adapters.audit, request, { actorUserId: request.auth!.user.id, action: "runtime.activation.requested", targetType: "runtime", targetId: activation.id, metadata: { projectId: params.projectId, capability: activation.capability } });
+    return ok(request, { activation });
   });
   app.post(`${API_PREFIX}/projects/:projectId/env-values`, { preHandler: [requireAuth, requireMutationRole] }, async (request, reply) => {
     const params = z.object({ projectId: z.string().min(1) }).parse(request.params);

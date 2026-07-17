@@ -10,6 +10,7 @@ import {
   projectCreateRequestSchema,
   projectSchema,
   projectUpdateRequestSchema,
+  runtimeConfigurationWriteRequestSchema,
   sseEventSchema
 } from "./index.js";
 
@@ -208,6 +209,11 @@ describe("contracts", () => {
     expect(Object.keys(parsed)).not.toContain("value");
     expect(Object.keys(parsed)).not.toContain("plaintextValue");
     expect(parsed.valueFingerprint).toBe("abcdef0123456789abcdef0123456789");
+  });
+
+  it("validates complete runtime configuration without accepting malformed domains or short secrets", () => {
+    expect(runtimeConfigurationWriteRequestSchema.safeParse({ domain: "app.example.test", acmeEmail: "ops@example.test", databasePassword: "a".repeat(16), runtimeSecret: "b".repeat(16) }).success).toBe(true);
+    expect(runtimeConfigurationWriteRequestSchema.safeParse({ domain: "http://app.example.test", acmeEmail: "ops@example.test", databasePassword: "a".repeat(16), runtimeSecret: "b".repeat(16) }).success).toBe(false);
   });
 
   it("accepts env secret value delete payloads with a default scope of project", () => {
