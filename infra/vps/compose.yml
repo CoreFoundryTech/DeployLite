@@ -1,7 +1,16 @@
 name: deploylite
 
 services:
+  traefik:
+    image: traefik:v3.1
+    restart: unless-stopped
+    ports:
+      - "80:80"
+      - "443:443"
+    networks:
+      - deploylite
   postgres:
+    profiles: [runtime]
     image: postgres:16-alpine
     restart: unless-stopped
     environment:
@@ -19,6 +28,7 @@ services:
       retries: 20
 
   migrate:
+    profiles: [runtime]
     build:
       context: ../..
       dockerfile: apps/api/Dockerfile
@@ -34,6 +44,7 @@ services:
       - deploylite
 
   api:
+    profiles: [runtime]
     build:
       context: ../..
       dockerfile: apps/api/Dockerfile
@@ -50,13 +61,11 @@ services:
       DEPLOYLITE_API_HOST: 0.0.0.0
       DEPLOYLITE_API_PORT: 3001
       DEPLOYLITE_API_URL: http://api:3001
-      DEPLOYLITE_CORS_ORIGIN: ${DEPLOYLITE_PUBLIC_WEB_ORIGIN:?DEPLOYLITE_PUBLIC_WEB_ORIGIN is required}
+      DEPLOYLITE_CORS_ORIGIN: https://${DEPLOYLITE_PUBLIC_HOST:-deploylite.invalid}
       DEPLOYLITE_SESSION_TTL_SECONDS: ${DEPLOYLITE_SESSION_TTL_SECONDS:-28800}
       DEPLOYLITE_SESSION_COOKIE_NAME: ${DEPLOYLITE_SESSION_COOKIE_NAME:-deploylite_session}
-      DEPLOYLITE_SESSION_COOKIE_SECURE: ${DEPLOYLITE_SESSION_COOKIE_SECURE:-false}
+      DEPLOYLITE_SESSION_COOKIE_SECURE: "true"
       DEPLOYLITE_BCRYPT_COST: ${DEPLOYLITE_BCRYPT_COST:-12}
-    ports:
-      - "3001:3001"
     networks:
       - deploylite
     healthcheck:
@@ -66,6 +75,7 @@ services:
       retries: 12
 
   web:
+    profiles: [runtime]
     build:
       context: ../..
       dockerfile: apps/web/Dockerfile
@@ -76,10 +86,8 @@ services:
         condition: service_healthy
     environment:
       NODE_ENV: production
-      DEPLOYLITE_WEB_API_BASE_URL: ${DEPLOYLITE_PUBLIC_API_ORIGIN:?DEPLOYLITE_PUBLIC_API_ORIGIN is required}
-      NEXT_PUBLIC_DEPLOYLITE_API_URL: ${DEPLOYLITE_PUBLIC_API_ORIGIN:?DEPLOYLITE_PUBLIC_API_ORIGIN is required}
-    ports:
-      - "80:3000"
+      DEPLOYLITE_WEB_API_BASE_URL: https://${DEPLOYLITE_PUBLIC_HOST:-deploylite.invalid}
+      NEXT_PUBLIC_DEPLOYLITE_API_URL: https://${DEPLOYLITE_PUBLIC_HOST:-deploylite.invalid}
     networks:
       - deploylite
     healthcheck:

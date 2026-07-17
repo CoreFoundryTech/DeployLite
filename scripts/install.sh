@@ -4,12 +4,12 @@ set -Eeuo pipefail
 INSTALL_DIR="${DEPLOYLITE_INSTALL_DIR:-/opt/deploylite}"
 REPO_ROOT="${DEPLOYLITE_REPO_ROOT:-$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)}"
 COMPOSE_FILE="${INSTALL_DIR}/compose.yml"
-ENV_FILE="${INSTALL_DIR}/.env"
+TLS_COMPOSE_FILE="${INSTALL_DIR}/compose.tls.yml"
 STATE_DIR="${INSTALL_DIR}/.state"
 DEFAULT_LOG_FILE="/var/log/deploylite/install.log"
 INSTALL_LOG="${DEPLOYLITE_INSTALL_LOG:-$DEFAULT_LOG_FILE}"
 INSTALL_LOG_DIR="${DEPLOYLITE_INSTALL_LOG_DIR:-$(dirname "$INSTALL_LOG")}"
-INTERACTIVE=0
+INTERACTIVE=1
 NOOP=0
 CHANGED_STEPS=()
 CREATED_RUNTIME=0
@@ -63,11 +63,11 @@ print_usage() {
 Usage: install.sh [options]
 
 Options:
-  --interactive, -i   Prompt for install values (TUI when available, read fallback).
+  --non-interactive   Skip the prerequisite confirmation TUI.
   --help, -h          Show this help and exit.
 
 Environment:
-  DEPLOYLITE_PUBLIC_HOST=<ip-or-host>  Public host for the runtime.
+  DEPLOYLITE_PUBLIC_HOST=<hostname>    Future HTTPS host; not persisted by this installer.
   DEPLOYLITE_INSTALL_DIR=<path>        Install directory (default: /opt/deploylite).
   DEPLOYLITE_INSTALL_LOG=<path>        Install log file (default: /var/log/deploylite/install.log).
   DEPLOYLITE_INSTALL_LOG_DIR=<path>    Install log directory (default: parent of DEPLOYLITE_INSTALL_LOG).
@@ -82,16 +82,17 @@ USAGE
 parse_args() {
   while (( $# > 0 )); do
     case "$1" in
-      --interactive|-i) INTERACTIVE=1; shift ;;
+       --interactive|-i) INTERACTIVE=1; shift ;;
+       --non-interactive) INTERACTIVE=0; shift ;;
       --noop) NOOP=1; shift ;;
       --help|-h) print_usage; exit 0 ;;
       --)
         shift
         while (( $# > 0 )); do
-          fail "Unknown argument: $1. Use --interactive or --help." 2
+        fail "Unknown argument: $1. Use --non-interactive or --help." 2
         done
         ;;
-      *) fail "Unknown argument: $1. Use --interactive or --help." 2 ;;
+      *) fail "Unknown argument: $1. Use --non-interactive or --help." 2 ;;
     esac
   done
 }
@@ -251,7 +252,7 @@ preflight() {
     fail "Root or sudo is required. Re-run as root or install sudo." 2
   fi
   port_available 80 || fail "Port 80 is already in use. Stop the conflicting service before installing." 2
-  port_available 3001 || fail "Port 3001 is already in use. Stop the conflicting service before installing." 2
+  port_available 443 || fail "Port 443 is already in use. Stop the conflicting service before installing." 2
 }
 
 install_docker() {
@@ -304,152 +305,44 @@ random_secret() {
   fi
 }
 
-detect_public_host_inner() {
-  # Best-effort public host detection. Returns the detected value on
-  # stdout (which may be empty) and never calls fail/exit, so callers
-  # that want to offer a default without aborting the installer can use
-  # it. detect_public_host wraps this with the hard-fail behavior.
-  if [[ -n "${DEPLOYLITE_PUBLIC_HOST:-}" ]]; then
-    printf '%s' "$DEPLOYLITE_PUBLIC_HOST"
-    return 0
-  fi
-  local candidate=""
-  if command_exists curl; then
-    candidate="$(curl -fsS --max-time 3 https://api.ipify.org 2>/dev/null || true)"
-  fi
-  [[ -n "$candidate" ]] || candidate="$(hostname -I 2>/dev/null | awk '{print $1}' || true)"
-  printf '%s' "$candidate"
-}
-
-detect_public_host() {
-  local host
-  host="$(detect_public_host_inner)"
-  [[ -n "$host" ]] || fail "Could not detect public host. Set DEPLOYLITE_PUBLIC_HOST=<ip-or-host>." 2
-  printf '%s' "$host"
-}
-
-env_get() {
-  local key="$1"
-  [[ -f "$ENV_FILE" ]] || return 1
-  grep -E "^${key}=" "$ENV_FILE" | tail -n 1 | cut -d= -f2- || true
-}
-
-write_env() {
-  local host postgres_password tmp detected interactive_host
-  if [[ "${INTERACTIVE}" == "1" ]]; then
-    # Offer a sensible default to the prompt without aborting the
-    # installer on detection failure. The detect helper caps its own
-    # network call (curl --max-time 3) so an unreachable ipify endpoint
-    # cannot stall the installer. The user can accept the detected
-    # value by pressing enter or override it. In non-interactive mode
-    # this branch is skipped entirely and the hard-fail path runs.
-    detected="$(detect_public_host_inner)"
-    interactive_host="$(prompt_value 'Public host (IP or hostname) for the runtime' "$detected")"
-    host="${interactive_host:-$detected}"
-  else
-    host="$(detect_public_host)"
-  fi
-  [[ -n "${host:-}" ]] || fail "Could not determine the public host. Set DEPLOYLITE_PUBLIC_HOST=<ip-or-host> and retry." 2
-  postgres_password="$(env_get POSTGRES_PASSWORD || true)"
-  [[ -n "$postgres_password" ]] || postgres_password="$(random_secret)"
-  tmp="$(mktemp)"
-  umask 077
-  cat >"$tmp" <<EOF
-COMPOSE_PROJECT_NAME=deploylite
-DEPLOYLITE_PUBLIC_HOST=${host}
-DEPLOYLITE_PUBLIC_WEB_ORIGIN=http://${host}
-DEPLOYLITE_PUBLIC_API_ORIGIN=http://${host}:3001
-POSTGRES_PASSWORD=${postgres_password}
-POSTGRES_DB=deploylite
-POSTGRES_USER=deploylite
-DEPLOYLITE_SESSION_TTL_SECONDS=28800
-DEPLOYLITE_SESSION_COOKIE_NAME=deploylite_session
-DEPLOYLITE_SESSION_COOKIE_SECURE=false
-DEPLOYLITE_BCRYPT_COST=12
-EOF
-  as_root install -m 600 "$tmp" "$ENV_FILE"
-  rm -f "$tmp"
-  if [[ "${INTERACTIVE}" == "1" ]]; then
-    info "Public host confirmed: ${host}"
-  fi
-}
-
 prepare_install_dir() {
-  if [[ -d "$INSTALL_DIR" && -f "$COMPOSE_FILE" && -f "$ENV_FILE" ]]; then
+  if [[ -d "$INSTALL_DIR" && -f "$COMPOSE_FILE" && -f "$TLS_COMPOSE_FILE" ]]; then
     info "Existing install at ${INSTALL_DIR} detected; preserving state."
   fi
   info "Preparing ${INSTALL_DIR}."
   as_root mkdir -p "$INSTALL_DIR" "$STATE_DIR"
   as_root chmod 700 "$INSTALL_DIR"
   install_compose_file
-  if [[ ! -f "$ENV_FILE" ]]; then
-    write_env
-    record_change "env-created"
-  else
-    as_root chmod 600 "$ENV_FILE"
-    info "Existing .env found; preserving generated secrets."
-  fi
-  record_change "runtime-files-installed"
+  record_change "compose-files-installed"
 }
 
 install_compose_file() {
-  local tmp
+  local tmp tls_tmp
   tmp="$(mktemp)"
+  tls_tmp="$(mktemp)"
   sed "s#context: ../..#context: ${REPO_ROOT}#g" "${REPO_ROOT}/infra/vps/compose.yml" >"$tmp"
+  sed "s#context: ../..#context: ${REPO_ROOT}#g" "${REPO_ROOT}/infra/vps/compose.tls.yml" >"$tls_tmp"
   as_root install -m 644 "$tmp" "$COMPOSE_FILE"
-  rm -f "$tmp"
+  as_root install -m 644 "$tls_tmp" "$TLS_COMPOSE_FILE"
+  rm -f "$tmp" "$tls_tmp"
 }
 
-compose() { as_root docker compose -f "$COMPOSE_FILE" --env-file "$ENV_FILE" --project-directory "$INSTALL_DIR" "$@"; }
+compose() { as_root docker compose -f "$COMPOSE_FILE" -f "$TLS_COMPOSE_FILE" --project-directory "$INSTALL_DIR" "$@"; }
 compose_down_safe() { compose down --remove-orphans; }
 
-start_runtime() {
-  info "Rendering Compose configuration."
-  compose config >/dev/null
-  info "Building and starting DeployLite runtime."
-  compose up -d --build postgres
-  CREATED_RUNTIME=1
-  compose up --build migrate
-  compose up -d --build api web
-  record_change "runtime-started"
-}
-
-wait_for_url() {
-  local name="$1" url="$2" attempts="${3:-30}" delay="${4:-5}"
-  for ((i = 1; i <= attempts; i += 1)); do
-    if curl -fsS --max-time 3 "$url" >/dev/null 2>&1; then
-      info "${name} is healthy."
-      return 0
-    fi
-    sleep "$delay"
-  done
-  fail "${name} did not become healthy at ${url}. Check docker compose logs." 1
-}
-
-wait_for_health() {
-  wait_for_url "API" "http://127.0.0.1:3001/api/v1/health" 30 5
-  wait_for_url "Web" "http://127.0.0.1/" 30 5
-}
-
-print_success() {
-  local host web api
-  host="$(env_get DEPLOYLITE_PUBLIC_HOST)"
-  web="http://${host}"
-  api="http://${host}:3001"
-  info "DeployLite is ready."
-  printf '\nDeployLite URL: %s\n' "$web"
-  printf 'API URL: %s\n' "$api"
-  printf 'Open the DeployLite URL in a browser and create the first owner account from the setup screen.\n'
-  printf 'No default admin credentials were created. Keep %s private.\n' "$ENV_FILE"
+validate_compose() {
+  info "Validating merged Compose configuration."
+  compose --profile runtime config >/dev/null
 }
 
 main() {
   parse_args "$@"
   install_log_setup
   if [[ "${INTERACTIVE}" == "1" ]]; then
-    info "Interactive mode: prompts enabled (TUI when available, read fallback)."
+    [[ "$(prompt_value 'Install Docker prerequisites and Compose templates?' 'yes')" == "yes" ]] || fail "Installation cancelled." 1
+    info "Interactive prerequisite confirmation accepted."
   else
-    info "Running in non-interactive mode; use --interactive to enable prompts."
+    info "Running in explicit non-interactive mode."
   fi
   if [[ "${NOOP}" == "1" ]]; then
     info "Noop mode: skipping preflight, Docker install, and runtime."
@@ -457,14 +350,9 @@ main() {
   fi
   preflight
   install_docker
-  if [[ "${DEPLOYLITE_SKIP_RUNTIME:-0}" == "1" ]]; then
-    info "Skipping runtime install (DEPLOYLITE_SKIP_RUNTIME=1)."
-    return 0
-  fi
   prepare_install_dir
-  start_runtime
-  wait_for_health
-  print_success
+  validate_compose
+  info "Prerequisites and Compose templates are ready. Domain and ACME configuration remain web-owned."
 }
 
 if [[ "${DEPLOYLITE_INSTALL_TESTING:-0}" != "1" ]]; then

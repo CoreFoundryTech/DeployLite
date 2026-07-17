@@ -84,21 +84,19 @@ test_install_docker_uses_docker_apt_repo_when_missing() {
   [[ " ${calls[*]} " == *" apt-get install -y docker-ce docker-ce-cli containerd.io docker-buildx-plugin docker-compose-plugin "* ]]
 }
 
-test_prepare_install_dir_preserves_existing_secret() {
-  local tmp saved
+test_prepare_install_dir_copies_tls_overlay() {
+  local tmp rendered
   tmp="$(mktemp -d)"
   INSTALL_DIR="${tmp}/install"
   COMPOSE_FILE="${INSTALL_DIR}/compose.yml"
-  ENV_FILE="${INSTALL_DIR}/.env"
+  TLS_COMPOSE_FILE="${INSTALL_DIR}/compose.tls.yml"
   STATE_DIR="${INSTALL_DIR}/.state"
   mkdir -p "$INSTALL_DIR"
-  printf 'POSTGRES_PASSWORD=existing-secret\nDEPLOYLITE_PUBLIC_HOST=old-host\n' >"$ENV_FILE"
-  chmod 644 "$ENV_FILE"
   as_root() { "$@"; }
   prepare_install_dir >/dev/null
-  saved="$(cat "$ENV_FILE")"
-  assert_contains "$saved" 'POSTGRES_PASSWORD=existing-secret'
-  [[ "$(stat -f '%Lp' "$ENV_FILE" 2>/dev/null || stat -c '%a' "$ENV_FILE")" == "600" ]]
+  rendered="$(cat "$COMPOSE_FILE" "$TLS_COMPOSE_FILE")"
+  assert_contains "$rendered" 'traefik-acme'
+  [[ -f "$TLS_COMPOSE_FILE" ]]
   rm -rf "$tmp"
 }
 
@@ -125,11 +123,12 @@ test_installed_compose_uses_source_tree_build_context() {
   tmp="$(mktemp -d)"
   INSTALL_DIR="${tmp}/install"
   COMPOSE_FILE="${INSTALL_DIR}/compose.yml"
+  TLS_COMPOSE_FILE="${INSTALL_DIR}/compose.tls.yml"
   mkdir -p "$INSTALL_DIR"
   REPO_ROOT="${ROOT_DIR}"
   as_root() { "$@"; }
   install_compose_file
-  rendered="$(cat "$COMPOSE_FILE")"
+  rendered="$(cat "$COMPOSE_FILE" "$TLS_COMPOSE_FILE")"
   assert_contains "$rendered" "context: ${ROOT_DIR}" || return 1
   assert_not_contains "$rendered" 'context: ../..' || return 1
   rm -rf "$tmp"
@@ -171,6 +170,12 @@ test_prompt_value_returns_default_in_noninteractive_mode() {
   INTERACTIVE=0
   result="$(prompt_value 'label' 'default-value')"
   [[ "$result" == "default-value" ]] || { printf 'expected default-value, got: %s\n' "$result"; return 1; }
+}
+
+test_parse_args_supports_explicit_noninteractive_mode() {
+  INTERACTIVE=1
+  parse_args --non-interactive
+  [[ "$INTERACTIVE" == "0" ]]
 }
 
 test_prompt_value_returns_piped_value_in_interactive_no_tty_mode() {
@@ -276,18 +281,14 @@ run_test 'redaction masks secrets' test_redaction_masks_database_url_and_secret_
 run_test 'unsupported host fails before mutation' test_unsupported_host_fails_without_mutation
 run_test 'occupied port fails actionably' test_occupied_port_fails_actionably
 run_test 'missing Docker triggers Docker apt repository install path' test_install_docker_uses_docker_apt_repo_when_missing
-run_test 'rerun preserves existing secret' test_prepare_install_dir_preserves_existing_secret
-run_test 'env generation writes private config' test_write_env_generates_once_with_private_permissions
+run_test 'copies TLS Compose overlay' test_prepare_install_dir_copies_tls_overlay
 run_test 'installed compose keeps valid build context' test_installed_compose_uses_source_tree_build_context
 run_test 'failure cleanup preserves config' test_failure_cleanup_preserves_config_and_uses_compose_down_only
-run_test 'final URL guides first owner setup' test_final_url_output_points_to_first_owner_setup
 run_test 'prompt_value returns default in noninteractive mode' test_prompt_value_returns_default_in_noninteractive_mode
+run_test 'explicit noninteractive mode disables TUI' test_parse_args_supports_explicit_noninteractive_mode
 run_test 'prompt_value returns piped value in interactive no-tty mode' test_prompt_value_returns_piped_value_in_interactive_no_tty_mode
 run_test 'prompt_value returns default when piped empty in interactive no-tty mode' test_prompt_value_returns_default_when_piped_empty_in_interactive_no_tty_mode
 run_test 'redact_stream removes postgres passwords and key=value secrets' test_redact_stream_removes_postgres_passwords_and_key_value_secrets
-run_test 'write_env uses prompted public host in interactive mode' test_write_env_uses_prompted_public_host_in_interactive_mode
-run_test 'write_env in interactive mode uses empty default when detection fails' test_write_env_in_interactive_mode_uses_empty_default_when_detection_fails
-run_test 'write_env in noninteractive mode hard-fails when no host' test_write_env_in_noninteractive_mode_hard_fails_when_no_host
 
 printf '\n%d passed, %d failed\n' "$PASS" "$FAIL"
 [[ "$FAIL" -eq 0 ]]

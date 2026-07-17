@@ -1,0 +1,32 @@
+services:
+  traefik:
+    command:
+      - --entrypoints.web.address=:80
+      - --entrypoints.web.http.redirections.entrypoint.to=websecure
+      - --entrypoints.web.http.redirections.entrypoint.scheme=https
+      - --entrypoints.websecure.address=:443
+      - --providers.docker=true
+      - --providers.docker.exposedbydefault=false
+      - --certificatesresolvers.le.acme.tlschallenge=true
+      - --certificatesresolvers.le.acme.email=${DEPLOYLITE_ACME_EMAIL:-invalid@example.invalid}
+      - --certificatesresolvers.le.acme.storage=/acme/acme.json
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+      - traefik-acme:/acme
+  api:
+    labels:
+      - traefik.enable=true
+      - traefik.http.routers.deploylite-api.rule=Host(`${DEPLOYLITE_PUBLIC_HOST:-deploylite.invalid}`) && PathPrefix(`/api`)
+      - traefik.http.routers.deploylite-api.entrypoints=websecure
+      - traefik.http.routers.deploylite-api.tls.certresolver=le
+      - traefik.http.services.deploylite-api.loadbalancer.server.port=3001
+  web:
+    labels:
+      - traefik.enable=true
+      - traefik.http.routers.deploylite-web.rule=Host(`${DEPLOYLITE_PUBLIC_HOST:-deploylite.invalid}`)
+      - traefik.http.routers.deploylite-web.entrypoints=websecure
+      - traefik.http.routers.deploylite-web.tls.certresolver=le
+      - traefik.http.services.deploylite-web.loadbalancer.server.port=3000
+
+volumes:
+  traefik-acme:

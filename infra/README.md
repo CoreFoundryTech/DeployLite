@@ -10,52 +10,47 @@ This directory contains local-development infrastructure and the first reviewabl
 
 `infra/local/postgres.yml` is the deterministic local PostgreSQL fixture used by the onboarding runbook and opt-in DB integration checks.
 
-## VPS runtime preview
+## VPS installer contract
 
-`infra/vps/compose.yml` defines the runtime slice used by the plug-and-play installer:
+The installer installs Docker prerequisites and copies `compose.yml` plus `compose.tls.yml`; it does not start DeployLite or ask for a domain or ACME email.
 
 - `postgres` uses `postgres:16-alpine` with a durable named volume.
 - `migrate` runs the existing hand-authored SQL migrations once before the API starts.
-- `api` builds `apps/api/Dockerfile`, binds internally to `0.0.0.0:3001`, and is temporarily exposed on host `:3001`.
-- `web` builds `apps/web/Dockerfile`, serves Next.js on container `:3000`, and is temporarily exposed on host `:80`.
+- Traefik is the sole host listener on ports `80` and `443`; API and web have no host ports.
+- The `runtime` profile is TLS-only: HTTP redirects to HTTPS and ACME state persists in `traefik-acme`.
+- API CORS and the web API URLs derive from `https://${DEPLOYLITE_PUBLIC_HOST}`.
 - Health checks gate API/Web startup where Compose supports dependency conditions.
 
 For local review, render the configuration without starting services:
 
 ```bash
-docker compose -f infra/vps/compose.yml --env-file infra/vps/.env.example config
+docker compose -f infra/vps/compose.yml -f infra/vps/compose.tls.yml --env-file infra/vps/.env.example --profile runtime config
 ```
 
-During installation, `scripts/install.sh` copies this Compose file to `/opt/deploylite/compose.yml`, writes `/opt/deploylite/.env` with mode `0600`, generates missing secrets once, and preserves existing values on reruns. Do not commit or paste the runtime `.env` file.
+Functional domain, ACME email, and runtime secret persistence are web-owned configuration. The current blocker is that no web persistence surface exists for these values, so the installer intentionally does not create a functional `.env`; `.env.example` is render-only and invalid for public use.
 
 ## VPS installer runbook
 
-Bootstrap from the reviewed GitHub `main` branch on a clean supported VPS:
+Bootstrap from an audited immutable GitHub commit SHA on a clean supported VPS:
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/CoreFoundryTech/DeployLite/main/scripts/bootstrap.sh | sudo bash
+curl -fsSL https://raw.githubusercontent.com/CoreFoundryTech/DeployLite/<sha>/scripts/bootstrap.sh | sudo DEPLOYLITE_VERSION=<40-char-sha> bash
 ```
 
-For a stable public IP or hostname, pass it through the environment:
+Skip the default prerequisite confirmation TUI only for automation:
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/CoreFoundryTech/DeployLite/main/scripts/bootstrap.sh | sudo DEPLOYLITE_PUBLIC_HOST=<ip-or-host> bash
+curl -fsSL https://raw.githubusercontent.com/CoreFoundryTech/DeployLite/<sha>/scripts/bootstrap.sh | sudo DEPLOYLITE_VERSION=<40-char-sha> bash -s -- --non-interactive
 ```
 
-Set `DEPLOYLITE_VERSION=<branch-tag-or-sha>` to download a specific GitHub ref. The bootstrapper downloads a GitHub tarball, extracts it under a temporary directory, preserves `DEPLOYLITE_*` environment variables when invoking the installer, and cleans temporary files on exit. It does not print secret values.
+`DEPLOYLITE_VERSION` must be a 40-character commit SHA. The bootstrapper uses bounded downloads, a private temporary directory, and validates that the extracted tree contains the installer.
 
 Alternatively, run from a reviewed source checkout:
 
 ```bash
-sudo DEPLOYLITE_PUBLIC_HOST=203.0.113.10 bash scripts/install.sh
+sudo bash scripts/install.sh
 ```
 
-The installer supports Ubuntu 20.04/22.04/24.04 and Debian 11/12 on x86_64 or arm64. It requires root or sudo, verifies ports `80` and `3001`, installs/verifies Docker Engine and the Compose plugin through `apt` when missing, starts Postgres/migrations/API/Web through Compose, waits for API/Web health, and prints the final HTTP URL.
+The installer supports Ubuntu 20.04/22.04/24.04 and Debian 11/12 on x86_64 or arm64. It requires root or sudo, verifies ports `80` and `443`, installs/verifies Docker Engine and the Compose plugin through `apt`, copies both Compose files, and validates their merged TLS runtime configuration. It does not start application services.
 
-After completion, open the printed `http://<host>/` URL and create the first owner account in the browser. No default admin user or password is created.
-
-On failure, the installer reports changed steps with secret redaction, stops newly started containers where safe, and preserves `/opt/deploylite/.env` plus named volumes.
-
-### HTTP-first limits
-
-This slice intentionally uses plain HTTP for reviewability: Web `:80`, API `:3001`, `DEPLOYLITE_SESSION_COOKIE_SECURE=false`, and credentialed CORS only for `DEPLOYLITE_CORS_ORIGIN`. It does not configure Traefik, ACME, domains, HTTPS, firewall rules, backups, upgrades, uninstall/reset, Dokploy, or a deployment agent/server Docker socket. The first owner/admin is still created only in the browser while the user table is empty; no default admin is seeded or documented.
+This contract does not configure a public domain, ACME identity, firewall, backups, upgrades, uninstall/reset, Dokploy, or a deployment agent/server Docker socket.
