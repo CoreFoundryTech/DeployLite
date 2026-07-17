@@ -19,10 +19,12 @@ The local compose file starts PostgreSQL only on host port `55433` to avoid comm
 For opt-in runtime PostgreSQL verification, run:
 
 ```bash
+export DATABASE_URL=postgres://deploylite:deploylite@localhost:55433/deploylite
+export DEPLOYLITE_DB_INTEGRATION=1
 pnpm --filter @deploylite/db db:verify:integration
 ```
 
-The integration check creates and drops a disposable database on the configured local server, applies migrations to an empty database, verifies canonical role and constraint behavior, and proves auth/session plus deployment metadata rows survive closing and recreating the PostgreSQL client lifecycle. It is intentionally outside `pnpm check` so normal workspace checks stay Docker-free.
+The integration check is skipped unless `DEPLOYLITE_DB_INTEGRATION=1`. When enabled, it requires an explicit `DATABASE_URL`; the test suite does not provide a fallback connection string or credentials. It creates and drops a disposable database on that configured local server, applies migrations to an empty database, verifies canonical role and constraint behavior, and proves auth/session plus deployment metadata rows survive closing and recreating the PostgreSQL client lifecycle. It is intentionally outside `pnpm check` so normal workspace checks stay Docker-free.
 
 ## Secret storage boundary
 

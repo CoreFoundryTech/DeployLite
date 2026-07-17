@@ -150,23 +150,23 @@ describe("web bootstrap API boundary", () => {
   });
 
   it("creates initial-admin requests without leaking passwords into URLs or headers", async () => {
-    const request = createInitialAdminApiRequest({ email: "admin@example.test", password: "very-secret-admin-password" });
+    const request = createInitialAdminApiRequest({ email: "admin@example.test", password: "test_fixture_admin_password" });
 
     expect(request.method).toBe("POST");
     expect(request.credentials).toBe("include");
     expect(request.headers).toEqual({ "content-type": "application/json" });
-    expect(JSON.stringify(request.headers)).not.toContain("very-secret-admin-password");
+    expect(JSON.stringify(request.headers)).not.toContain("test_fixture_admin_password");
   });
 
   it("maps initial-admin success and locked setup submissions", async () => {
     const success = await createInitialAdmin({
       apiBaseUrl: "https://api.example.test",
-      input: { email: "admin@example.test", password: "very-secret-admin-password" },
+      input: { email: "admin@example.test", password: "test_fixture_admin_password" },
       fetchImpl: async () => new Response(JSON.stringify({ data: { user: { id: "user_1", email: "admin@example.test", role: "admin", status: "active" } }, error: null, requestId: "req_admin_1" }), { status: 200 })
     });
     const locked = await createInitialAdmin({
       apiBaseUrl: "https://api.example.test",
-      input: { email: "admin@example.test", password: "very-secret-admin-password" },
+      input: { email: "admin@example.test", password: "test_fixture_admin_password" },
       fetchImpl: async () => new Response(JSON.stringify({ data: null, error: { code: "BOOTSTRAP_LOCKED", message: "Locked", correlationId: "req_locked" }, requestId: "req_locked" }), { status: 409 })
     });
 

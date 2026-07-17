@@ -11,8 +11,8 @@ describe("auth repository helpers", () => {
   it("redacts sensitive audit metadata before persistence", () => {
     expect(
       redactAuditMetadata({
-        password: "correct horse battery staple",
-        nested: { authorization: "Bearer dl_1234567890", safe: "visible" }
+        password: "test_fixture_password_primary",
+        nested: { authorization: "Bearer dl_fixture_token_1234567890", safe: "visible" }
       })
     ).toEqual({ password: "[REDACTED]", nested: { authorization: "[REDACTED]", safe: "visible" } });
   });

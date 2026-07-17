@@ -12,6 +12,7 @@ export default defineConfig({
   },
   test: {
     environment: "node",
+    forbidOnly: true,
     include: ["src/**/*.test.ts"],
     setupFiles: ["./vitest.setup.ts"]
   }

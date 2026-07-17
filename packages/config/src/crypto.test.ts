@@ -10,7 +10,7 @@ import {
   safeEqualFingerprint
 } from "./crypto.js";
 
-const validKey = "unit-test-secret-key-1234567890";
+const validKey = "test_fixture_crypto_key_1234567890";
 
 describe("env secret encryption", () => {
   it("derives a 32-byte key from a non-empty DEPLOYLITE_SECRET_KEY", () => {
@@ -41,8 +41,8 @@ describe("env secret encryption", () => {
     const cipher = createEnvSecretCipher(loadEnvSecretKey(validKey));
     const samples = [
       "short",
-      "ghp_1234567890abcdefABCDEF",
-      JSON.stringify({ nested: { token: "dl_abcdef1234567890", scopes: ["deploy", "read"] } }),
+      "ghp_fixture_token_1234567890abcdef",
+      JSON.stringify({ nested: { token: "dl_fixture_token_abcdef1234567890", scopes: ["deploy", "read"] } }),
       "with\nmulti\nlines\nand\ttabs"
     ];
 
@@ -86,7 +86,7 @@ describe("env secret encryption", () => {
 
   it("computes a stable, keyed, fixed-length hex fingerprint per plaintext", () => {
     const cipher = createEnvSecretCipher(loadEnvSecretKey(validKey));
-    const otherCipher = createEnvSecretCipher(loadEnvSecretKey("unit-test-secret-key-different-123456"));
+    const otherCipher = createEnvSecretCipher(loadEnvSecretKey("test_fixture_crypto_key_different_123456"));
     const left = cipher.fingerprint("api-token-1");
     const right = cipher.fingerprint("api-token-1");
     const other = cipher.fingerprint("api-token-2");
@@ -102,10 +102,10 @@ describe("env secret encryption", () => {
 
   it("never includes the raw plaintext in a serialized ciphertext envelope", () => {
     const cipher = createEnvSecretCipher(loadEnvSecretKey(validKey));
-    const raw = "deploylite_xyzzy_secret_value_42";
+    const raw = "fixture_secret_raw_marker_42";
     const envelope = cipher.encrypt(raw);
     expect(envelope).not.toContain(raw);
-    expect(envelope).not.toContain("xyzzy");
-    expect(envelope).not.toContain("deploylite_");
+    expect(envelope).not.toContain("raw_marker");
+    expect(envelope).not.toContain("fixture_secret_");
   });
 });

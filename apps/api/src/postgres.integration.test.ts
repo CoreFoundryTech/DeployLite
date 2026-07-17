@@ -7,11 +7,11 @@ import { afterAll, beforeAll, describe, expect, it } from "vitest";
 
 import { buildApiApp } from "./app.js";
 
-const localDatabaseUrl = "postgres://deploylite:deploylite@localhost:55433/deploylite";
 const integrationEnabled = process.env.DEPLOYLITE_API_POSTGRES_INTEGRATION === "1";
 const describeIntegration = integrationEnabled ? describe : describe.skip;
+const configuredDatabaseUrl = integrationEnabled ? requireIntegrationDatabaseUrl() : "";
 const contentHeaders = { "content-type": "application/json" };
-const adminPassword = "correct horse battery staple";
+const adminPassword = "test_fixture_admin_password";
 
 let maintenancePool: ReturnType<typeof createDbPool> | null = null;
 let pool: ReturnType<typeof createDbPool> | null = null;
@@ -21,15 +21,14 @@ let databaseUrl = "";
 
 describeIntegration("DeployLite API PostgreSQL integration", () => {
   beforeAll(async () => {
-    const configuredUrl = process.env.DATABASE_URL ?? localDatabaseUrl;
     databaseName = `deploylite_api_verify_${randomUUID().replaceAll("-", "_")}`;
 
-    const maintenanceUrl = new URL(configuredUrl);
+    const maintenanceUrl = new URL(configuredDatabaseUrl);
     maintenanceUrl.pathname = "/postgres";
     maintenancePool = createDbPool(maintenanceUrl.toString(), { max: 1 });
     await maintenancePool.query(`CREATE DATABASE ${quoteIdentifier(databaseName)}`);
 
-    const testDatabaseUrl = new URL(configuredUrl);
+    const testDatabaseUrl = new URL(configuredDatabaseUrl);
     testDatabaseUrl.pathname = `/${databaseName}`;
     databaseUrl = testDatabaseUrl.toString();
 
@@ -118,7 +117,7 @@ describeIntegration("DeployLite API PostgreSQL integration", () => {
       deploymentId,
       sequence: 1,
       level: "info",
-      message: "PostgreSQL integration log token dl_1234567890abcdef should be redacted",
+      message: "PostgreSQL integration log token dl_fixture_token_1234567890abcdef should be redacted",
       timestamp: new Date().toISOString(),
       redactionApplied: false,
       requestId: "req_api_pg_integration",
@@ -143,7 +142,7 @@ describeIntegration("DeployLite API PostgreSQL integration", () => {
     expect(logs.json().data.events).toEqual([
       expect.objectContaining({ deploymentId, sequence: 1, message: expect.stringContaining("[REDACTED]"), redactionApplied: true })
     ]);
-    expect(JSON.stringify(logs.json())).not.toContain("dl_1234567890abcdef");
+    expect(JSON.stringify(logs.json())).not.toContain("dl_fixture_token_1234567890abcdef");
 
     const logout = await restartedApp.inject({ method: "POST", url: "/api/v1/auth/logout", headers: { cookie } });
     expect(logout.statusCode).toBe(200);
@@ -204,6 +203,15 @@ describeIntegration("DeployLite API PostgreSQL integration", () => {
     await app.close();
   }, 30_000);
 });
+
+function requireIntegrationDatabaseUrl(): string {
+  const databaseUrl = process.env.DATABASE_URL;
+  if (!databaseUrl) {
+    throw new Error("DATABASE_URL must be set when DEPLOYLITE_API_POSTGRES_INTEGRATION=1.");
+  }
+
+  return databaseUrl;
+}
 
 async function createPostgresApp(): Promise<FastifyInstance> {
   return buildApiApp({

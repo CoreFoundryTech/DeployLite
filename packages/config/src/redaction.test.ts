@@ -6,8 +6,8 @@ describe("redaction helpers", () => {
   it("masks secret-like object keys recursively", () => {
     const redacted = redactSecrets({
       user: "admin@example.test",
-      nested: { apiKey: "dl_1234567890abcdef" },
-      password: "not-for-fixtures"
+      nested: { apiKey: "dl_fixture_token_1234567890abcdef" },
+      password: "test_fixture_password_value"
     });
 
     expect(redacted).toEqual({
@@ -18,7 +18,7 @@ describe("redaction helpers", () => {
   });
 
   it("masks token-like values inside log messages", () => {
-    expect(redactLogMessage("using token dl_1234567890abcdef for deploy")).toBe(
+    expect(redactLogMessage("using token dl_fixture_token_1234567890abcdef for deploy")).toBe(
       "using token [REDACTED] for deploy"
     );
   });
@@ -31,7 +31,7 @@ describe("redaction helpers", () => {
       targetId: "dep_1",
       requestId: "req_1",
       correlationId: "req_1",
-      metadata: { authorization: "Bearer dl_1234567890abcdef" }
+      metadata: { authorization: "Bearer dl_fixture_token_1234567890abcdef" }
     });
 
     expect(record.metadata).toEqual({});
@@ -65,8 +65,8 @@ describe("redaction helpers", () => {
         requestId: "req_1",
         correlationId: "req_1",
         action: "deployment.read",
-        token: "dl_1234567890abcdef",
-        environment: { DATABASE_URL: "postgres://user:password@private.example.test/app" },
+        token: "dl_fixture_token_1234567890abcdef",
+        environment: { DATABASE_URL: "postgres://test_fixture_user:test_fixture_password@fixture.invalid/test_fixture_database" },
         certificate: "-----BEGIN PRIVATE KEY-----"
       });
 
