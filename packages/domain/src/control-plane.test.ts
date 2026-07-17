@@ -12,10 +12,13 @@ describe("control-plane policy", () => {
     expect(evaluator.evaluate({ ...request, role: "auditor", grants: [{ id: "grant", actorId: request.actorId, action: "project.delete", scope: request.scope }] })).toMatchObject({ allowed: false, code: "ROLE_DENIED" });
   });
 
-  it("denies a cross-project grant and permits an exact project grant", () => {
+  it("requires admin for platform grants while preserving exact project grants for operators", () => {
     expect(evaluator.evaluate({ ...request, role: "operator", grants: [{ id: "other", actorId: request.actorId, action: "project.delete", scope: { kind: "project", projectId: "project-b" } }] })).toMatchObject({ allowed: false, code: "SCOPE_DENIED" });
+    expect(evaluator.evaluate({ ...request, role: "operator", grants: [{ id: "platform", actorId: request.actorId, action: "project.delete", scope: { kind: "platform" } }] })).toMatchObject({ allowed: false, code: "SCOPE_DENIED" });
+    expect(evaluator.evaluate({ ...request, scope: { kind: "platform" }, role: "operator", grants: [{ id: "platform", actorId: request.actorId, action: "project.delete", scope: { kind: "platform" } }] })).toMatchObject({ allowed: false, code: "SCOPE_DENIED" });
     expect(evaluator.evaluate({ ...request, role: "operator", grants: [{ id: "foreign", actorId: "actor-b", action: "project.delete", scope: request.scope }] })).toMatchObject({ allowed: false, code: "FORBIDDEN" });
     expect(evaluator.evaluate({ ...request, role: "operator", grants: [{ id: "exact", actorId: request.actorId, action: "project.delete", scope: request.scope }] })).toEqual({ allowed: true, grantId: "exact", correlationId: "corr-1" });
+    expect(evaluator.evaluate({ ...request, role: "admin", grants: [{ id: "admin-platform", actorId: request.actorId, action: "project.delete", scope: { kind: "platform" } }] })).toEqual({ allowed: true, grantId: "admin-platform", correlationId: "corr-1" });
   });
 });
 

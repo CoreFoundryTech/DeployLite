@@ -62,7 +62,9 @@ async function authFixture(options: AuthFixtureOptions = {}) {
   const users = new InMemoryAuthUserRepository([user]);
   const state = options.state
     ? { envSecretValues: new InMemoryEnvSecretValueRepository(), envSecretCipher: testEnvSecretCipher, ...options.state }
-    : undefined;
+    : options.env?.DEPLOYLITE_CONTROL_PLANE_CONFIRMED_DELETE === "true"
+      ? { controlGrants: { listForActor: async (actorId: string) => actorId === user.id ? [{ id: "test-admin-platform-grant", actorId, action: "project.delete" as const, scope: { kind: "platform" as const } }] : [] } }
+      : undefined;
   const app = await buildApiApp({
     auth: { audit, hasher, sessions, users },
     authConfig: { cookieName: "dl_test_session", cookieSecure: false, sessionTtlSeconds: 3600 },
@@ -930,6 +932,23 @@ describe("DeployLite API scaffold", () => {
     expect(retry.statusCode).toBe(200);
     expect(retry.json().data).toMatchObject({ removed: true, commandId, idempotent: true });
     expect(audit.events.some((event) => event.action === "project.delete" && event.targetId === projectId)).toBe(true);
+  });
+
+  it("denies an operator with a platform grant from deleting another project", async () => {
+    const { app } = await authFixture({
+      env: { ...testEnv, DEPLOYLITE_CONTROL_PLANE_CONFIRMED_DELETE: "true" },
+      user: { role: "operator" },
+      state: { controlGrants: { listForActor: async (actorId: string) => actorId === "user_test_1" ? [{ id: "operator-platform-grant", actorId, action: "project.delete" as const, scope: { kind: "platform" as const } }] : [] } }
+    });
+    const cookie = await loginCookie(app);
+    const projectA = await app.inject({ method: "POST", url: "/api/v1/projects", headers: { ...contentHeaders, cookie }, payload: { name: "Operator project", repoUrl: "https://github.com/example/operator-project", defaultBranch: "main" } });
+    const projectB = await app.inject({ method: "POST", url: "/api/v1/projects", headers: { ...contentHeaders, cookie }, payload: { name: "Other project", repoUrl: "https://github.com/example/other-project", defaultBranch: "main" } });
+
+    const denied = await app.inject({ method: "DELETE", url: `/api/v1/projects/${projectB.json().data.project.id}`, headers: { cookie, "x-control-idempotency-key": "operator-platform-cross-project" } });
+
+    expect(projectA.statusCode).toBe(200);
+    expect(projectB.statusCode).toBe(200);
+    expect(denied.statusCode).toBe(403);
   });
 
   it("rejects DELETE for read-only callers, missing projects, and unauthenticated requests", async () => {

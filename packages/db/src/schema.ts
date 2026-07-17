@@ -263,6 +263,24 @@ export const controlCommands = pgTable(
   ]
 );
 
+export const controlGrants = pgTable(
+  "control_grants",
+  {
+    id: uuid("id").primaryKey().defaultRandom(),
+    actorUserId: uuid("actor_user_id").notNull().references(() => users.id, { onDelete: "restrict", onUpdate: "cascade" }),
+    action: text("action").notNull(),
+    scopeKind: text("scope_kind").notNull(),
+    scopeKey: text("scope_key").notNull(),
+    createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow()
+  },
+  (table) => [
+    uniqueIndex("control_grants_actor_action_scope_unique").on(table.actorUserId, table.action, table.scopeKind, table.scopeKey),
+    index("control_grants_actor_user_id_idx").on(table.actorUserId),
+    check("control_grants_action_valid", sql`${table.action} in ('project.delete', 'project.deploy', 'project.update', 'platform.agent.register')`),
+    check("control_grants_scope_valid", sql`${table.scopeKind} in ('platform', 'project')`)
+  ]
+);
+
 export const controlCommandConfirmations = pgTable(
   "control_command_confirmations",
   {
@@ -342,4 +360,5 @@ export type NewEnvVariableMetadata = typeof envVariableMetadata.$inferInsert;
 export type EnvSecretValueRow = typeof envSecretValues.$inferSelect;
 export type NewEnvSecretValue = typeof envSecretValues.$inferInsert;
 export type ControlCommandRow = typeof controlCommands.$inferSelect;
+export type ControlGrantRow = typeof controlGrants.$inferSelect;
 export type ControlCommandConfirmationRow = typeof controlCommandConfirmations.$inferSelect;

@@ -2,6 +2,7 @@ import { createHash, randomUUID } from "node:crypto";
 import type { CanonicalRole, ConfirmationClassification, ControlCommandStatus, ControlPlaneAction, ControlPlaneScope } from "@deploylite/contracts";
 
 export type ControlGrant = { id: string; actorId: string; action: ControlPlaneAction; scope: ControlPlaneScope };
+export type ControlGrantRepository = { listForActor(actorId: string): Promise<ControlGrant[]> };
 export type PolicyRequest = { actorId: string; role: CanonicalRole; action: ControlPlaneAction; scope: ControlPlaneScope; correlationId: string; grants: ControlGrant[] };
 export type PolicyDecision = { allowed: true; grantId: string; correlationId: string } | { allowed: false; code: "FORBIDDEN" | "ROLE_DENIED" | "SCOPE_DENIED"; correlationId: string };
 export type ControlCommand = { id: string; actorId: string; action: ControlPlaneAction; scope: ControlPlaneScope; inputDigest: string; idempotencyKey: string; correlationId: string; status: ControlCommandStatus; expiresAt: Date };
@@ -14,7 +15,7 @@ export class PolicyEvaluator {
   evaluate(request: PolicyRequest): PolicyDecision {
     if (readOnlyRoles.has(request.role)) return { allowed: false, code: "ROLE_DENIED", correlationId: request.correlationId };
     const actionGrants = request.grants.filter((grant) => grant.actorId === request.actorId && grant.action === request.action);
-    const grant = actionGrants.find((candidate) => scopesEqual(candidate.scope, request.scope));
+    const grant = actionGrants.find((candidate) => grantApplies(candidate.scope, request.scope, request.role));
     if (grant) return { allowed: true, grantId: grant.id, correlationId: request.correlationId };
     return { allowed: false, code: actionGrants.length ? "SCOPE_DENIED" : "FORBIDDEN", correlationId: request.correlationId };
   }
@@ -61,6 +62,11 @@ export function scopeKey(scope: ControlPlaneScope): string { return scope.kind =
 
 function scopesEqual(left: ControlPlaneScope, right: ControlPlaneScope): boolean {
   return left.kind === right.kind && (left.kind === "platform" || left.projectId === (right as Extract<ControlPlaneScope, { kind: "project" }>).projectId);
+}
+
+function grantApplies(grantScope: ControlPlaneScope, requestedScope: ControlPlaneScope, role: CanonicalRole): boolean {
+  if (grantScope.kind === "platform") return role === "admin";
+  return scopesEqual(grantScope, requestedScope);
 }
 
 function stableJson(value: unknown): string {

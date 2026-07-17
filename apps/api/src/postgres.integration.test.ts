@@ -1,7 +1,7 @@
 import { randomUUID } from "node:crypto";
 import { readdir, readFile } from "node:fs/promises";
 
-import { closeDbPool, createDbClient, createDbPool, DbAgentRepository, DbDeploymentRepository, DbProjectRepository, type DeployLiteDb } from "@deploylite/db";
+import { BcryptPasswordHasher, closeDbPool, createDbClient, createDbPool, DbAgentRepository, DbDeploymentRepository, DbProjectRepository, type DeployLiteDb } from "@deploylite/db";
 import type { FastifyInstance } from "fastify";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 
@@ -153,12 +153,14 @@ describeIntegration("DeployLite API PostgreSQL integration", () => {
     await restartedApp.close();
   }, 30_000);
 
-  it("persists the confirmed delete command and correlated audit while making replay idempotent", async () => {
+  it("allows an admin platform grant to persist the confirmed delete command and correlated audit while making replay idempotent", async () => {
     const app = await createPostgresApp();
     const login = await app.inject({ method: "POST", url: "/api/v1/auth/login", headers: contentHeaders, payload: { email: "admin@example.test", password: adminPassword } });
     const cookie = login.headers["set-cookie"] as string;
+    const actorId = login.json().data.user.id as string;
     const projectId = randomUUID();
     await new DbProjectRepository(requireDb()).save({ id: projectId, name: "Confirmed PostgreSQL project", repoUrl: "https://github.com/example/confirmed-postgres", defaultBranch: "main", buildCommand: null, runCommand: null, port: null, description: null, imageTag: null });
+    await requirePool().query("INSERT INTO control_grants (actor_user_id, action, scope_kind, scope_key) VALUES ($1, 'project.delete', 'platform', 'platform')", [actorId]);
     const headers = { cookie, "x-control-idempotency-key": "postgres-confirmed-delete" };
 
     const pending = await app.inject({ method: "DELETE", url: `/api/v1/projects/${projectId}`, headers });
@@ -173,6 +175,31 @@ describeIntegration("DeployLite API PostgreSQL integration", () => {
     const audit = await requirePool().query<{ outcome: string; correlation_id: string; consumed_at: Date | null; status: string }>("SELECT a.outcome, a.correlation_id, c.consumed_at, cmd.status FROM control_command_audits a JOIN control_command_confirmations c ON c.id = a.confirmation_id JOIN control_commands cmd ON cmd.id = a.command_id WHERE a.command_id = $1", [commandId]);
     expect(audit.rows).toEqual([expect.objectContaining({ outcome: "accepted", status: "completed", consumed_at: expect.any(Date) })]);
     expect(audit.rows[0]?.correlation_id).toBeTruthy();
+    await app.close();
+  }, 30_000);
+
+  it("uses persisted platform and project grants to deny cross-project operator deletes while allowing the exact project scope", async () => {
+    const app = await createPostgresApp();
+    const operatorId = randomUUID();
+    const projectA = randomUUID();
+    const projectB = randomUUID();
+    const operatorRole = (await requirePool().query<{ id: string }>("SELECT id FROM roles WHERE name = 'operator'")).rows[0];
+    if (!operatorRole) throw new Error("Canonical operator role was not seeded");
+    const passwordHash = await new BcryptPasswordHasher(10).hash(adminPassword);
+    await requirePool().query("INSERT INTO users (id, email, email_normalized, password_hash, role_id) VALUES ($1, $2, $2, $3, $4)", [operatorId, `${operatorId}@example.test`, passwordHash, operatorRole.id]);
+    await new DbProjectRepository(requireDb()).save({ id: projectA, name: "Granted project", repoUrl: "https://github.com/example/granted", defaultBranch: "main", buildCommand: null, runCommand: null, port: null, description: null, imageTag: null });
+    await new DbProjectRepository(requireDb()).save({ id: projectB, name: "Denied project", repoUrl: "https://github.com/example/denied", defaultBranch: "main", buildCommand: null, runCommand: null, port: null, description: null, imageTag: null });
+    await requirePool().query("INSERT INTO control_grants (actor_user_id, action, scope_kind, scope_key) VALUES ($1, 'project.delete', 'platform', 'platform'), ($1, 'project.delete', 'project', $2)", [operatorId, projectA]);
+    const login = await app.inject({ method: "POST", url: "/api/v1/auth/login", headers: contentHeaders, payload: { email: `${operatorId}@example.test`, password: adminPassword } });
+    const denied = await app.inject({ method: "DELETE", url: `/api/v1/projects/${projectB}`, headers: { cookie: login.headers["set-cookie"] as string, "x-control-idempotency-key": "cross-project-denial", "x-request-id": "req_cross_project_denial" } });
+
+    expect(denied.statusCode).toBe(403);
+    expect((await requirePool().query("SELECT id FROM control_commands WHERE actor_user_id = $1", [operatorId])).rowCount).toBe(0);
+    await expect(requirePool().query("SELECT action, correlation_id, metadata FROM audit_events WHERE actor_user_id = $1 AND target_id = $2", [operatorId, projectB])).resolves.toMatchObject({
+      rows: [expect.objectContaining({ action: "project.delete.rejected", correlation_id: expect.any(String), metadata: { reason: "SCOPE_DENIED" } })]
+    });
+    const allowed = await app.inject({ method: "DELETE", url: `/api/v1/projects/${projectA}`, headers: { cookie: login.headers["set-cookie"] as string, "x-control-idempotency-key": "exact-project-allow" } });
+    expect(allowed.statusCode).toBe(202);
     await app.close();
   }, 30_000);
 });
