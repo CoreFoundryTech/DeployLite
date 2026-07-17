@@ -21,13 +21,13 @@ The installer installs Docker prerequisites and copies `compose.yml` plus `compo
 - API CORS and the web API URLs derive from `https://${DEPLOYLITE_PUBLIC_HOST}`.
 - Health checks gate API/Web startup where Compose supports dependency conditions.
 
-For local review, render the configuration without starting services:
+For local review, render the installer-safe base and Traefik overlay without starting services or enabling the runtime profile:
 
 ```bash
-docker compose -f infra/vps/compose.yml -f infra/vps/compose.tls.yml --env-file infra/vps/.env.example --profile runtime config
+docker compose -f infra/vps/compose.yml -f infra/vps/compose.tls.yml config --no-interpolate
 ```
 
-Functional domain, ACME email, and runtime secret persistence are web-owned configuration. The current blocker is that no web persistence surface exists for these values, so the installer intentionally does not create a functional `.env`; `.env.example` is render-only and invalid for public use.
+Functional domain, ACME email, and runtime secrets (including `POSTGRES_PASSWORD`) are web-owned configuration. The installer intentionally does not generate, request, or persist them, and it never enables the `runtime` profile. Configure those values through the web-owned configuration flow before enabling runtime later; `.env.example` is render-only and invalid for public use.
 
 ## VPS installer runbook
 
@@ -51,6 +51,6 @@ Alternatively, run from a reviewed source checkout:
 sudo bash scripts/install.sh
 ```
 
-The installer supports Ubuntu 20.04/22.04/24.04 and Debian 11/12 on x86_64 or arm64. It requires root or sudo, verifies ports `80` and `443`, installs/verifies Docker Engine and the Compose plugin through `apt`, copies both Compose files, and validates their merged TLS runtime configuration. It does not start application services.
+The installer supports Ubuntu 20.04/22.04/24.04 and Debian 11/12 on x86_64 or arm64. It requires root or sudo, verifies ports `80` and `443`, installs/verifies Docker Engine and the Compose plugin through `apt`, copies both Compose files, and validates their merged base/Traefik configuration without the runtime profile. It does not start application services.
 
 This contract does not configure a public domain, ACME identity, firewall, backups, upgrades, uninstall/reset, Dokploy, or a deployment agent/server Docker socket.

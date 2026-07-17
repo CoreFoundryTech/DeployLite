@@ -100,24 +100,6 @@ test_prepare_install_dir_copies_tls_overlay() {
   rm -rf "$tmp"
 }
 
-test_write_env_generates_once_with_private_permissions() {
-  local tmp saved
-  tmp="$(mktemp -d)"
-  INSTALL_DIR="${tmp}/install"
-  ENV_FILE="${INSTALL_DIR}/.env"
-  mkdir -p "$INSTALL_DIR"
-  DEPLOYLITE_PUBLIC_HOST="198.51.100.10"
-  as_root() { "$@"; }
-  random_secret() { printf 'generated-secret'; }
-  write_env
-  saved="$(cat "$ENV_FILE")"
-  assert_contains "$saved" 'DEPLOYLITE_PUBLIC_WEB_ORIGIN=http://198.51.100.10'
-  assert_contains "$saved" 'DEPLOYLITE_PUBLIC_API_ORIGIN=http://198.51.100.10:3001'
-  assert_contains "$saved" 'POSTGRES_PASSWORD=generated-secret'
-  [[ "$(stat -f '%Lp' "$ENV_FILE" 2>/dev/null || stat -c '%a' "$ENV_FILE")" == "600" ]]
-  rm -rf "$tmp"
-}
-
 test_installed_compose_uses_source_tree_build_context() {
   local tmp rendered
   tmp="$(mktemp -d)"
@@ -131,37 +113,6 @@ test_installed_compose_uses_source_tree_build_context() {
   rendered="$(cat "$COMPOSE_FILE" "$TLS_COMPOSE_FILE")"
   assert_contains "$rendered" "context: ${ROOT_DIR}" || return 1
   assert_not_contains "$rendered" 'context: ../..' || return 1
-  rm -rf "$tmp"
-}
-
-test_failure_cleanup_preserves_config_and_uses_compose_down_only() {
-  local tmp output status
-  tmp="$(mktemp -d)"
-  INSTALL_DIR="${tmp}/install"
-  ENV_FILE="${INSTALL_DIR}/.env"
-  mkdir -p "$INSTALL_DIR"
-  printf 'POSTGRES_PASSWORD=keep-me\n' >"$ENV_FILE"
-  CHANGED_STEPS=(env-created runtime-started)
-  CREATED_RUNTIME=1
-  compose_down_safe() { printf 'compose down called\n'; }
-  output="$(on_error 2>&1)" && status=0 || status=$?
-  [[ "$status" -ne 0 ]]
-  assert_contains "$output" 'compose down called'
-  assert_contains "$(cat "$ENV_FILE")" 'POSTGRES_PASSWORD=keep-me'
-  rm -rf "$tmp"
-}
-
-test_final_url_output_points_to_first_owner_setup() {
-  local tmp output
-  tmp="$(mktemp -d)"
-  INSTALL_DIR="${tmp}/install"
-  ENV_FILE="${INSTALL_DIR}/.env"
-  mkdir -p "$INSTALL_DIR"
-  printf 'DEPLOYLITE_PUBLIC_HOST=203.0.113.55\n' >"$ENV_FILE"
-  output="$(print_success)"
-  assert_contains "$output" 'DeployLite URL: http://203.0.113.55'
-  assert_contains "$output" 'create the first owner account'
-  assert_contains "$output" 'No default admin credentials'
   rm -rf "$tmp"
 }
 
@@ -212,69 +163,13 @@ test_redact_stream_removes_postgres_passwords_and_key_value_secrets() {
   assert_contains "$output" 'plain line' || { printf 'plain line lost in stream: %s\n' "$output"; return 1; }
 }
 
-test_write_env_uses_prompted_public_host_in_interactive_mode() {
-  local tmp saved
-  tmp="$(mktemp -d)"
-  INSTALL_DIR="${tmp}/install"
-  ENV_FILE="${INSTALL_DIR}/.env"
-  mkdir -p "$INSTALL_DIR"
-  # Provide a default via env so detect_public_host_inner returns it.
-  DEPLOYLITE_PUBLIC_HOST="198.51.100.10"
-  INTERACTIVE=1
-  as_root() { "$@"; }
-  random_secret() { printf 'generated-secret'; }
-  # Pipe an override value; the function must use it in the env file.
-  write_env <<<'203.0.113.99'
-  saved="$(cat "$ENV_FILE")"
-  assert_contains "$saved" 'DEPLOYLITE_PUBLIC_HOST=203.0.113.99' || { printf 'expected prompted host, got: %s\n' "$saved"; rm -rf "$tmp"; return 1; }
-  assert_contains "$saved" 'DEPLOYLITE_PUBLIC_WEB_ORIGIN=http://203.0.113.99' || { printf 'expected web origin, got: %s\n' "$saved"; rm -rf "$tmp"; return 1; }
-  assert_contains "$saved" 'DEPLOYLITE_PUBLIC_API_ORIGIN=http://203.0.113.99:3001' || { printf 'expected api origin, got: %s\n' "$saved"; rm -rf "$tmp"; return 1; }
-  rm -rf "$tmp"
-}
-
-test_write_env_in_interactive_mode_uses_empty_default_when_detection_fails() {
-  local tmp saved
-  tmp="$(mktemp -d)"
-  INSTALL_DIR="${tmp}/install"
-  ENV_FILE="${INSTALL_DIR}/.env"
-  mkdir -p "$INSTALL_DIR"
-  unset DEPLOYLITE_PUBLIC_HOST
-  INTERACTIVE=1
-  as_root() { "$@"; }
-  random_secret() { printf 'generated-secret'; }
-  # Stub detect_public_host_inner to return empty (no network, no env).
-  detect_public_host_inner() { :; }
-  # Provide a value via the prompt.
-  write_env <<<'198.51.100.42'
-  saved="$(cat "$ENV_FILE")"
-  assert_contains "$saved" 'DEPLOYLITE_PUBLIC_HOST=198.51.100.42' || { printf 'expected prompted host with empty default, got: %s\n' "$saved"; rm -rf "$tmp"; return 1; }
-  rm -rf "$tmp"
-}
-
-test_write_env_in_noninteractive_mode_hard_fails_when_no_host() {
-  local tmp status fail_called=0
-  tmp="$(mktemp -d)"
-  INSTALL_DIR="${tmp}/install"
-  ENV_FILE="${INSTALL_DIR}/.env"
-  mkdir -p "$INSTALL_DIR"
-  unset DEPLOYLITE_PUBLIC_HOST
-  INTERACTIVE=0
-  as_root() { "$@"; }
-  random_secret() { printf 'generated-secret'; }
-  # Stub detect_public_host to return empty (simulating a host that
-  # cannot be detected) WITHOUT calling the real fail() — that would
-  # exit the test runner. The hard-fail path in write_env must then
-  # call fail() itself. We stub fail() to record the call and return
-  # a non-zero status instead of exiting; the real fail() would call
-  # exit, which is the behavior we are exercising the guard for.
-  detect_public_host() { :; }
-  fail() { fail_called=1; return 2; }
-  set +e
-  write_env >/dev/null 2>&1
-  status=$?
-  set -e
-  [[ "$fail_called" -eq 1 ]] || { printf 'expected fail() to be called when no host available, got status=%s fail_called=%s\n' "$status" "$fail_called"; rm -rf "$tmp"; return 1; }
-  rm -rf "$tmp"
+test_validate_compose_omits_runtime_profile() {
+  local compose_calls=""
+  compose() { compose_calls="$*"; }
+  validate_compose >/dev/null
+  assert_contains "$compose_calls" 'config' || return 1
+  assert_contains "$compose_calls" '--no-interpolate' || return 1
+  assert_not_contains "$compose_calls" '--profile' || return 1
 }
 
 run_test 'redaction masks secrets' test_redaction_masks_database_url_and_secret_assignments
@@ -283,12 +178,12 @@ run_test 'occupied port fails actionably' test_occupied_port_fails_actionably
 run_test 'missing Docker triggers Docker apt repository install path' test_install_docker_uses_docker_apt_repo_when_missing
 run_test 'copies TLS Compose overlay' test_prepare_install_dir_copies_tls_overlay
 run_test 'installed compose keeps valid build context' test_installed_compose_uses_source_tree_build_context
-run_test 'failure cleanup preserves config' test_failure_cleanup_preserves_config_and_uses_compose_down_only
 run_test 'prompt_value returns default in noninteractive mode' test_prompt_value_returns_default_in_noninteractive_mode
 run_test 'explicit noninteractive mode disables TUI' test_parse_args_supports_explicit_noninteractive_mode
 run_test 'prompt_value returns piped value in interactive no-tty mode' test_prompt_value_returns_piped_value_in_interactive_no_tty_mode
 run_test 'prompt_value returns default when piped empty in interactive no-tty mode' test_prompt_value_returns_default_when_piped_empty_in_interactive_no_tty_mode
 run_test 'redact_stream removes postgres passwords and key=value secrets' test_redact_stream_removes_postgres_passwords_and_key_value_secrets
+run_test 'validates Compose without the runtime profile' test_validate_compose_omits_runtime_profile
 
 printf '\n%d passed, %d failed\n' "$PASS" "$FAIL"
 [[ "$FAIL" -eq 0 ]]

@@ -63,6 +63,7 @@ print_usage() {
 Usage: install.sh [options]
 
 Options:
+  --interactive, -i       Show the prerequisite confirmation TUI (default).
   --non-interactive   Skip the prerequisite confirmation TUI.
   --help, -h          Show this help and exit.
 
@@ -297,14 +298,6 @@ install_docker_apt_repository() {
     | as_root tee "$repo_file" >/dev/null
 }
 
-random_secret() {
-  if command_exists openssl; then
-    openssl rand -hex 32 | tr -d '\n'
-  else
-    LC_ALL=C tr -dc 'A-Za-z0-9_-' </dev/urandom | head -c 48
-  fi
-}
-
 prepare_install_dir() {
   if [[ -d "$INSTALL_DIR" && -f "$COMPOSE_FILE" && -f "$TLS_COMPOSE_FILE" ]]; then
     info "Existing install at ${INSTALL_DIR} detected; preserving state."
@@ -331,8 +324,8 @@ compose() { as_root docker compose -f "$COMPOSE_FILE" -f "$TLS_COMPOSE_FILE" --p
 compose_down_safe() { compose down --remove-orphans; }
 
 validate_compose() {
-  info "Validating merged Compose configuration."
-  compose --profile runtime config >/dev/null
+  info "Validating base and Traefik Compose configuration without the runtime profile."
+  compose config --no-interpolate >/dev/null
 }
 
 main() {
@@ -352,7 +345,7 @@ main() {
   install_docker
   prepare_install_dir
   validate_compose
-  info "Prerequisites and Compose templates are ready. Domain and ACME configuration remain web-owned."
+  info "Prerequisites and Compose templates are ready. Web-owned runtime configuration is required before enabling the runtime profile."
 }
 
 if [[ "${DEPLOYLITE_INSTALL_TESTING:-0}" != "1" ]]; then

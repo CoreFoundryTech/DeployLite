@@ -2,10 +2,12 @@
 set -Eeuo pipefail
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-rendered="$(docker compose -f "$ROOT_DIR/infra/vps/compose.yml" -f "$ROOT_DIR/infra/vps/compose.tls.yml" --env-file "$ROOT_DIR/infra/vps/.env.example" --profile runtime config)"
+base_rendered="$(docker compose -f "$ROOT_DIR/infra/vps/compose.yml" config --no-interpolate)"
+rendered="$(docker compose -f "$ROOT_DIR/infra/vps/compose.yml" -f "$ROOT_DIR/infra/vps/compose.tls.yml" config --no-interpolate)"
 
 contains() { [[ "$rendered" == *"$1"* ]] || { printf 'missing: %s\n' "$1"; return 1; }; }
-contains 'DEPLOYLITE_CORS_ORIGIN: https://deploylite.invalid'
+[[ "$base_rendered" == *'traefik:v3.1'* ]] || { printf 'base Compose must render Traefik without runtime configuration\n'; exit 1; }
+contains "DEPLOYLITE_CORS_ORIGIN: https://\${DEPLOYLITE_PUBLIC_HOST:-deploylite.invalid}"
 contains -- '--entrypoints.web.http.redirections.entrypoint.scheme=https'
 contains 'source: traefik-acme'
 contains 'target: /acme'
