@@ -19,6 +19,7 @@ services:
       - deploylite
   postgres:
     image: postgres:16-alpine
+    profiles: [runtime]
     restart: unless-stopped
     environment:
       POSTGRES_DB: ${POSTGRES_DB:-deploylite}
@@ -39,6 +40,7 @@ services:
       context: ../..
       dockerfile: apps/api/Dockerfile
     image: deploylite-api:local
+    profiles: [runtime]
     restart: "no"
     depends_on:
       postgres:
@@ -54,6 +56,7 @@ services:
       context: ../..
       dockerfile: apps/api/Dockerfile
     image: deploylite-api:local
+    profiles: [runtime]
     restart: unless-stopped
     depends_on:
       postgres:
@@ -70,7 +73,7 @@ services:
       DEPLOYLITE_SECRET_KEY: ${DEPLOYLITE_SECRET_KEY:?DEPLOYLITE_SECRET_KEY is required}
       DEPLOYLITE_SESSION_TTL_SECONDS: ${DEPLOYLITE_SESSION_TTL_SECONDS:-28800}
       DEPLOYLITE_SESSION_COOKIE_NAME: ${DEPLOYLITE_SESSION_COOKIE_NAME:-deploylite_session}
-      DEPLOYLITE_SESSION_COOKIE_SECURE: ${DEPLOYLITE_SESSION_COOKIE_SECURE:-false}
+      DEPLOYLITE_SESSION_COOKIE_SECURE: "true"
       DEPLOYLITE_BCRYPT_COST: ${DEPLOYLITE_BCRYPT_COST:-12}
     labels:
       - traefik.enable=true
@@ -91,6 +94,7 @@ services:
       context: ../..
       dockerfile: apps/web/Dockerfile
     image: deploylite-web:local
+    profiles: [runtime]
     restart: unless-stopped
     depends_on:
       api:

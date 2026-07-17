@@ -114,10 +114,27 @@ test_write_env_generates_runtime_secrets_without_business_configuration() {
   saved="$(cat "$ENV_FILE")"
   assert_contains "$saved" 'POSTGRES_PASSWORD=generated-secret'
   assert_contains "$saved" 'DEPLOYLITE_SECRET_KEY=generated-secret'
+  assert_not_contains "$saved" 'DEPLOYLITE_SESSION_COOKIE_SECURE='
   assert_not_contains "$saved" 'DEPLOYLITE_DOMAIN='
   assert_not_contains "$saved" 'DEPLOYLITE_ACME_EMAIL='
   [[ "$(stat -f '%Lp' "$ENV_FILE" 2>/dev/null || stat -c '%a' "$ENV_FILE")" == "600" ]]
   rm -rf "$tmp"
+}
+
+test_base_compose_requires_runtime_profile_and_secure_cookies() {
+  local compose
+  compose="$(cat "${ROOT_DIR}/infra/vps/compose.yml")"
+  assert_contains "$compose" 'profiles: [runtime]' || return 1
+  assert_contains "$compose" 'DEPLOYLITE_SESSION_COOKIE_SECURE: "true"' || return 1
+  assert_not_contains "$compose" "DEPLOYLITE_SESSION_COOKIE_SECURE: \${DEPLOYLITE_SESSION_COOKIE_SECURE:-false}" || return 1
+}
+
+test_tls_overlay_keeps_websecure_routes() {
+  local overlay
+  overlay="$(cat "${ROOT_DIR}/infra/vps/compose.tls.yml")"
+  assert_contains "$overlay" 'deploylite-api-tls.entrypoints=websecure' || return 1
+  assert_contains "$overlay" 'deploylite-web-tls.entrypoints=websecure' || return 1
+  assert_contains "$overlay" 'certificatesresolvers.letsencrypt.acme' || return 1
 }
 
 test_installed_compose_uses_source_tree_build_context() {
@@ -210,6 +227,8 @@ run_test 'occupied port fails actionably' test_occupied_port_fails_actionably
 run_test 'missing Docker triggers Docker apt repository install path' test_install_docker_uses_docker_apt_repo_when_missing
 run_test 'rerun preserves existing secret' test_prepare_install_dir_preserves_existing_secret
 run_test 'env generation writes only runtime secrets' test_write_env_generates_runtime_secrets_without_business_configuration
+run_test 'base compose gates runtime and secure cookies' test_base_compose_requires_runtime_profile_and_secure_cookies
+run_test 'TLS overlay retains secure routes' test_tls_overlay_keeps_websecure_routes
 run_test 'installed compose keeps valid build context' test_installed_compose_uses_source_tree_build_context
 run_test 'failure cleanup preserves config' test_failure_cleanup_preserves_config_and_uses_compose_down_only
 run_test 'success output defers business configuration to web' test_success_output_defers_business_configuration_to_web
