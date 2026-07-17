@@ -8,6 +8,8 @@ export type PolicyDecision = { allowed: true; grantId: string; correlationId: st
 export type ControlCommand = { id: string; actorId: string; action: ControlPlaneAction; scope: ControlPlaneScope; inputDigest: string; idempotencyKey: string; correlationId: string; status: ControlCommandStatus; expiresAt: Date };
 export type ControlConfirmation = { id: string; commandId: string; actorId: string; action: ControlPlaneAction; scope: ControlPlaneScope; inputDigest: string; classification: ConfirmationClassification; expiresAt: Date; consumedAt: Date | null };
 export type ConfirmationOutcome = { command: ControlCommand; accepted: boolean; reason: string | null };
+export type ConfirmedProjectDeleteInput = { command: ControlCommand; confirmation: ControlConfirmation; projectId: string; requestId: string; now?: Date };
+export type ConfirmedProjectDeleteOutcome = ConfirmationOutcome & { removed: boolean; auditRecorded: boolean; alreadyCompleted: boolean };
 
 const readOnlyRoles = new Set<CanonicalRole>(["read-only", "auditor"]);
 
@@ -56,6 +58,9 @@ export type ControlCommandRepository = {
 export type ControlConfirmationRepository = {
   bind(confirmation: ControlConfirmation): Promise<void>;
   consume(command: ControlCommand, confirmation: ControlConfirmation, now?: Date): Promise<ConfirmationOutcome>;
+};
+export type ControlDeleteRepository = ControlCommandRepository & ControlConfirmationRepository & {
+  executeConfirmedProjectDelete(input: ConfirmedProjectDeleteInput): Promise<ConfirmedProjectDeleteOutcome>;
 };
 
 export function scopeKey(scope: ControlPlaneScope): string { return scope.kind === "platform" ? "platform" : scope.projectId; }
