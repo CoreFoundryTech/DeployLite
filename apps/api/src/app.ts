@@ -43,6 +43,7 @@ import {
   type CanonicalRoleName,
   type ControlCommand,
   type ControlCommandRepository,
+  type ControlDeleteRepository,
   type ControlConfirmation,
   type ControlConfirmationRepository,
   type CreateInitialAdminInput,
@@ -438,7 +439,7 @@ type PlatformRepositoryOptions = {
   envMetadata?: EnvVariableMetadataRepository;
   envSecretValues?: EnvSecretValueRepository;
   envSecretCipher?: EnvSecretCipher;
-  controlDeletes?: ControlCommandRepository & ControlConfirmationRepository;
+  controlDeletes?: ControlDeleteRepository;
 };
 
 type PlatformRepositories = PlatformRepositoryOptions & {
@@ -447,7 +448,7 @@ type PlatformRepositories = PlatformRepositoryOptions & {
   envSecretValues: EnvSecretValueRepository;
   envSecretCipher: EnvSecretCipher;
   deployRunner: DeployRunner;
-  controlDeletes: ControlCommandRepository & ControlConfirmationRepository;
+  controlDeletes: ControlDeleteRepository;
 };
 
 type EnvSecretKeySource = NodeJS.ProcessEnv | Record<string, string | number | boolean | undefined>;
@@ -475,10 +476,10 @@ function createApiState(env: EnvSecretKeySource, overrides: Partial<PlatformRepo
   const envSecretCipher = overrides.envSecretCipher ?? createLazyEnvSecretCipher(env);
   const agentStatus = new AgentStatusService(agents);
   const deployRunner = new DeployRunner(deployments, envMetadata, agentStatus, envSecretCipher);
-  return { agents, deployments, projects, envMetadata, envSecretValues, envSecretCipher, agentStatus, deployRunner, controlDeletes: overrides.controlDeletes ?? new InMemoryControlDeleteRepository() };
+  return { agents, deployments, projects, envMetadata, envSecretValues, envSecretCipher, agentStatus, deployRunner, controlDeletes: overrides.controlDeletes ?? new InMemoryControlDeleteRepository(projects) };
 }
 
-class InMemoryControlDeleteRepository implements ControlCommandRepository, ControlConfirmationRepository {
+class InMemoryControlDeleteRepository implements ControlDeleteRepository {
   readonly #commands = new Map<string, ControlCommand>();
   readonly #confirmations = new Map<string, ControlConfirmation>();
 
@@ -517,6 +518,15 @@ class InMemoryControlDeleteRepository implements ControlCommandRepository, Contr
     if (current.status === "eligible") current.status = "completed";
     return structuredClone(current);
   }
+
+  async executeConfirmedProjectDelete({ command, confirmation, projectId }: Parameters<ControlDeleteRepository["executeConfirmedProjectDelete"]>[0]) {
+    const outcome = await this.consume(command, confirmation);
+    if (!outcome.accepted || outcome.command.status === "completed") return { ...outcome, removed: outcome.command.status === "completed", auditRecorded: false, alreadyCompleted: outcome.command.status === "completed" };
+    if (!await this.projects.remove(projectId)) throw new Error("Project was not found for confirmed deletion");
+    return { command: await this.complete(outcome.command), accepted: true, reason: null, removed: true, auditRecorded: false, alreadyCompleted: false };
+  }
+
+  constructor(private readonly projects: ProjectRepository) {}
 }
 
 /**
@@ -1007,12 +1017,10 @@ function registerRoutes(app: FastifyInstance, state: PlatformRepositories, adapt
       }
       if (!confirmationId) return reply.code(409).send(errorEnvelope(request, "CONFIRMATION_REQUIRED", "An explicit confirmation is required for project deletion."));
       const confirmation = { id: confirmationId, commandId: resolved.command.id, actorId: resolved.command.actorId, action: resolved.command.action, scope: resolved.command.scope, inputDigest: resolved.command.inputDigest, classification: "destructive" as const, expiresAt: resolved.command.expiresAt, consumedAt: null };
-      const outcome = await state.controlDeletes.consume(resolved.command, confirmation);
-      if (outcome.command.status === "completed") return ok(request, { removed: true, commandId: outcome.command.id, idempotent: true });
-      if (!outcome.accepted) return reply.code(409).send(errorEnvelope(request, "CONFIRMATION_REJECTED", "Confirmation is not eligible for this command."));
-      await state.projects.remove(params.projectId);
-      await state.controlDeletes.complete(outcome.command);
-      await appendAudit(adapters.audit, request, { actorUserId: request.auth!.user.id, action: "project.delete", targetType: "project", targetId: params.projectId, metadata: { commandId: outcome.command.id, confirmationId } });
+       const outcome = await state.controlDeletes.executeConfirmedProjectDelete({ command: resolved.command, confirmation, projectId: params.projectId, requestId: request.correlationContext.requestId });
+       if (outcome.alreadyCompleted) return ok(request, { removed: true, commandId: outcome.command.id, idempotent: true });
+       if (!outcome.accepted) return reply.code(409).send(errorEnvelope(request, "CONFIRMATION_REJECTED", "Confirmation is not eligible for this command."));
+       if (!outcome.auditRecorded) await appendAudit(adapters.audit, request, { actorUserId: request.auth!.user.id, action: "project.delete", targetType: "project", targetId: params.projectId, metadata: { commandId: outcome.command.id, confirmationId } });
       return ok(request, { removed: true, commandId: outcome.command.id, idempotent: false });
     }
     const existing = await state.projects.findById(params.projectId);

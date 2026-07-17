@@ -8,7 +8,7 @@ import { createDbClient, createDbPool, closeDbPool, type DeployLiteDb } from "./
 import { assertEnvMetadataHasNoValueColumns, toEnvVariableMetadataInsert } from "./env-metadata.js";
 import { DbAuthUserRepository, DbRoleRepository, DbSessionRepository } from "./repositories/auth.js";
 import { DbAgentRepository, DbDeploymentRepository, DbProjectRepository } from "./repositories/deployment-data.js";
-import { DbControlCommandRepository } from "./repositories/control-plane.js";
+import { DbControlCommandRepository, type ControlDeleteFaultStage } from "./repositories/control-plane.js";
 import { IdempotencyConflictError, createConfirmation, createControlCommand, digestControlInput } from "@deploylite/domain";
 
 const { Client } = pg;
@@ -352,6 +352,39 @@ describeIntegration("PostgreSQL auth foundation integration", () => {
     await repo.bind(expiredConfirmation);
     await expect(repo.consume(expired, expiredConfirmation)).resolves.toMatchObject({ accepted: false, reason: "confirmation_rejected" });
   });
+
+  it("rolls back every confirmed-delete stage and retries to one terminal command and audit", async () => {
+    const client = requirePool();
+    const role = (await client.query<{ id: string }>("SELECT id FROM roles WHERE name = 'admin'")).rows[0];
+    if (!role) throw new Error("Canonical admin role was not seeded");
+
+    for (const stage of ["confirmation-consumed", "project-deleted", "command-completed", "audit-recorded"] as const satisfies ControlDeleteFaultStage[]) {
+      const actorId = randomUUID();
+      const projectId = randomUUID();
+      await client.query("INSERT INTO users (id, email, email_normalized, password_hash, role_id) VALUES ($1, $2, $2, $3, $4)", [actorId, `${actorId}@example.test`, "hash", role.id]);
+      await requireDbProjectRepository().save({ id: projectId, name: `Atomic ${stage}`, repoUrl: "https://github.com/example/atomic", defaultBranch: "main", buildCommand: null, runCommand: null, port: null, description: null, imageTag: null });
+      const command = createControlCommand({ actorId, action: "project.delete", scope: { kind: "project", projectId }, input: { projectId }, idempotencyKey: `atomic-${stage}`, correlationId: `corr-${stage}` });
+      const confirmation = createConfirmation({ command, classification: "destructive" });
+      const faulting = new DbControlCommandRepository(requireDb(), (current) => {
+        if (current === stage) throw new Error(`fault:${stage}`);
+      });
+      await faulting.resolve(command);
+      await faulting.bind(confirmation);
+
+      await expect(faulting.executeConfirmedProjectDelete({ command, confirmation, projectId, requestId: `req-${stage}` })).rejects.toThrow(`fault:${stage}`);
+      await expect(client.query("SELECT id FROM projects WHERE id = $1", [projectId])).resolves.toMatchObject({ rowCount: 1 });
+      await expect(client.query("SELECT consumed_at FROM control_command_confirmations WHERE id = $1", [confirmation.id])).resolves.toMatchObject({ rows: [expect.objectContaining({ consumed_at: null })] });
+      await expect(client.query("SELECT status FROM control_commands WHERE id = $1", [command.id])).resolves.toMatchObject({ rows: [expect.objectContaining({ status: "pending_confirmation" })] });
+      await expect(client.query("SELECT id FROM control_command_audits WHERE command_id = $1", [command.id])).resolves.toMatchObject({ rowCount: 0 });
+      await expect(client.query("SELECT id FROM audit_events WHERE correlation_id = $1", [command.correlationId])).resolves.toMatchObject({ rowCount: 0 });
+
+      const retry = new DbControlCommandRepository(requireDb());
+      await expect(retry.executeConfirmedProjectDelete({ command, confirmation, projectId, requestId: `req-${stage}` })).resolves.toMatchObject({ accepted: true, removed: true, alreadyCompleted: false, command: { status: "completed" } });
+      await expect(retry.executeConfirmedProjectDelete({ command, confirmation, projectId, requestId: `req-${stage}` })).resolves.toMatchObject({ accepted: true, removed: true, alreadyCompleted: true, command: { status: "completed" } });
+      await expect(client.query("SELECT outcome FROM control_command_audits WHERE command_id = $1", [command.id])).resolves.toMatchObject({ rowCount: 1, rows: [expect.objectContaining({ outcome: "completed" })] });
+      await expect(client.query("SELECT id FROM audit_events WHERE correlation_id = $1", [command.correlationId])).resolves.toMatchObject({ rowCount: 1 });
+    }
+  }, 30_000);
 });
 
 function requirePool(): pg.Pool {

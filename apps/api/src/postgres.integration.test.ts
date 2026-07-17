@@ -171,8 +171,9 @@ describeIntegration("DeployLite API PostgreSQL integration", () => {
     expect(replay.json().data).toMatchObject({ removed: true, commandId, idempotent: true });
 
     const audit = await requirePool().query<{ outcome: string; correlation_id: string; consumed_at: Date | null; status: string }>("SELECT a.outcome, a.correlation_id, c.consumed_at, cmd.status FROM control_command_audits a JOIN control_command_confirmations c ON c.id = a.confirmation_id JOIN control_commands cmd ON cmd.id = a.command_id WHERE a.command_id = $1", [commandId]);
-    expect(audit.rows).toEqual([expect.objectContaining({ outcome: "accepted", status: "completed", consumed_at: expect.any(Date) })]);
+    expect(audit.rows).toEqual([expect.objectContaining({ outcome: "completed", status: "completed", consumed_at: expect.any(Date) })]);
     expect(audit.rows[0]?.correlation_id).toBeTruthy();
+    await expect(requirePool().query("SELECT id FROM audit_events WHERE correlation_id = $1 AND action = 'project.delete' AND target_id = $2", [audit.rows[0]?.correlation_id, projectId])).resolves.toMatchObject({ rowCount: 1 });
     await app.close();
   }, 30_000);
 });
