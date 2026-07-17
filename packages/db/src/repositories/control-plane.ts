@@ -1,9 +1,18 @@
 import { and, eq, gt, isNull } from "drizzle-orm";
-import type { ControlCommand, ControlCommandRepository, ControlConfirmation, ControlConfirmationRepository, ConfirmationOutcome } from "@deploylite/domain";
+import type { ControlCommand, ControlCommandRepository, ControlConfirmation, ControlConfirmationRepository, ControlGrant, ControlGrantRepository, ConfirmationOutcome } from "@deploylite/domain";
 import { IdempotencyConflictError, scopeKey } from "@deploylite/domain";
 
 import type { DeployLiteDb } from "../client.js";
-import { controlCommandAudits, controlCommandConfirmations, controlCommands, type ControlCommandRow } from "../schema.js";
+import { controlCommandAudits, controlCommandConfirmations, controlCommands, controlGrants, type ControlCommandRow, type ControlGrantRow } from "../schema.js";
+
+export class DbControlGrantRepository implements ControlGrantRepository {
+  constructor(private readonly db: DeployLiteDb) {}
+
+  async listForActor(actorId: string): Promise<ControlGrant[]> {
+    const rows = await this.db.select().from(controlGrants).where(eq(controlGrants.actorUserId, actorId));
+    return rows.map(toGrant);
+  }
+}
 
 export class DbControlCommandRepository implements ControlCommandRepository, ControlConfirmationRepository {
   constructor(private readonly db: DeployLiteDb) {}
@@ -58,4 +67,8 @@ export class DbControlCommandRepository implements ControlCommandRepository, Con
 
 function toCommand(row: ControlCommandRow): ControlCommand {
   return { id: row.id, actorId: row.actorUserId, action: row.action as ControlCommand["action"], scope: row.scopeKind === "platform" ? { kind: "platform" } : { kind: "project", projectId: row.scopeKey }, inputDigest: row.inputDigest, idempotencyKey: row.idempotencyKey, correlationId: row.correlationId, status: row.status as ControlCommand["status"], expiresAt: row.expiresAt };
+}
+
+function toGrant(row: ControlGrantRow): ControlGrant {
+  return { id: row.id, actorId: row.actorUserId, action: row.action as ControlGrant["action"], scope: row.scopeKind === "platform" ? { kind: "platform" } : { kind: "project", projectId: row.scopeKey } };
 }

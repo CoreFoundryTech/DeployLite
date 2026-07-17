@@ -8,7 +8,7 @@ import { createDbClient, createDbPool, closeDbPool, type DeployLiteDb } from "./
 import { assertEnvMetadataHasNoValueColumns, toEnvVariableMetadataInsert } from "./env-metadata.js";
 import { DbAuthUserRepository, DbRoleRepository, DbSessionRepository } from "./repositories/auth.js";
 import { DbAgentRepository, DbDeploymentRepository, DbProjectRepository } from "./repositories/deployment-data.js";
-import { DbControlCommandRepository } from "./repositories/control-plane.js";
+import { DbControlCommandRepository, DbControlGrantRepository } from "./repositories/control-plane.js";
 import { IdempotencyConflictError, createConfirmation, createControlCommand, digestControlInput } from "@deploylite/domain";
 
 const { Client } = pg;
@@ -321,6 +321,22 @@ describeIntegration("PostgreSQL auth foundation integration", () => {
     await client.query("INSERT INTO control_commands (id, actor_user_id, action, scope_kind, scope_key, input_digest, idempotency_key, correlation_id, expires_at) VALUES ($1, $2, 'project.delete', 'project', $3, $4, 'rollback-key', 'corr-rollback', now())", [rolledBackId, actorId, randomUUID(), digestControlInput({ rollback: true })]);
     await client.query("ROLLBACK");
     await expect(client.query("SELECT id FROM control_commands WHERE id = $1", [rolledBackId])).resolves.toMatchObject({ rowCount: 0 });
+  });
+
+  it("loads only persisted actor/action grants and fails closed for absent or cross-project scopes", async () => {
+    const client = requirePool();
+    const role = (await client.query<{ id: string }>("SELECT id FROM roles WHERE name = 'operator'")).rows[0];
+    if (!role) throw new Error("Canonical operator role was not seeded");
+    const actorId = randomUUID();
+    await client.query("INSERT INTO users (id, email, email_normalized, password_hash, role_id) VALUES ($1, $2, $2, $3, $4)", [actorId, `${actorId}@example.test`, "hash", role.id]);
+    const projectA = randomUUID();
+    const projectB = randomUUID();
+    await client.query("INSERT INTO control_grants (actor_user_id, action, scope_kind, scope_key) VALUES ($1, 'project.delete', 'project', $2)", [actorId, projectA]);
+    const grants = await new DbControlGrantRepository(requireDb()).listForActor(actorId);
+
+    expect(grants).toEqual([expect.objectContaining({ actorId, action: "project.delete", scope: { kind: "project", projectId: projectA } })]);
+    expect(grants.some((grant) => grant.scope.kind === "project" && grant.scope.projectId === projectB)).toBe(false);
+    await expect(new DbControlGrantRepository(requireDb()).listForActor(randomUUID())).resolves.toEqual([]);
   });
 
   it("atomically rejects mismatched, expired, and replayed confirmations with correlated audit evidence", async () => {

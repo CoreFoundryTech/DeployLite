@@ -21,7 +21,7 @@ import {
   type EnvVariableMetadata,
   type Project
 } from "@deploylite/contracts";
-import { BcryptPasswordHasher, bootstrapInitialAdmin, closeDbPool, createDbClient, createDbPool, createOpaqueSessionToken, DbAgentRepository, DbAuditRepository, DbAuthUserRepository, DbControlCommandRepository, DbDeploymentRepository, DbEnvSecretValueRepository, DbEnvVariableMetadataRepository, DbProjectRepository, DbSessionRepository, hashSessionToken, type DeployLiteDb } from "@deploylite/db";
+import { BcryptPasswordHasher, bootstrapInitialAdmin, closeDbPool, createDbClient, createDbPool, createOpaqueSessionToken, DbAgentRepository, DbAuditRepository, DbAuthUserRepository, DbControlCommandRepository, DbControlGrantRepository, DbDeploymentRepository, DbEnvSecretValueRepository, DbEnvVariableMetadataRepository, DbProjectRepository, DbSessionRepository, hashSessionToken, type DeployLiteDb } from "@deploylite/db";
 import {
   AgentStatusService,
   authenticateLocalUser,
@@ -45,6 +45,8 @@ import {
   type ControlCommandRepository,
   type ControlConfirmation,
   type ControlConfirmationRepository,
+  type ControlGrant,
+  type ControlGrantRepository,
   type CreateInitialAdminInput,
   type CreateSessionInput,
   type EnvSecretValueRepository,
@@ -439,6 +441,7 @@ type PlatformRepositoryOptions = {
   envSecretValues?: EnvSecretValueRepository;
   envSecretCipher?: EnvSecretCipher;
   controlDeletes?: ControlCommandRepository & ControlConfirmationRepository;
+  controlGrants?: ControlGrantRepository;
 };
 
 type PlatformRepositories = PlatformRepositoryOptions & {
@@ -448,6 +451,7 @@ type PlatformRepositories = PlatformRepositoryOptions & {
   envSecretCipher: EnvSecretCipher;
   deployRunner: DeployRunner;
   controlDeletes: ControlCommandRepository & ControlConfirmationRepository;
+  controlGrants: ControlGrantRepository;
 };
 
 type EnvSecretKeySource = NodeJS.ProcessEnv | Record<string, string | number | boolean | undefined>;
@@ -475,7 +479,15 @@ function createApiState(env: EnvSecretKeySource, overrides: Partial<PlatformRepo
   const envSecretCipher = overrides.envSecretCipher ?? createLazyEnvSecretCipher(env);
   const agentStatus = new AgentStatusService(agents);
   const deployRunner = new DeployRunner(deployments, envMetadata, agentStatus, envSecretCipher);
-  return { agents, deployments, projects, envMetadata, envSecretValues, envSecretCipher, agentStatus, deployRunner, controlDeletes: overrides.controlDeletes ?? new InMemoryControlDeleteRepository() };
+  return { agents, deployments, projects, envMetadata, envSecretValues, envSecretCipher, agentStatus, deployRunner, controlDeletes: overrides.controlDeletes ?? new InMemoryControlDeleteRepository(), controlGrants: overrides.controlGrants ?? new InMemoryControlGrantRepository() };
+}
+
+class InMemoryControlGrantRepository implements ControlGrantRepository {
+  constructor(private readonly grants: ControlGrant[] = []) {}
+
+  async listForActor(actorId: string): Promise<ControlGrant[]> {
+    return this.grants.filter((grant) => grant.actorId === actorId).map((grant) => structuredClone(grant));
+  }
 }
 
 class InMemoryControlDeleteRepository implements ControlCommandRepository, ControlConfirmationRepository {
@@ -722,7 +734,8 @@ function createDbAuthAdapters(env: DeployLiteEnv, options: BuildApiAppOptions): 
       envMetadata: options.state?.envMetadata ?? new DbEnvVariableMetadataRepository(db),
       envSecretValues: options.state?.envSecretValues ?? new DbEnvSecretValueRepository(db),
        envSecretCipher: options.state?.envSecretCipher,
-       controlDeletes: options.state?.controlDeletes ?? new DbControlCommandRepository(db)
+        controlDeletes: options.state?.controlDeletes ?? new DbControlCommandRepository(db),
+        controlGrants: options.state?.controlGrants ?? new DbControlGrantRepository(db)
     })
   };
 }
@@ -978,9 +991,7 @@ function registerRoutes(app: FastifyInstance, state: PlatformRepositories, adapt
         action: "project.delete",
         scope,
         correlationId: request.correlationContext.correlationId,
-        grants: request.auth!.user.role === "admin" || request.auth!.user.role === "operator"
-          ? [{ id: `project-delete:${request.auth!.user.id}:${params.projectId}`, actorId: request.auth!.user.id, action: "project.delete", scope }]
-          : []
+        grants: await state.controlGrants.listForActor(request.auth!.user.id)
       });
       if (!decision.allowed) {
         await appendAudit(adapters.audit, request, { actorUserId: request.auth!.user.id, action: "project.delete.rejected", targetType: "project", targetId: params.projectId, metadata: { reason: decision.code } });

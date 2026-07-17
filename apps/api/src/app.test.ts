@@ -62,7 +62,9 @@ async function authFixture(options: AuthFixtureOptions = {}) {
   const users = new InMemoryAuthUserRepository([user]);
   const state = options.state
     ? { envSecretValues: new InMemoryEnvSecretValueRepository(), envSecretCipher: testEnvSecretCipher, ...options.state }
-    : undefined;
+    : options.env?.DEPLOYLITE_CONTROL_PLANE_CONFIRMED_DELETE === "true"
+      ? { controlGrants: { listForActor: async (actorId: string) => actorId === user.id ? [{ id: "test-admin-platform-grant", actorId, action: "project.delete" as const, scope: { kind: "platform" as const } }] : [] } }
+      : undefined;
   const app = await buildApiApp({
     auth: { audit, hasher, sessions, users },
     authConfig: { cookieName: "dl_test_session", cookieSecure: false, sessionTtlSeconds: 3600 },
