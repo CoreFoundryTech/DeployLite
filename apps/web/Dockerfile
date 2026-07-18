@@ -1,6 +1,6 @@
 # syntax=docker/dockerfile:1.7
 
-FROM node:22-alpine AS build
+FROM node:24.12.0-alpine@sha256:c921b97d4b74f51744057454b306b418cf693865e73b8100559189605f6955b8 AS build
 WORKDIR /app
 ENV CI=true
 RUN corepack enable
@@ -15,7 +15,7 @@ COPY apps/web apps/web
 COPY packages/contracts packages/contracts
 RUN pnpm --filter @deploylite/contracts build && pnpm --filter @deploylite/web build
 
-FROM node:22-alpine AS runtime
+FROM node:24.12.0-alpine@sha256:c921b97d4b74f51744057454b306b418cf693865e73b8100559189605f6955b8 AS runtime
 WORKDIR /app
 ENV NODE_ENV=production
 RUN corepack enable && addgroup -S deploylite && adduser -S deploylite -G deploylite
