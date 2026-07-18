@@ -1,6 +1,6 @@
 import { and, eq } from "drizzle-orm";
 import type { EnvSecretValue } from "@deploylite/contracts";
-import type { EnvSecretValueInput, EnvSecretValueRecord, EnvSecretValueRepository } from "@deploylite/domain";
+import type { EncryptedEnvSecretValueRecord, EnvSecretValueInput, EnvSecretValueRecord, EnvSecretValueRepository } from "@deploylite/domain";
 
 import type { DeployLiteDb } from "../client.js";
 import { assertEnvSecretValuesInputHasNoRawValueColumns } from "../env-metadata.js";
@@ -12,6 +12,11 @@ export class DbEnvSecretValueRepository implements EnvSecretValueRepository {
   async listByProject(projectId: string): Promise<EnvSecretValueRecord[]> {
     const rows = await this.db.select().from(envSecretValues).where(eq(envSecretValues.projectId, projectId));
     return rows.map(toEnvSecretValue);
+  }
+
+  async listEncryptedByProject(projectId: string): Promise<EncryptedEnvSecretValueRecord[]> {
+    const rows = await this.db.select().from(envSecretValues).where(eq(envSecretValues.projectId, projectId));
+    return rows.map((row) => ({ ...toEnvSecretValue(row), encryptedValue: Buffer.from(row.encryptedValue) }));
   }
 
   async upsert(record: EnvSecretValueInput): Promise<EnvSecretValueRecord> {

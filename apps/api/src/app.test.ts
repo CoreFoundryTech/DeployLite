@@ -1042,6 +1042,72 @@ describe("DeployLite API scaffold", () => {
     expect(JSON.stringify(list.json())).not.toContain(rawValue);
   });
 
+  it("stores runtime configuration encrypted, redacts operational values, restricts it to admins, and records an idempotent unavailable activation", async () => {
+    const { app, audit } = await authFixture();
+    const cookie = await loginCookie(app);
+    const payload = { domain: "app.example.test", acmeEmail: "ops@example.test", databasePassword: "database-password-123", runtimeSecret: "runtime-secret-value" };
+    const write = await app.inject({ method: "PUT", url: "/api/v1/projects/project_mock_1/runtime-configuration", headers: { ...contentHeaders, cookie }, payload });
+    expect(write.statusCode).toBe(200);
+    expect(JSON.stringify(write.json())).not.toContain(payload.acmeEmail);
+    expect(JSON.stringify(write.json())).not.toContain(payload.databasePassword);
+    expect(write.json().data.runtimeConfiguration).toEqual({ domain: payload.domain, acmeEmailConfigured: true, databasePasswordConfigured: true, runtimeSecretConfigured: true });
+
+    const activationHeaders = { ...contentHeaders, cookie, "x-request-id": "req_runtime_unavailable_1" };
+    const first = await app.inject({ method: "POST", url: "/api/v1/projects/project_mock_1/runtime-activation", headers: activationHeaders, payload: {} });
+    const second = await app.inject({ method: "POST", url: "/api/v1/projects/project_mock_1/runtime-activation", headers: activationHeaders, payload: {} });
+    expect(first.json().data.activation).toMatchObject({ status: "capability_unavailable", capability: "safe_runtime_executor", output: null });
+    expect(second.json().data.activation.id).toBe(first.json().data.activation.id);
+    expect(audit.events.filter((event) => event.action === "runtime.activation.requested")).toHaveLength(2);
+
+    const readOnly = await authFixture({ user: { role: "read-only" } });
+    const readOnlyCookie = await loginCookie(readOnly.app);
+    const denied = await readOnly.app.inject({ method: "POST", url: "/api/v1/projects/project_mock_1/runtime-activation", headers: { ...contentHeaders, cookie: readOnlyCookie }, payload: {} });
+    expect(denied.statusCode).toBe(403);
+  });
+
+  it("scopes activation idempotency to a project and request while replaying the same request", async () => {
+    const commands: unknown[] = [];
+    const dispatcher = {
+      available: () => true,
+      async dispatch(command: { commandId: string; idempotencyKey: string; projectId: string; domain: string }) {
+        commands.push(command);
+        return { id: command.idempotencyKey, commandId: command.commandId, status: "succeeded" as const, capability: "safe_runtime_executor" as const, output: "TOKEN=dispatch-secret\nready" };
+      }
+    };
+    const { app, audit } = await authFixture({ state: { runtimeActivationDispatcher: dispatcher } });
+    const cookie = await loginCookie(app);
+    const payload = { domain: "app.example.test", acmeEmail: "ops@example.test", databasePassword: "database-password-123", runtimeSecret: "runtime-secret-value" };
+    await app.inject({ method: "PUT", url: "/api/v1/projects/project_mock_1/runtime-configuration", headers: { ...contentHeaders, cookie }, payload });
+
+    const response = await app.inject({ method: "POST", url: "/api/v1/projects/project_mock_1/runtime-activation", headers: { ...contentHeaders, cookie, "x-request-id": "req_runtime_dispatch_1" }, payload: {} });
+    const replay = await app.inject({ method: "POST", url: "/api/v1/projects/project_mock_1/runtime-activation", headers: { ...contentHeaders, cookie, "x-request-id": "req_runtime_dispatch_1" }, payload: {} });
+    const created = await app.inject({
+      method: "POST",
+      url: "/api/v1/projects",
+      headers: { ...contentHeaders, cookie },
+      payload: { name: "Second project", repoUrl: "https://github.com/example/second-project", defaultBranch: "main" }
+    });
+    const secondProjectId = created.json().data.project.id;
+    await app.inject({ method: "PUT", url: `/api/v1/projects/${secondProjectId}/runtime-configuration`, headers: { ...contentHeaders, cookie }, payload });
+    const crossProject = await app.inject({ method: "POST", url: `/api/v1/projects/${secondProjectId}/runtime-activation`, headers: { ...contentHeaders, cookie, "x-request-id": "req_runtime_dispatch_1" }, payload: {} });
+    const reactivation = await app.inject({ method: "POST", url: "/api/v1/projects/project_mock_1/runtime-activation", headers: { ...contentHeaders, cookie, "x-request-id": "req_runtime_dispatch_2" }, payload: {} });
+
+    expect(response.statusCode).toBe(200);
+    expect(replay.statusCode).toBe(200);
+    expect(crossProject.statusCode).toBe(200);
+    expect(reactivation.statusCode).toBe(200);
+    expect(response.json().data.activation).toMatchObject({ status: "succeeded", output: "TOKEN=[REDACTED]\n[REDACTED]" });
+    expect(JSON.stringify(commands)).not.toContain(payload.databasePassword);
+    expect(JSON.stringify(commands)).not.toContain(payload.runtimeSecret);
+    expect(commands[0]).toMatchObject({ profile: "runtime", action: "apply", domain: payload.domain });
+    expect(commands).toHaveLength(4);
+    expect((commands[0] as { idempotencyKey: string }).idempotencyKey).toBe((commands[1] as { idempotencyKey: string }).idempotencyKey);
+    expect((commands[0] as { idempotencyKey: string }).idempotencyKey).not.toBe((commands[2] as { idempotencyKey: string }).idempotencyKey);
+    expect((commands[0] as { idempotencyKey: string }).idempotencyKey).not.toBe((commands[3] as { idempotencyKey: string }).idempotencyKey);
+    expect(audit.inputs.map((event) => event.action)).toEqual(expect.arrayContaining(["runtime.activation.requested", "runtime.activation.dispatched", "runtime.activation.succeeded"]));
+    expect(JSON.stringify(audit.inputs)).not.toContain("dispatch-secret");
+  });
+
   it("returns SECRET_KEY_UNAVAILABLE for env value writes when DEPLOYLITE_SECRET_KEY is missing or invalid", async () => {
     const cases: Array<{ name: string; env: NodeJS.ProcessEnv }> = [
       {

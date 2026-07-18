@@ -8,6 +8,7 @@ import {
   materializeMockDeploy,
   redactEnvFileForLog
 } from "./index.js";
+import { SafeRuntimeExecutor, renderControlledRuntimePlan } from "./executor.js";
 
 const SECRET_KEY = "deploylite-test-agent-secret-key-1234567890abcdef";
 const cipher = createEnvSecretCipher(loadEnvSecretKey(SECRET_KEY));
@@ -243,5 +244,103 @@ describe("EnvMaterializedEntry shape", () => {
     });
     expect(entry.projectId).toBe("project_alpha");
     expect(entry.agentId).toBe("agent_mock_1");
+  });
+});
+
+describe("SafeRuntimeExecutor", () => {
+  const command = {
+    commandId: "runtime_command_1",
+    correlationId: "req_runtime_1",
+    idempotencyKey: "runtime_config_1",
+    projectId: "project_1",
+    configurationRef: "runtime_config_1",
+    domain: "app.example.test",
+    profile: "runtime" as const,
+    action: "apply" as const
+  };
+
+  it("renders an internal-only fixed Compose and Traefik plan", () => {
+    expect(renderControlledRuntimePlan(command)).toMatchObject({
+      composeProfile: "runtime",
+      action: "apply",
+      traefik: { exposure: "internal-only", publicPorts: [] }
+    });
+  });
+
+  it("does not execute when the safe executor capability is missing", async () => {
+    const run = vi.fn();
+    const result = await new SafeRuntimeExecutor({ available: false, runner: { run, rollback: vi.fn() } }).execute(command);
+    expect(result.status).toBe("capability_unavailable");
+    expect(run).not.toHaveBeenCalled();
+  });
+
+  it("replays the terminal result without executing twice and redacts runner output", async () => {
+    const runner = { run: vi.fn().mockResolvedValue({ output: "TOKEN=super-secret-value\nstarted" }), rollback: vi.fn() };
+    const executor = new SafeRuntimeExecutor({ available: true, runner });
+    const first = await executor.execute(command);
+    const second = await executor.execute({ ...command, correlationId: "req_runtime_2" });
+    expect(first).toEqual(second);
+    expect(first.output).toContain("TOKEN=[REDACTED]");
+    expect(first.output).not.toContain("super-secret-value");
+    expect(runner.run).toHaveBeenCalledTimes(1);
+  });
+
+  it("does not collide cached results across projects and permits a later activation revision", async () => {
+    const runner = { run: vi.fn().mockResolvedValue({ output: "ready" }), rollback: vi.fn() };
+    const executor = new SafeRuntimeExecutor({ available: true, runner });
+
+    await executor.execute(command);
+    await executor.execute({ ...command, projectId: "project_2", idempotencyKey: "runtime_config_2", configurationRef: "runtime_config_2" });
+    await executor.execute({ ...command, correlationId: "req_runtime_3", idempotencyKey: "runtime_config_3", configurationRef: "runtime_config_3" });
+
+    expect(runner.run).toHaveBeenCalledTimes(3);
+  });
+
+  it("coalesces concurrent requests with the same idempotency key", async () => {
+    let complete!: (value: { output: string }) => void;
+    const runner = { run: vi.fn().mockImplementation(() => new Promise<{ output: string }>((resolve) => { complete = resolve; })), rollback: vi.fn() };
+    const executor = new SafeRuntimeExecutor({ available: true, runner });
+    const first = executor.execute(command);
+    const second = executor.execute({ ...command, correlationId: "req_runtime_2" });
+    complete({ output: "ready" });
+    await expect(Promise.all([first, second])).resolves.toHaveLength(2);
+    expect(runner.run).toHaveBeenCalledTimes(1);
+  });
+
+  it("rolls back after a command failure", async () => {
+    const runner = { run: vi.fn().mockRejectedValue(new Error("failed")), rollback: vi.fn().mockResolvedValue({ output: "TOKEN=rollback-secret" }) };
+    const result = await new SafeRuntimeExecutor({ available: true, runner }).execute(command);
+    expect(result.status).toBe("failed");
+    expect(runner.rollback).toHaveBeenCalledTimes(1);
+    expect(result.output).not.toContain("rollback-secret");
+  });
+
+  it("bounds execution time and rolls back a stalled runner", async () => {
+    const runner = { run: vi.fn().mockImplementation(() => new Promise(() => undefined)), rollback: vi.fn().mockResolvedValue({ output: "clean" }) };
+    const result = await new SafeRuntimeExecutor({ available: true, runner, timeoutMs: 5 }).execute(command);
+    expect(result.status).toBe("failed");
+    expect(result.output).toContain("timed out");
+    expect(runner.rollback).toHaveBeenCalledTimes(1);
+  });
+
+  it("terminates a stalled rollback, aborts it, and returns a cached terminal result", async () => {
+    let rollbackSignal: AbortSignal | undefined;
+    const runner = {
+      run: vi.fn().mockRejectedValue(new Error("failed")),
+      rollback: vi.fn().mockImplementation((_plan, options: { signal: AbortSignal }) => {
+        rollbackSignal = options.signal;
+        return new Promise(() => undefined);
+      })
+    };
+    const executor = new SafeRuntimeExecutor({ available: true, runner, timeoutMs: 5 });
+
+    const result = await executor.execute(command);
+    const replay = await executor.execute(command);
+
+    expect(result).toEqual(replay);
+    expect(result.status).toBe("failed");
+    expect(result.output).toBe("Runtime execution failed. Rollback timed out.");
+    expect(rollbackSignal?.aborted).toBe(true);
+    expect(runner.rollback).toHaveBeenCalledTimes(1);
   });
 });

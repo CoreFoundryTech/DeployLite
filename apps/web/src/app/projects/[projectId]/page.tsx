@@ -11,6 +11,7 @@ import { ProjectDetailActions } from "./project-detail-actions";
 import { ProjectDeleteDialog } from "@/components/project-delete-dialog";
 import { ProjectAuditHistoryPanel } from "./project-audit-history-panel";
 import { ProjectEnvValuesTable } from "@/components/project-env-values-table";
+import { RuntimeConfigurationCard } from "./runtime-configuration-card";
 import { AppShell } from "@/components/app-shell";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
@@ -268,6 +269,8 @@ export default async function ProjectDetailPage({ params }: { params: Promise<Pa
             />
           </CardContent>
         </Card>
+
+        {auth.user.role === "admin" ? <RuntimeConfigurationCard projectId={project.id} apiBaseUrl={apiBaseUrl} cookieHeader={cookieHeader} /> : null}
 
         <Card id="audit-history">
           <CardHeader>

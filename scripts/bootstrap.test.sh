@@ -31,16 +31,24 @@ run_test() {
   fi
 }
 
-test_tarball_url_defaults_to_main() {
+test_tarball_url_uses_immutable_sha() {
   DEPLOYLITE_REPO="CoreFoundryTech/DeployLite"
+  DEPLOYLITE_VERSION="fbd0ec736c6c76428fde181f34f1a9ede0323e16"
+  [[ "$(tarball_url)" == "https://codeload.github.com/CoreFoundryTech/DeployLite/tar.gz/${DEPLOYLITE_VERSION}" ]]
+}
+
+test_branch_ref_is_rejected() {
+  local output status
   DEPLOYLITE_VERSION="main"
-  [[ "$(tarball_url)" == "https://codeload.github.com/CoreFoundryTech/DeployLite/tar.gz/main" ]]
+  output="$(validate_config 2>&1)" && status=0 || status=$?
+  [[ "$status" -eq 2 ]]
+  assert_contains "$output" "immutable 40-character commit SHA"
 }
 
 test_invalid_repo_fails_actionably() {
   local output status
   DEPLOYLITE_REPO="https://github.com/CoreFoundryTech/DeployLite"
-  DEPLOYLITE_VERSION="main"
+  DEPLOYLITE_VERSION="fbd0ec736c6c76428fde181f34f1a9ede0323e16"
   output="$(validate_config 2>&1)" && status=0 || status=$?
   [[ "$status" -eq 2 ]]
   assert_contains "$output" "Invalid DEPLOYLITE_REPO"
@@ -51,7 +59,7 @@ test_download_uses_curl_without_printing_secret_values() {
   tmp="$(mktemp -d)"
   TARBALL_PATH="${tmp}/deploylite.tar.gz"
   command_exists() { [[ "$1" == "curl" ]]; }
-  curl() { printf 'fake archive' >"$4"; }
+  curl() { printf 'fake archive' >"${!#}"; }
   DEPLOYLITE_SECRET_TOKEN="super-secret-value"
   output="$(download_tarball "https://example.invalid/archive.tar.gz" 2>&1)"
   [[ -f "$TARBALL_PATH" ]]
@@ -104,7 +112,8 @@ test_cleanup_removes_temp_root() {
   [[ ! -e "$tmp" ]]
 }
 
-run_test 'tarball URL defaults to main' test_tarball_url_defaults_to_main
+run_test 'tarball URL uses immutable SHA' test_tarball_url_uses_immutable_sha
+run_test 'branch ref is rejected' test_branch_ref_is_rejected
 run_test 'invalid repo fails actionably' test_invalid_repo_fails_actionably
 run_test 'download uses curl without secret output' test_download_uses_curl_without_printing_secret_values
 run_test 'extract finds installer with mocked tar' test_extract_finds_installer_without_network_or_real_tar

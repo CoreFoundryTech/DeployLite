@@ -48,7 +48,7 @@ test_unsupported_host_fails_without_mutation() {
   detect_os() { fail 'Unsupported host: expected Ubuntu 20.04/22.04/24.04 or Debian 11/12.' 2; }
   detect_arch() { :; }
   port_available() { :; }
-  command_exists() { [[ "$1" == "sudo" ]]; }
+  command_exists() { [[ "$1" == "sudo" || "$1" == "timeout" ]]; }
   output="$(preflight 2>&1)" && status=0 || status=$?
   [[ "$status" -eq 2 ]]
   assert_contains "$output" 'Unsupported host'
@@ -60,63 +60,92 @@ test_occupied_port_fails_actionably() {
   local output status
   detect_os() { :; }
   detect_arch() { :; }
-  command_exists() { [[ "$1" == "sudo" ]]; }
+  command_exists() { [[ "$1" == "sudo" || "$1" == "timeout" ]]; }
   port_available() { [[ "$1" != "80" ]]; }
   output="$(preflight 2>&1)" && status=0 || status=$?
   [[ "$status" -eq 2 ]]
   assert_contains "$output" 'Port 80 is already in use'
 }
 
+test_existing_deploylite_traefik_allows_bootstrap_repair() {
+  local output status
+  INSTALL_DIR='/opt/deploylite'
+  detect_os() { :; }
+  detect_arch() { :; }
+  command_exists() { [[ "$1" == 'sudo' || "$1" == 'timeout' || "$1" == 'docker' ]]; }
+  port_available() { return 1; }
+  as_root() {
+    case "$*" in
+      *'docker ps --quiet'* ) printf 'traefik-container\n' ;;
+      *'docker inspect'* ) printf 'deploylite|traefik|/opt/deploylite\n' ;;
+      *'docker port traefik-container 80/tcp'* ) printf '0.0.0.0:80\n' ;;
+      *'docker port traefik-container 443/tcp'* ) printf '0.0.0.0:443\n' ;;
+      *) return 1 ;;
+    esac
+  }
+  output="$(preflight 2>&1)" && status=0 || status=$?
+  [[ "$status" -eq 0 ]] || return 1
+  assert_contains "$output" 'Running preflight checks.'
+}
+
+test_unverified_port_owner_fails_preflight() {
+  local output status
+  INSTALL_DIR='/opt/deploylite'
+  detect_os() { :; }
+  detect_arch() { :; }
+  command_exists() { [[ "$1" == 'sudo' || "$1" == 'timeout' || "$1" == 'docker' ]]; }
+  port_available() { return 1; }
+  as_root() {
+    case "$*" in
+      *'docker ps --quiet'* ) printf 'foreign-container\n' ;;
+      *'docker inspect'* ) printf 'other-project|traefik|/opt/other\n' ;;
+      *) return 1 ;;
+    esac
+  }
+  output="$(preflight 2>&1)" && status=0 || status=$?
+  [[ "$status" -eq 2 ]] || return 1
+  assert_contains "$output" "other than this install's DeployLite Traefik container"
+}
+
 test_install_docker_uses_docker_apt_repo_when_missing() {
   local calls=() docker_ready=0
   command_exists() {
     case "$1" in
-      apt-get|curl|gpg) return 0 ;;
+      apt-get|curl|gpg|timeout) return 0 ;;
       docker) [[ "$docker_ready" == "1" ]] ;;
       *) return 1 ;;
     esac
   }
   install_docker_apt_repository() { calls+=("install_docker_apt_repository"); }
-  as_root() { calls+=("$*"); [[ "$*" == apt-get\ install* ]] && docker_ready=1; return 0; }
+  as_root() { calls+=("$*"); [[ "$*" == *apt-get*install* ]] && docker_ready=1; return 0; }
   install_docker
   [[ " ${calls[*]} " == *" install_docker_apt_repository "* ]]
-  [[ " ${calls[*]} " == *" apt-get update "* ]]
-  [[ " ${calls[*]} " == *" apt-get install -y docker-ce docker-ce-cli containerd.io docker-buildx-plugin docker-compose-plugin "* ]]
+  [[ " ${calls[*]} " == *" apt-get -o DPkg::Lock::Timeout=180 -o Acquire::http::Timeout=180 -o Acquire::https::Timeout=180 update "* ]]
+  [[ " ${calls[*]} " == *" apt-get -o DPkg::Lock::Timeout=180 -o Acquire::http::Timeout=180 -o Acquire::https::Timeout=180 install -y docker-ce docker-ce-cli containerd.io docker-buildx-plugin docker-compose-plugin "* ]]
 }
 
-test_prepare_install_dir_preserves_existing_secret() {
-  local tmp saved
+test_install_curl_is_separate_from_docker_detection() {
+  local calls=() curl_ready=0
+  command_exists() { [[ "$1" == "apt-get" || "$1" == "timeout" || ("$1" == "curl" && "$curl_ready" == "1") ]]; }
+  as_root() { calls+=("$*"); [[ "$*" == *apt-get*install*curl* ]] && curl_ready=1; return 0; }
+  install_curl
+  [[ " ${calls[*]} " == *" apt-get -o DPkg::Lock::Timeout=180 -o Acquire::http::Timeout=180 -o Acquire::https::Timeout=180 update "* ]] || return 1
+  [[ " ${calls[*]} " == *" apt-get -o DPkg::Lock::Timeout=180 -o Acquire::http::Timeout=180 -o Acquire::https::Timeout=180 install -y ca-certificates curl "* ]] || return 1
+}
+
+test_prepare_install_dir_copies_tls_overlay() {
+  local tmp rendered
   tmp="$(mktemp -d)"
   INSTALL_DIR="${tmp}/install"
   COMPOSE_FILE="${INSTALL_DIR}/compose.yml"
-  ENV_FILE="${INSTALL_DIR}/.env"
+  TLS_COMPOSE_FILE="${INSTALL_DIR}/compose.tls.yml"
   STATE_DIR="${INSTALL_DIR}/.state"
   mkdir -p "$INSTALL_DIR"
-  printf 'POSTGRES_PASSWORD=existing-secret\nDEPLOYLITE_PUBLIC_HOST=old-host\n' >"$ENV_FILE"
-  chmod 644 "$ENV_FILE"
   as_root() { "$@"; }
   prepare_install_dir >/dev/null
-  saved="$(cat "$ENV_FILE")"
-  assert_contains "$saved" 'POSTGRES_PASSWORD=existing-secret'
-  [[ "$(stat -f '%Lp' "$ENV_FILE" 2>/dev/null || stat -c '%a' "$ENV_FILE")" == "600" ]]
-  rm -rf "$tmp"
-}
-
-test_write_env_generates_once_with_private_permissions() {
-  local tmp saved
-  tmp="$(mktemp -d)"
-  INSTALL_DIR="${tmp}/install"
-  ENV_FILE="${INSTALL_DIR}/.env"
-  mkdir -p "$INSTALL_DIR"
-  DEPLOYLITE_PUBLIC_HOST="198.51.100.10"
-  as_root() { "$@"; }
-  random_secret() { printf 'generated-secret'; }
-  write_env
-  saved="$(cat "$ENV_FILE")"
-  assert_contains "$saved" 'DEPLOYLITE_PUBLIC_WEB_ORIGIN=http://198.51.100.10'
-  assert_contains "$saved" 'DEPLOYLITE_PUBLIC_API_ORIGIN=http://198.51.100.10:3001'
-  assert_contains "$saved" 'POSTGRES_PASSWORD=generated-secret'
-  [[ "$(stat -f '%Lp' "$ENV_FILE" 2>/dev/null || stat -c '%a' "$ENV_FILE")" == "600" ]]
+  rendered="$(cat "$COMPOSE_FILE" "$TLS_COMPOSE_FILE")"
+  assert_contains "$rendered" 'traefik-acme'
+  [[ -f "$TLS_COMPOSE_FILE" ]]
   rm -rf "$tmp"
 }
 
@@ -125,44 +154,17 @@ test_installed_compose_uses_source_tree_build_context() {
   tmp="$(mktemp -d)"
   INSTALL_DIR="${tmp}/install"
   COMPOSE_FILE="${INSTALL_DIR}/compose.yml"
+  TLS_COMPOSE_FILE="${INSTALL_DIR}/compose.tls.yml"
   mkdir -p "$INSTALL_DIR"
   REPO_ROOT="${ROOT_DIR}"
   as_root() { "$@"; }
   install_compose_file
-  rendered="$(cat "$COMPOSE_FILE")"
+  rendered="$(cat "$COMPOSE_FILE" "$TLS_COMPOSE_FILE")"
   assert_contains "$rendered" "context: ${ROOT_DIR}" || return 1
   assert_not_contains "$rendered" 'context: ../..' || return 1
-  rm -rf "$tmp"
-}
-
-test_failure_cleanup_preserves_config_and_uses_compose_down_only() {
-  local tmp output status
-  tmp="$(mktemp -d)"
-  INSTALL_DIR="${tmp}/install"
-  ENV_FILE="${INSTALL_DIR}/.env"
-  mkdir -p "$INSTALL_DIR"
-  printf 'POSTGRES_PASSWORD=keep-me\n' >"$ENV_FILE"
-  CHANGED_STEPS=(env-created runtime-started)
-  CREATED_RUNTIME=1
-  compose_down_safe() { printf 'compose down called\n'; }
-  output="$(on_error 2>&1)" && status=0 || status=$?
-  [[ "$status" -ne 0 ]]
-  assert_contains "$output" 'compose down called'
-  assert_contains "$(cat "$ENV_FILE")" 'POSTGRES_PASSWORD=keep-me'
-  rm -rf "$tmp"
-}
-
-test_final_url_output_points_to_first_owner_setup() {
-  local tmp output
-  tmp="$(mktemp -d)"
-  INSTALL_DIR="${tmp}/install"
-  ENV_FILE="${INSTALL_DIR}/.env"
-  mkdir -p "$INSTALL_DIR"
-  printf 'DEPLOYLITE_PUBLIC_HOST=203.0.113.55\n' >"$ENV_FILE"
-  output="$(print_success)"
-  assert_contains "$output" 'DeployLite URL: http://203.0.113.55'
-  assert_contains "$output" 'create the first owner account'
-  assert_contains "$output" 'No default admin credentials'
+  assert_contains "$rendered" 'traefik:v3.6.7' || return 1
+  assert_contains "$rendered" '--providers.docker=true' || return 1
+  assert_contains "$rendered" '/var/run/docker.sock:/var/run/docker.sock:ro' || return 1
   rm -rf "$tmp"
 }
 
@@ -171,6 +173,12 @@ test_prompt_value_returns_default_in_noninteractive_mode() {
   INTERACTIVE=0
   result="$(prompt_value 'label' 'default-value')"
   [[ "$result" == "default-value" ]] || { printf 'expected default-value, got: %s\n' "$result"; return 1; }
+}
+
+test_parse_args_supports_explicit_noninteractive_mode() {
+  INTERACTIVE=1
+  parse_args --non-interactive
+  [[ "$INTERACTIVE" == "0" ]]
 }
 
 test_prompt_value_returns_piped_value_in_interactive_no_tty_mode() {
@@ -207,87 +215,140 @@ test_redact_stream_removes_postgres_passwords_and_key_value_secrets() {
   assert_contains "$output" 'plain line' || { printf 'plain line lost in stream: %s\n' "$output"; return 1; }
 }
 
-test_write_env_uses_prompted_public_host_in_interactive_mode() {
-  local tmp saved
+test_validate_compose_omits_runtime_profile() {
+  local compose_calls=""
+  compose_bounded() { compose_calls="$*"; }
+  validate_compose >/dev/null
+  assert_contains "$compose_calls" 'config' || return 1
+  assert_contains "$compose_calls" '--no-interpolate' || return 1
+  assert_contains "$compose_calls" '--profile bootstrap' || return 1
+}
+
+test_prepare_runtime_env_rejects_stale_or_inconsistent_values() {
+  local tmp output status
   tmp="$(mktemp -d)"
-  INSTALL_DIR="${tmp}/install"
-  ENV_FILE="${INSTALL_DIR}/.env"
+  INSTALL_DIR="$tmp/install"
+  RUNTIME_ENV_FILE="$INSTALL_DIR/.env"
   mkdir -p "$INSTALL_DIR"
-  # Provide a default via env so detect_public_host_inner returns it.
-  DEPLOYLITE_PUBLIC_HOST="198.51.100.10"
-  INTERACTIVE=1
+  printf 'DEPLOYLITE_PUBLIC_HOST=old.example.test\nPOSTGRES_PASSWORD=short\nDEPLOYLITE_SECRET_KEY=%064d\n' 0 >"$RUNTIME_ENV_FILE"
   as_root() { "$@"; }
-  random_secret() { printf 'generated-secret'; }
-  # Pipe an override value; the function must use it in the env file.
-  write_env <<<'203.0.113.99'
-  saved="$(cat "$ENV_FILE")"
-  assert_contains "$saved" 'DEPLOYLITE_PUBLIC_HOST=203.0.113.99' || { printf 'expected prompted host, got: %s\n' "$saved"; rm -rf "$tmp"; return 1; }
-  assert_contains "$saved" 'DEPLOYLITE_PUBLIC_WEB_ORIGIN=http://203.0.113.99' || { printf 'expected web origin, got: %s\n' "$saved"; rm -rf "$tmp"; return 1; }
-  assert_contains "$saved" 'DEPLOYLITE_PUBLIC_API_ORIGIN=http://203.0.113.99:3001' || { printf 'expected api origin, got: %s\n' "$saved"; rm -rf "$tmp"; return 1; }
+  DEPLOYLITE_PUBLIC_HOST="new.example.test"
+  output="$(prepare_runtime_env 2>&1)" && status=0 || status=$?
+  [[ "$status" -eq 2 ]] || return 1
+  assert_contains "$output" 'host does not match' || return 1
   rm -rf "$tmp"
 }
 
-test_write_env_in_interactive_mode_uses_empty_default_when_detection_fails() {
-  local tmp saved
+test_prepare_runtime_env_rejects_malformed_secret_values() {
+  local tmp output status
   tmp="$(mktemp -d)"
-  INSTALL_DIR="${tmp}/install"
-  ENV_FILE="${INSTALL_DIR}/.env"
+  INSTALL_DIR="$tmp/install"
+  RUNTIME_ENV_FILE="$INSTALL_DIR/.env"
   mkdir -p "$INSTALL_DIR"
-  unset DEPLOYLITE_PUBLIC_HOST
-  INTERACTIVE=1
+  printf 'DEPLOYLITE_PUBLIC_HOST=deploylite.com\nPOSTGRES_PASSWORD=short\nDEPLOYLITE_SECRET_KEY=also-short\n' >"$RUNTIME_ENV_FILE"
   as_root() { "$@"; }
-  random_secret() { printf 'generated-secret'; }
-  # Stub detect_public_host_inner to return empty (no network, no env).
-  detect_public_host_inner() { :; }
-  # Provide a value via the prompt.
-  write_env <<<'198.51.100.42'
-  saved="$(cat "$ENV_FILE")"
-  assert_contains "$saved" 'DEPLOYLITE_PUBLIC_HOST=198.51.100.42' || { printf 'expected prompted host with empty default, got: %s\n' "$saved"; rm -rf "$tmp"; return 1; }
+  unset DEPLOYLITE_PUBLIC_HOST
+  output="$(prepare_runtime_env 2>&1)" && status=0 || status=$?
+  [[ "$status" -eq 2 ]] || return 1
+  assert_contains "$output" 'POSTGRES_PASSWORD has an invalid generated-secret format' || return 1
   rm -rf "$tmp"
 }
 
-test_write_env_in_noninteractive_mode_hard_fails_when_no_host() {
-  local tmp status fail_called=0
+test_verify_local_reachability_checks_dns_header_and_body() {
+  local tmp headers_path body_path
+  DEPLOYLITE_PUBLIC_HOST="local.example.test"
+  DEPLOYLITE_EXPECTED_PUBLIC_IP="203.0.113.10"
+  command_exists() { [[ "$1" == "curl" || "$1" == "getent" ]]; }
+  getent() { printf '203.0.113.10 STREAM local.example.test\n'; }
+  curl() {
+    if [[ "$*" == *'api.ipify.org'* ]]; then
+      printf '203.0.113.10'
+      return 0
+    fi
+    while (( $# > 0 )); do
+      case "$1" in
+        --dump-header|--output) shift; printf '%s\n' "$1" >>/tmp/deploylite-curl-paths.test;;
+      esac
+      shift
+    done
+    headers_path="$(sed -n '1p' /tmp/deploylite-curl-paths.test)"
+    body_path="$(sed -n '2p' /tmp/deploylite-curl-paths.test)"
+    printf 'HTTP/2 200\nX-DeployLite-Bootstrap: ready\n\n' >"$headers_path"
+    printf '<html>DeployLite first owner</html>\n' >"$body_path"
+  }
+  : >/tmp/deploylite-curl-paths.test
+  verify_local_reachability
+  rm -f /tmp/deploylite-curl-paths.test "$headers_path" "$body_path"
+}
+
+test_prepare_runtime_env_uses_restricted_file_without_secret_output() {
+  local tmp output mode contents
   tmp="$(mktemp -d)"
-  INSTALL_DIR="${tmp}/install"
-  ENV_FILE="${INSTALL_DIR}/.env"
+  INSTALL_DIR="$tmp/install"
+  RUNTIME_ENV_FILE="$INSTALL_DIR/.env"
   mkdir -p "$INSTALL_DIR"
-  unset DEPLOYLITE_PUBLIC_HOST
-  INTERACTIVE=0
   as_root() { "$@"; }
-  random_secret() { printf 'generated-secret'; }
-  # Stub detect_public_host to return empty (simulating a host that
-  # cannot be detected) WITHOUT calling the real fail() — that would
-  # exit the test runner. The hard-fail path in write_env must then
-  # call fail() itself. We stub fail() to record the call and return
-  # a non-zero status instead of exiting; the real fail() would call
-  # exit, which is the behavior we are exercising the guard for.
-  detect_public_host() { :; }
-  fail() { fail_called=1; return 2; }
-  set +e
-  write_env >/dev/null 2>&1
-  status=$?
-  set -e
-  [[ "$fail_called" -eq 1 ]] || { printf 'expected fail() to be called when no host available, got status=%s fail_called=%s\n' "$status" "$fail_called"; rm -rf "$tmp"; return 1; }
+  command_exists() { [[ "$1" == "openssl" ]]; }
+  openssl() { printf 'generated-secret\n'; }
+  output="$(prepare_runtime_env)"
+  mode="$(stat -f '%Lp' "$RUNTIME_ENV_FILE")"
+  contents="$(<"$RUNTIME_ENV_FILE")"
+  [[ "$mode" == "600" ]] || return 1
+  assert_contains "$contents" 'DEPLOYLITE_PUBLIC_HOST=deploylite.com' || return 1
+  assert_not_contains "$output" 'generated-secret' || return 1
   rm -rf "$tmp"
+}
+
+test_prepare_runtime_env_generates_a_url_safe_database_url() {
+  local tmp output password database_url
+  tmp="$(mktemp -d)"
+  INSTALL_DIR="$tmp/install"
+  RUNTIME_ENV_FILE="$INSTALL_DIR/.env"
+  password="$(printf 'a%.0s' {1..62})+/"
+  mkdir -p "$INSTALL_DIR"
+  as_root() { "$@"; }
+  command_exists() { [[ "$1" == "openssl" ]]; }
+  openssl() { printf '%s\n' "$password"; }
+  output="$(prepare_runtime_env)"
+  database_url="$(awk -F= '$1 == "DATABASE_URL" { print substr($0, length($1) + 2) }' "$RUNTIME_ENV_FILE")"
+  [[ "$database_url" == *'%2B'* && "$database_url" == *'%2F'* ]] || return 1
+  node -e 'new URL(process.argv[1])' "$database_url"
+  assert_not_contains "$output" "$password" || return 1
+  rm -rf "$tmp"
+}
+
+test_start_bootstrap_is_bounded_and_never_activates_runtime() {
+  local compose_calls=""
+  compose_bounded() { compose_calls+="|$*"; }
+  verify_local_reachability() { :; }
+  start_bootstrap >/dev/null
+  assert_contains "$compose_calls" '--profile bootstrap pull' || return 1
+  assert_contains "$compose_calls" '--profile bootstrap build' || return 1
+  assert_contains "$compose_calls" '--profile bootstrap up -d --wait --wait-timeout 120' || return 1
+  assert_not_contains "$compose_calls" '--profile runtime' || return 1
 }
 
 run_test 'redaction masks secrets' test_redaction_masks_database_url_and_secret_assignments
 run_test 'unsupported host fails before mutation' test_unsupported_host_fails_without_mutation
 run_test 'occupied port fails actionably' test_occupied_port_fails_actionably
+run_test 'existing DeployLite Traefik permits bootstrap repair' test_existing_deploylite_traefik_allows_bootstrap_repair
+run_test 'unverified port owner fails preflight' test_unverified_port_owner_fails_preflight
 run_test 'missing Docker triggers Docker apt repository install path' test_install_docker_uses_docker_apt_repo_when_missing
-run_test 'rerun preserves existing secret' test_prepare_install_dir_preserves_existing_secret
-run_test 'env generation writes private config' test_write_env_generates_once_with_private_permissions
+run_test 'curl installation is independent of Docker detection' test_install_curl_is_separate_from_docker_detection
+run_test 'copies TLS Compose overlay' test_prepare_install_dir_copies_tls_overlay
 run_test 'installed compose keeps valid build context' test_installed_compose_uses_source_tree_build_context
-run_test 'failure cleanup preserves config' test_failure_cleanup_preserves_config_and_uses_compose_down_only
-run_test 'final URL guides first owner setup' test_final_url_output_points_to_first_owner_setup
 run_test 'prompt_value returns default in noninteractive mode' test_prompt_value_returns_default_in_noninteractive_mode
+run_test 'explicit noninteractive mode disables TUI' test_parse_args_supports_explicit_noninteractive_mode
 run_test 'prompt_value returns piped value in interactive no-tty mode' test_prompt_value_returns_piped_value_in_interactive_no_tty_mode
 run_test 'prompt_value returns default when piped empty in interactive no-tty mode' test_prompt_value_returns_default_when_piped_empty_in_interactive_no_tty_mode
 run_test 'redact_stream removes postgres passwords and key=value secrets' test_redact_stream_removes_postgres_passwords_and_key_value_secrets
-run_test 'write_env uses prompted public host in interactive mode' test_write_env_uses_prompted_public_host_in_interactive_mode
-run_test 'write_env in interactive mode uses empty default when detection fails' test_write_env_in_interactive_mode_uses_empty_default_when_detection_fails
-run_test 'write_env in noninteractive mode hard-fails when no host' test_write_env_in_noninteractive_mode_hard_fails_when_no_host
+run_test 'validates the bootstrap Compose profile' test_validate_compose_omits_runtime_profile
+run_test 'generates silent restricted internal runtime secrets' test_prepare_runtime_env_uses_restricted_file_without_secret_output
+run_test 'generates a valid URL-safe database URL' test_prepare_runtime_env_generates_a_url_safe_database_url
+run_test 'rejects stale or inconsistent runtime secrets' test_prepare_runtime_env_rejects_stale_or_inconsistent_values
+run_test 'rejects malformed runtime secret values' test_prepare_runtime_env_rejects_malformed_secret_values
+run_test 'verifies local DNS and HTTPS response markers' test_verify_local_reachability_checks_dns_header_and_body
+run_test 'pulls, builds, and starts only the bounded bootstrap control plane' test_start_bootstrap_is_bounded_and_never_activates_runtime
 
 printf '\n%d passed, %d failed\n' "$PASS" "$FAIL"
 [[ "$FAIL" -eq 0 ]]

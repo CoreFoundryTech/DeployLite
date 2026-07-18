@@ -136,8 +136,12 @@ export type EnvSecretValueInput = {
   keyVersion: number;
 };
 
+// Private repository-only shape. It never crosses a contract or API response.
+export type EncryptedEnvSecretValueRecord = EnvSecretValueRecord & Pick<EnvSecretValueInput, "encryptedValue">;
+
 export type EnvSecretValueRepository = {
   listByProject(projectId: string): Promise<EnvSecretValueRecord[]>;
+  listEncryptedByProject(projectId: string): Promise<EncryptedEnvSecretValueRecord[]>;
   upsert(record: EnvSecretValueInput): Promise<EnvSecretValueRecord>;
   remove(projectId: string, key: string, scope: EnvSecretValueRecord["scope"]): Promise<boolean>;
 };
@@ -316,6 +320,7 @@ export class InMemoryEnvVariableMetadataRepository implements EnvVariableMetadat
 
 export class InMemoryEnvSecretValueRepository implements EnvSecretValueRepository {
   readonly #records = new Map<string, EnvSecretValueRecord>();
+  readonly #encryptedValues = new Map<string, Buffer>();
   #seq = 0;
 
   #key(projectId: string, key: string, scope: EnvSecretValueRecord["scope"]): string {
@@ -326,6 +331,10 @@ export class InMemoryEnvSecretValueRepository implements EnvSecretValueRepositor
     return [...this.#records.values()]
       .filter((record) => record.projectId === projectId)
       .map((record) => ({ ...record }));
+  }
+
+  async listEncryptedByProject(projectId: string): Promise<EncryptedEnvSecretValueRecord[]> {
+    return (await this.listByProject(projectId)).map((record) => ({ ...record, encryptedValue: Buffer.from(this.#encryptedValues.get(this.#key(record.projectId, record.key, record.scope))!) }));
   }
 
   async upsert(record: EnvSecretValueInput): Promise<EnvSecretValueRecord> {
@@ -352,10 +361,13 @@ export class InMemoryEnvSecretValueRepository implements EnvSecretValueRepositor
       updatedAt: now
     };
     this.#records.set(this.#key(record.projectId, record.key, record.scope), next);
+    this.#encryptedValues.set(this.#key(record.projectId, record.key, record.scope), Buffer.from(record.encryptedValue));
     return { ...next };
   }
 
   async remove(projectId: string, key: string, scope: EnvSecretValueRecord["scope"]): Promise<boolean> {
-    return this.#records.delete(this.#key(projectId, key, scope));
+    const id = this.#key(projectId, key, scope);
+    this.#encryptedValues.delete(id);
+    return this.#records.delete(id);
   }
 }

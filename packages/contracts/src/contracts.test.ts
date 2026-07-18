@@ -10,6 +10,8 @@ import {
   projectCreateRequestSchema,
   projectSchema,
   projectUpdateRequestSchema,
+  runtimeActivationCommandSchema,
+  runtimeConfigurationWriteRequestSchema,
   sseEventSchema
 } from "./index.js";
 
@@ -208,6 +210,27 @@ describe("contracts", () => {
     expect(Object.keys(parsed)).not.toContain("value");
     expect(Object.keys(parsed)).not.toContain("plaintextValue");
     expect(parsed.valueFingerprint).toBe("abcdef0123456789abcdef0123456789");
+  });
+
+  it("validates complete runtime configuration without accepting malformed domains or short secrets", () => {
+    expect(runtimeConfigurationWriteRequestSchema.safeParse({ domain: "app.example.test", acmeEmail: "ops@example.test", databasePassword: "a".repeat(16), runtimeSecret: "b".repeat(16) }).success).toBe(true);
+    expect(runtimeConfigurationWriteRequestSchema.safeParse({ domain: "http://app.example.test", acmeEmail: "ops@example.test", databasePassword: "a".repeat(16), runtimeSecret: "b".repeat(16) }).success).toBe(false);
+  });
+
+  it("accepts only the fixed runtime apply command without shell, image, path, or secret inputs", () => {
+    const command = runtimeActivationCommandSchema.parse({
+      commandId: "runtime_cmd_1",
+      correlationId: "req_1",
+      idempotencyKey: "runtime_config_1",
+      projectId: "project_1",
+      configurationRef: "runtime_config_1",
+      domain: "app.example.test",
+      profile: "runtime",
+      action: "apply"
+    });
+    expect(command.profile).toBe("runtime");
+    expect(runtimeActivationCommandSchema.safeParse({ ...command, shell: "rm -rf /" }).success).toBe(false);
+    expect(runtimeActivationCommandSchema.safeParse({ ...command, profile: "other" }).success).toBe(false);
   });
 
   it("accepts env secret value delete payloads with a default scope of project", () => {
