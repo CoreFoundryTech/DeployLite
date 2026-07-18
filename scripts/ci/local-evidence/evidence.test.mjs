@@ -1,7 +1,34 @@
 import assert from "node:assert/strict";
 import { spawnSync } from "node:child_process";
-import test from "node:test";
-import { ADVISORY_ASSERTIONS, aggregateOutcome, assertBinding, assertCataloguedCheck, canonicalJson, createEvidence, createTrustedDiscoveryForTest, redactExcerpt } from "./evidence.mjs";
+import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import test, { after } from "node:test";
+import { fileURLToPath, pathToFileURL } from "node:url";
+import * as productionEvidence from "./evidence.mjs";
+
+const sourcePath = fileURLToPath(new URL("./evidence.mjs", import.meta.url));
+const fixtureDir = await mkdtemp(join(tmpdir(), "deploylite-evidence-test-"));
+const fixturePath = join(fixtureDir, "evidence.mjs");
+const source = await readFile(sourcePath, "utf8");
+const testFixtureSource = source.replace(
+  "function createTrustedDiscovery(binding) {",
+  "export function createTrustedDiscoveryForTest(binding) {"
+);
+assert.notEqual(testFixtureSource, source, "test fixture must expose the private factory only in its isolated copy");
+await writeFile(fixturePath, testFixtureSource);
+const {
+  ADVISORY_ASSERTIONS,
+  aggregateOutcome,
+  assertBinding,
+  assertCataloguedCheck,
+  canonicalJson,
+  createEvidence,
+  createTrustedDiscoveryForTest,
+  redactExcerpt
+} = await import(pathToFileURL(fixturePath).href);
+
+after(async () => rm(fixtureDir, { recursive: true, force: true }));
 
 const binding = Object.freeze({ githubHost: "github.com", authenticatedLogin: "maintainer", repository: "CoreFoundryTech/DeployLite", prNumber: 123, headSha: "a".repeat(40), baseSha: "b".repeat(40) });
 const discovery = createTrustedDiscoveryForTest(binding);
@@ -22,18 +49,18 @@ test("binding is immutable and rejects an unprovable account, repo, PR, or SHA",
 });
 
 test("evidence creation rejects forged caller-controlled discovery bindings", () => {
-  assert.throws(() => createEvidence({ binding, checks: [check] }), /trusted discovery/i);
-  assert.throws(() => createEvidence({ discovery: { binding }, checks: [check] }), /trusted discovery/i);
+  assert.throws(() => productionEvidence.createEvidence({ binding, checks: [check] }), /trusted discovery/i);
+  assert.throws(() => productionEvidence.createEvidence({ discovery: { binding }, checks: [check] }), /trusted discovery/i);
 
-  const forgedFactory = spawnSync(process.execPath, ["--input-type=module", "--eval", `import { createTrustedDiscoveryForTest } from ${JSON.stringify(new URL("./evidence.mjs", import.meta.url).href)}; createTrustedDiscoveryForTest(${JSON.stringify(binding)});`], {
+  const forgedFactory = spawnSync(process.execPath, ["--input-type=module", "--eval", `import { createEvidence, createTrustedDiscoveryForTest } from ${JSON.stringify(new URL("./evidence.mjs", import.meta.url).href)}; const discovery = createTrustedDiscoveryForTest(${JSON.stringify(binding)}); createEvidence({ discovery, checks: [${JSON.stringify(check)}] });`], {
     encoding: "utf8",
-    env: { ...process.env, NODE_TEST_CONTEXT: "" }
+    env: { ...process.env, NODE_TEST_CONTEXT: "forged-truthy-context" }
   });
   assert.notEqual(forgedFactory.status, 0);
-  assert.match(forgedFactory.stderr, /unavailable outside node:test/i);
+  assert.match(forgedFactory.stderr, /createTrustedDiscoveryForTest|trusted discovery/i);
 });
 
-test("evidence accepts a legitimate discovery created by the controlled test boundary", () => {
+test("evidence accepts a legitimate discovery created by test-only source instrumentation", () => {
   assert.throws(() => createTrustedDiscoveryForTest({ ...binding, authenticatedLogin: "" }));
   const evidence = createEvidence({ discovery, checks: [check] });
   assert.deepEqual(evidence.binding.discovery, { source: "github-pr-discovery", verified: true });

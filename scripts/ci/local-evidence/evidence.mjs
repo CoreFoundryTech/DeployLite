@@ -49,15 +49,6 @@ function createTrustedDiscovery(binding) {
   return trusted;
 }
 
-/**
- * Controlled node:test-only seam. Production callers have no binding factory:
- * a later GitHub discovery boundary will create the private trusted capsule.
- */
-export function createTrustedDiscoveryForTest(binding) {
-  assert(process.env.NODE_TEST_CONTEXT, "trusted discovery test seam is unavailable outside node:test");
-  return createTrustedDiscovery(binding);
-}
-
 export function assertCataloguedCheck({ id, argv }) {
   assert(CATALOGUE_IDS.has(id), `check ${id} is not catalogued`);
   assert(Array.isArray(argv) && argv.length > 0 && argv.every((part) => typeof part === "string" && part.length > 0), "argv must be a non-empty string array");
