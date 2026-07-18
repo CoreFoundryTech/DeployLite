@@ -15,7 +15,7 @@ The following capabilities are available in the current `main` branch:
 | Control-plane views | Deployment and log metadata with Server-Sent Events (SSE) log inspection |
 | Model Context Protocol (MCP) | Read-only server status, deployment, and log inspection |
 
-The current deployment-control and agent surfaces are not a finished production deployment platform. Real Docker execution, privileged host mutation, and production hardening remain gated work.
+The current deployment-control and agent surfaces are Alpha/early access, not a finished production deployment platform. Real Docker execution, privileged host mutation, and production hardening remain gated work. See the [platform support policy](docs/support-policy.md) and [release-evidence contract](docs/release-evidence.md) for the current release-baseline boundary.
 
 ## What is planned
 
