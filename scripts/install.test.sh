@@ -67,6 +67,46 @@ test_occupied_port_fails_actionably() {
   assert_contains "$output" 'Port 80 is already in use'
 }
 
+test_existing_deploylite_traefik_allows_bootstrap_repair() {
+  local output status
+  INSTALL_DIR='/opt/deploylite'
+  detect_os() { :; }
+  detect_arch() { :; }
+  command_exists() { [[ "$1" == 'sudo' || "$1" == 'timeout' || "$1" == 'docker' ]]; }
+  port_available() { return 1; }
+  as_root() {
+    case "$*" in
+      *'docker ps --quiet'* ) printf 'traefik-container\n' ;;
+      *'docker inspect'* ) printf 'deploylite|traefik|/opt/deploylite\n' ;;
+      *'docker port traefik-container 80/tcp'* ) printf '0.0.0.0:80\n' ;;
+      *'docker port traefik-container 443/tcp'* ) printf '0.0.0.0:443\n' ;;
+      *) return 1 ;;
+    esac
+  }
+  output="$(preflight 2>&1)" && status=0 || status=$?
+  [[ "$status" -eq 0 ]] || return 1
+  assert_contains "$output" 'Running preflight checks.'
+}
+
+test_unverified_port_owner_fails_preflight() {
+  local output status
+  INSTALL_DIR='/opt/deploylite'
+  detect_os() { :; }
+  detect_arch() { :; }
+  command_exists() { [[ "$1" == 'sudo' || "$1" == 'timeout' || "$1" == 'docker' ]]; }
+  port_available() { return 1; }
+  as_root() {
+    case "$*" in
+      *'docker ps --quiet'* ) printf 'foreign-container\n' ;;
+      *'docker inspect'* ) printf 'other-project|traefik|/opt/other\n' ;;
+      *) return 1 ;;
+    esac
+  }
+  output="$(preflight 2>&1)" && status=0 || status=$?
+  [[ "$status" -eq 2 ]] || return 1
+  assert_contains "$output" "other than this install's DeployLite Traefik container"
+}
+
 test_install_docker_uses_docker_apt_repo_when_missing() {
   local calls=() docker_ready=0
   command_exists() {
@@ -288,6 +328,8 @@ test_start_bootstrap_is_bounded_and_never_activates_runtime() {
 run_test 'redaction masks secrets' test_redaction_masks_database_url_and_secret_assignments
 run_test 'unsupported host fails before mutation' test_unsupported_host_fails_without_mutation
 run_test 'occupied port fails actionably' test_occupied_port_fails_actionably
+run_test 'existing DeployLite Traefik permits bootstrap repair' test_existing_deploylite_traefik_allows_bootstrap_repair
+run_test 'unverified port owner fails preflight' test_unverified_port_owner_fails_preflight
 run_test 'missing Docker triggers Docker apt repository install path' test_install_docker_uses_docker_apt_repo_when_missing
 run_test 'curl installation is independent of Docker detection' test_install_curl_is_separate_from_docker_detection
 run_test 'copies TLS Compose overlay' test_prepare_install_dir_copies_tls_overlay

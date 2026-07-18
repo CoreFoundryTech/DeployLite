@@ -251,6 +251,34 @@ port_available() {
   return 0
 }
 
+deploylite_traefik_owns_port() {
+  local port="$1" container_ids container_id metadata binding count=0
+  command_exists docker || return 1
+  container_ids="$(as_root docker ps --quiet \
+    --filter 'label=com.docker.compose.project=deploylite' \
+    --filter 'label=com.docker.compose.service=traefik')" || return 1
+
+  while IFS= read -r container_id; do
+    [[ -n "$container_id" ]] || continue
+    count=$((count + 1))
+  done <<<"$container_ids"
+  [[ "$count" -eq 1 ]] || return 1
+
+  container_id="$container_ids"
+  metadata="$(as_root docker inspect --format '{{index .Config.Labels "com.docker.compose.project"}}|{{index .Config.Labels "com.docker.compose.service"}}|{{index .Config.Labels "com.docker.compose.project.working_dir"}}' "$container_id")" || return 1
+  [[ "$metadata" == "deploylite|traefik|${INSTALL_DIR}" ]] || return 1
+
+  while IFS= read -r binding; do
+    [[ "$binding" == *":${port}" ]] && return 0
+  done < <(as_root docker port "$container_id" "${port}/tcp" 2>/dev/null)
+  return 1
+}
+
+port_available_or_owned_by_deploylite_traefik() {
+  local port="$1"
+  port_available "$port" || deploylite_traefik_owns_port "$port"
+}
+
 preflight() {
   info "Running preflight checks."
   detect_os
@@ -259,8 +287,8 @@ preflight() {
     fail "Root or sudo is required. Re-run as root or install sudo." 2
   fi
   command_exists timeout || fail "timeout is required to bound apt and Compose operations." 2
-  port_available 80 || fail "Port 80 is already in use. Stop the conflicting service before installing." 2
-  port_available 443 || fail "Port 443 is already in use. Stop the conflicting service before installing." 2
+  port_available_or_owned_by_deploylite_traefik 80 || fail "Port 80 is already in use by a service other than this install's DeployLite Traefik container. Stop the conflicting service before installing." 2
+  port_available_or_owned_by_deploylite_traefik 443 || fail "Port 443 is already in use by a service other than this install's DeployLite Traefik container. Stop the conflicting service before installing." 2
 }
 
 install_docker() {
