@@ -256,6 +256,24 @@ test_prepare_runtime_env_uses_restricted_file_without_secret_output() {
   rm -rf "$tmp"
 }
 
+test_prepare_runtime_env_generates_a_url_safe_database_url() {
+  local tmp output password database_url
+  tmp="$(mktemp -d)"
+  INSTALL_DIR="$tmp/install"
+  RUNTIME_ENV_FILE="$INSTALL_DIR/.env"
+  password="$(printf 'a%.0s' {1..62})+/"
+  mkdir -p "$INSTALL_DIR"
+  as_root() { "$@"; }
+  command_exists() { [[ "$1" == "openssl" ]]; }
+  openssl() { printf '%s\n' "$password"; }
+  output="$(prepare_runtime_env)"
+  database_url="$(awk -F= '$1 == "DATABASE_URL" { print substr($0, length($1) + 2) }' "$RUNTIME_ENV_FILE")"
+  [[ "$database_url" == *'%2B'* && "$database_url" == *'%2F'* ]] || return 1
+  node -e 'new URL(process.argv[1])' "$database_url"
+  assert_not_contains "$output" "$password" || return 1
+  rm -rf "$tmp"
+}
+
 test_start_bootstrap_is_bounded_and_never_activates_runtime() {
   local compose_calls=""
   compose_bounded() { compose_calls+="|$*"; }
@@ -281,6 +299,7 @@ run_test 'prompt_value returns default when piped empty in interactive no-tty mo
 run_test 'redact_stream removes postgres passwords and key=value secrets' test_redact_stream_removes_postgres_passwords_and_key_value_secrets
 run_test 'validates the bootstrap Compose profile' test_validate_compose_omits_runtime_profile
 run_test 'generates silent restricted internal runtime secrets' test_prepare_runtime_env_uses_restricted_file_without_secret_output
+run_test 'generates a valid URL-safe database URL' test_prepare_runtime_env_generates_a_url_safe_database_url
 run_test 'rejects stale or inconsistent runtime secrets' test_prepare_runtime_env_rejects_stale_or_inconsistent_values
 run_test 'rejects malformed runtime secret values' test_prepare_runtime_env_rejects_malformed_secret_values
 run_test 'verifies local DNS and HTTPS response markers' test_verify_local_reachability_checks_dns_header_and_body

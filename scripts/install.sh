@@ -381,21 +381,48 @@ generate_secret() {
   openssl rand -base64 48 | tr -d '\n'
 }
 
+database_url_for_password() {
+  local password="$1" encoded_password
+  # Compose does not URL-encode interpolated values. Keep the PostgreSQL
+  # password raw, but percent-encode URL-reserved characters for pg.
+  encoded_password="$(printf '%s' "$password" | sed -e 's/%/%25/g' -e 's/+/%2B/g' -e 's#/#%2F#g' -e 's/:/%3A/g' -e 's/@/%40/g')"
+  printf 'postgres://%s:%s@postgres:5432/%s' "${POSTGRES_USER:-deploylite}" "$encoded_password" "${POSTGRES_DB:-deploylite}"
+}
+
+ensure_runtime_database_url() {
+  local database_password database_url tmp
+  database_password="$(read_runtime_env_value POSTGRES_PASSWORD)"
+  database_url="$(database_url_for_password "$database_password")"
+  tmp="$(mktemp)"
+  awk -v database_url="$database_url" '
+    /^DATABASE_URL=/ {
+      if (!written++) print "DATABASE_URL=" database_url
+      next
+    }
+    { print }
+    END { if (!written) print "DATABASE_URL=" database_url }
+  ' "$RUNTIME_ENV_FILE" >"$tmp"
+  as_root install -m 600 "$tmp" "$RUNTIME_ENV_FILE"
+  rm -f "$tmp"
+}
+
 prepare_runtime_env() {
-  local tmp host database_password secret_key
+  local tmp host database_password database_url secret_key
   if [[ -f "$RUNTIME_ENV_FILE" ]]; then
     as_root chmod 600 "$RUNTIME_ENV_FILE"
     validate_runtime_env
+    ensure_runtime_database_url
     info "Existing internal runtime secrets validated and preserved."
     return 0
   fi
   host="${DEPLOYLITE_PUBLIC_HOST:-deploylite.com}"
   [[ "$host" =~ ^[A-Za-z0-9.-]+$ ]] || fail "DEPLOYLITE_PUBLIC_HOST must be a hostname." 2
   database_password="$(generate_secret)"
+  database_url="$(database_url_for_password "$database_password")"
   secret_key="$(generate_secret)"
   tmp="$(mktemp)"
   umask 077
-  printf 'DEPLOYLITE_PUBLIC_HOST=%s\nPOSTGRES_PASSWORD=%s\nDEPLOYLITE_SECRET_KEY=%s\n' "$host" "$database_password" "$secret_key" >"$tmp"
+  printf 'DEPLOYLITE_PUBLIC_HOST=%s\nPOSTGRES_PASSWORD=%s\nDATABASE_URL=%s\nDEPLOYLITE_SECRET_KEY=%s\n' "$host" "$database_password" "$database_url" "$secret_key" >"$tmp"
   as_root install -m 600 "$tmp" "$RUNTIME_ENV_FILE"
   rm -f "$tmp"
   record_change "internal-runtime-secrets-generated"

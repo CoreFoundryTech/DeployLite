@@ -38,7 +38,7 @@ services:
       postgres:
         condition: service_healthy
     environment:
-      DATABASE_URL: postgres://${POSTGRES_USER:-deploylite}:${POSTGRES_PASSWORD:?POSTGRES_PASSWORD is required}@postgres:5432/${POSTGRES_DB:-deploylite}
+      DATABASE_URL: ${DATABASE_URL:?DATABASE_URL is required}
     command: ["node", "packages/db/scripts/migrate.mjs"]
     networks:
       - deploylite
@@ -57,7 +57,7 @@ services:
         condition: service_completed_successfully
     environment:
       NODE_ENV: production
-      DATABASE_URL: postgres://${POSTGRES_USER:-deploylite}:${POSTGRES_PASSWORD:?POSTGRES_PASSWORD is required}@postgres:5432/${POSTGRES_DB:-deploylite}
+      DATABASE_URL: ${DATABASE_URL:?DATABASE_URL is required}
       DEPLOYLITE_API_HOST: 0.0.0.0
       DEPLOYLITE_API_PORT: 3001
       DEPLOYLITE_API_URL: http://api:3001
