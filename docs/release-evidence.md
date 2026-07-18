@@ -10,17 +10,17 @@ Create `release-evidence.json` from `schemas/release-evidence.schema.json`. The 
 | --- | --- |
 | `commit` | Immutable commit SHA under review. |
 | `alphaPosture` | Exactly `alpha-early-access`. |
-| `runtime` and `inputs` | Node/pnpm versions, lock hash, Compose inputs, and relevant image digests. |
-| `images` | Image tag, immutable digest, platform, and build identity when available. |
-| `checks` | Command, timestamp, result (`pass`, `fail`, or `exception`), and retained output location for every applicable gate. |
-| `exceptions` | ID, component, owner, rationale, compensating control, reviewer, evidence link, and unexpired UTC expiry. |
-| `smoke` | Non-production target/result only when the staging slice exists; otherwise record it as pending. |
-| `review` | Reviewer and approval location for the current slice. |
+| `runtime` and `inputs` | Node/pnpm versions, lock hash, Compose digest, and relevant image digests; empty objects are invalid. |
+| `images` | At least one image tag, immutable `sha256:` digest, platform, and build identity. |
+| `checks` | At least one command, RFC 3339 timestamp, result (`pass`, `fail`, or `exception`), and retained output location. |
+| `exceptions` | ID, component, owner, rationale, compensating control, reviewer, evidence link, and unexpired RFC 3339 UTC expiry. An exception check must reference its declared exception ID. |
+| `smoke` | Non-empty status and non-production target; record status as `pending` before the staging slice exists. |
+| `review` | Non-empty reviewer and approval location for the current slice. |
 | `artifacts` | Retained report, SBOM, scan, or command-output locations. |
 
 ## Upgrade and rollback evidence
 
-For every supported-component update, include before/after versions and digests, vendor lifecycle source, compatibility result, pre-upgrade checks, approval, validation result, rollback trigger, rollback steps, and rollback result. Missing evidence, a failing check, or an expired exception blocks release eligibility.
+For every supported-component update, include before/after versions and digests, vendor lifecycle source, compatibility result, pre-upgrade checks, approval, validation result, rollback trigger, rollback steps, and rollback result. Missing, malformed, or expired exception evidence, or a failing check, blocks release eligibility.
 
 ## Current boundary
 
