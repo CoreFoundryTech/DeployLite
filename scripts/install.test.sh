@@ -162,6 +162,9 @@ test_installed_compose_uses_source_tree_build_context() {
   rendered="$(cat "$COMPOSE_FILE" "$TLS_COMPOSE_FILE")"
   assert_contains "$rendered" "context: ${ROOT_DIR}" || return 1
   assert_not_contains "$rendered" 'context: ../..' || return 1
+  assert_contains "$rendered" 'traefik:v3.6.7' || return 1
+  assert_contains "$rendered" '--providers.docker=true' || return 1
+  assert_contains "$rendered" '/var/run/docker.sock:/var/run/docker.sock:ro' || return 1
   rm -rf "$tmp"
 }
 

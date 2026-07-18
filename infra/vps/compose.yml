@@ -2,7 +2,8 @@ name: deploylite
 
 services:
   traefik:
-    image: traefik:v3.1
+    # v3.6.7 ships a Docker v28.3.3 client (API 1.51), compatible with Docker 29.
+    image: traefik:v3.6.7
     restart: unless-stopped
     ports:
       - "80:80"

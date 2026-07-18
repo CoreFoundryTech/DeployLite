@@ -18,6 +18,7 @@ The installer installs Docker prerequisites, generates installation-local intern
 - `migrate` runs the existing hand-authored SQL migrations once before the API starts.
 - Traefik is the sole host listener on ports `80` and `443`; API and web have no host ports.
 - The `bootstrap` profile is TLS-only: HTTP redirects to HTTPS and ACME state persists in `traefik-acme`.
+- Traefik is pinned to `v3.6.7`. Its Docker v28.3.3 client uses Docker API `1.51`, so the Docker provider can discover the labeled API and web routers on Docker 29 (API `>=1.40`) instead of failing with the obsolete API `1.24` client error.
 - API CORS and the web API URLs derive from `https://${DEPLOYLITE_PUBLIC_HOST}`.
 - Health checks gate API/Web startup where Compose supports dependency conditions.
 
