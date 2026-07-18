@@ -1,0 +1,46 @@
+name: Non-production staging smoke
+
+on:
+  workflow_dispatch:
+    inputs:
+      target:
+        description: Approved non-production DNS target
+        required: true
+        type: string
+      confirmation:
+        description: Type RUN_NON_PRODUCTION_SMOKE to invoke network assertions
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: staging-smoke-${{ inputs.target }}
+  cancel-in-progress: false
+
+jobs:
+  smoke:
+    if: inputs.confirmation == 'RUN_NON_PRODUCTION_SMOKE'
+    runs-on: ubuntu-latest
+    environment: non-production
+    timeout-minutes: 10
+    env:
+      STAGING_APPROVED_TARGET: ${{ vars.STAGING_APPROVED_TARGET }}
+      STAGING_ALLOWED_SUFFIX: ${{ vars.STAGING_ALLOWED_SUFFIX }}
+      STAGING_TARGET: ${{ inputs.target }}
+      STAGING_SSH_PRIVATE_KEY: ${{ secrets.STAGING_SSH_PRIVATE_KEY }}
+      STAGING_SSH_HOST_KEY: ${{ secrets.STAGING_SSH_HOST_KEY }}
+      STAGING_SMOKE_TOKEN: ${{ secrets.STAGING_SMOKE_TOKEN }}
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.1.1
+      - name: Run credential-safe non-production smoke
+        run: bash scripts/staging-smoke.sh --execute --evidence "$STAGING_EVIDENCE_FILE"
+      - name: Upload redacted smoke evidence
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: staging-smoke-evidence
+          path: ${{ runner.temp }}/staging-smoke-evidence.json
+          if-no-files-found: warn
+          retention-days: 30
