@@ -1,0 +1,19 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "DeployLite release evidence",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["commit", "alphaPosture", "runtime", "inputs", "images", "checks", "exceptions", "smoke", "review", "artifacts"],
+  "properties": {
+    "commit": { "type": "string", "pattern": "^[0-9a-f]{40}$" },
+    "alphaPosture": { "const": "alpha-early-access" },
+    "runtime": { "type": "object" },
+    "inputs": { "type": "object" },
+    "images": { "type": "array", "items": { "type": "object", "required": ["tag", "digest"] } },
+    "checks": { "type": "array", "items": { "type": "object", "required": ["name", "result", "command", "artifact"], "properties": { "result": { "enum": ["pass", "fail", "exception"] } } } },
+    "exceptions": { "type": "array", "items": { "type": "object", "required": ["id", "component", "owner", "rationale", "compensatingControl", "reviewer", "evidence", "expiresAt"] } },
+    "smoke": { "type": "object" },
+    "review": { "type": "object" },
+    "artifacts": { "type": "array", "items": { "type": "string" } }
+  }
+}
