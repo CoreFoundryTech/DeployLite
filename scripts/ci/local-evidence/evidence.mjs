@@ -38,18 +38,24 @@ export function assertBinding(binding) {
   return Object.freeze({ githubHost, authenticatedLogin, repository, prNumber, headSha, ...(baseSha ? { baseSha } : {}) });
 }
 
-/**
- * Test seam for a discovery adapter that has already read and verified the
- * authenticated GitHub host/login, repository, PR number, and head SHA.
- * Evidence creation only accepts instances made by this boundary.
- */
-export function createTrustedDiscovery(binding, { source = "github-pr-discovery", verified = true } = {}) {
+function createTrustedDiscovery(binding) {
+  const source = "github-pr-discovery";
+  const verified = true;
   assert(source === "github-pr-discovery" && verified === true, "discovery must be verified by GitHub PR discovery");
   const trusted = Object.freeze({
     binding: Object.freeze({ ...assertBinding(binding), discovery: Object.freeze({ source, verified }) })
   });
   trustedDiscoveries.add(trusted);
   return trusted;
+}
+
+/**
+ * Controlled node:test-only seam. Production callers have no binding factory:
+ * a later GitHub discovery boundary will create the private trusted capsule.
+ */
+export function createTrustedDiscoveryForTest(binding) {
+  assert(process.env.NODE_TEST_CONTEXT, "trusted discovery test seam is unavailable outside node:test");
+  return createTrustedDiscovery(binding);
 }
 
 export function assertCataloguedCheck({ id, argv }) {

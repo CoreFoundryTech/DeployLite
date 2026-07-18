@@ -1,9 +1,10 @@
 import assert from "node:assert/strict";
+import { spawnSync } from "node:child_process";
 import test from "node:test";
-import { ADVISORY_ASSERTIONS, aggregateOutcome, assertBinding, assertCataloguedCheck, canonicalJson, createEvidence, createTrustedDiscovery, redactExcerpt } from "./evidence.mjs";
+import { ADVISORY_ASSERTIONS, aggregateOutcome, assertBinding, assertCataloguedCheck, canonicalJson, createEvidence, createTrustedDiscoveryForTest, redactExcerpt } from "./evidence.mjs";
 
 const binding = Object.freeze({ githubHost: "github.com", authenticatedLogin: "maintainer", repository: "CoreFoundryTech/DeployLite", prNumber: 123, headSha: "a".repeat(40), baseSha: "b".repeat(40) });
-const discovery = createTrustedDiscovery(binding);
+const discovery = createTrustedDiscoveryForTest(binding);
 const check = { id: "test", argv: ["pnpm", "test"], outcome: "pass", excerpt: "token=top-secret /Users/alice/work", durationMs: 12, exitCode: 0 };
 
 test("RED contract rejects commands that are not fixed catalogue argv", () => {
@@ -20,9 +21,20 @@ test("binding is immutable and rejects an unprovable account, repo, PR, or SHA",
   }
 });
 
-test("evidence creation requires a trusted discovery binding rather than caller-controlled identity fields", () => {
+test("evidence creation rejects forged caller-controlled discovery bindings", () => {
   assert.throws(() => createEvidence({ binding, checks: [check] }), /trusted discovery/i);
-  assert.throws(() => createTrustedDiscovery({ ...binding, authenticatedLogin: "" }));
+  assert.throws(() => createEvidence({ discovery: { binding }, checks: [check] }), /trusted discovery/i);
+
+  const forgedFactory = spawnSync(process.execPath, ["--input-type=module", "--eval", `import { createTrustedDiscoveryForTest } from ${JSON.stringify(new URL("./evidence.mjs", import.meta.url).href)}; createTrustedDiscoveryForTest(${JSON.stringify(binding)});`], {
+    encoding: "utf8",
+    env: { ...process.env, NODE_TEST_CONTEXT: "" }
+  });
+  assert.notEqual(forgedFactory.status, 0);
+  assert.match(forgedFactory.stderr, /unavailable outside node:test/i);
+});
+
+test("evidence accepts a legitimate discovery created by the controlled test boundary", () => {
+  assert.throws(() => createTrustedDiscoveryForTest({ ...binding, authenticatedLogin: "" }));
   const evidence = createEvidence({ discovery, checks: [check] });
   assert.deepEqual(evidence.binding.discovery, { source: "github-pr-discovery", verified: true });
 });
@@ -47,7 +59,7 @@ test("evidence rejects secret-bearing argv before serialization and hashing", ()
 test("canonical serialization and hash are deterministic regardless of input key order", () => {
   assert.equal(canonicalJson({ z: 1, a: { y: 2, b: 3 } }), canonicalJson({ a: { b: 3, y: 2 }, z: 1 }));
   const first = createEvidence({ discovery, checks: [check] });
-  const second = createEvidence({ discovery: createTrustedDiscovery({ ...binding }), checks: [{ ...check, argv: [...check.argv] }] });
+  const second = createEvidence({ discovery: createTrustedDiscoveryForTest({ ...binding }), checks: [{ ...check, argv: [...check.argv] }] });
   assert.equal(first.evidenceHash, second.evidenceHash);
 });
 
