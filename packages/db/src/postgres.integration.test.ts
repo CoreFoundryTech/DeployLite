@@ -232,7 +232,12 @@ describeIntegration("PostgreSQL auth foundation integration", () => {
       id: projectId,
       name: "Integration project",
       repoUrl: "https://github.com/example/deploylite-integration",
-      defaultBranch: "main"
+      defaultBranch: "main",
+      buildCommand: "pnpm build",
+      runCommand: "pnpm start",
+      port: 3000,
+      description: null,
+      imageTag: null
     });
     await expect(requireDbDeploymentRepository().findById(deploymentId)).resolves.toMatchObject({
       id: deploymentId,
