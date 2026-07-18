@@ -1,0 +1,65 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://deploylite.dev/schemas/local-ci-evidence-v1.json",
+  "title": "DeployLite local advisory CI evidence",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schemaVersion", "binding", "generatedAt", "assertions", "aggregateOutcome", "checks", "evidenceHash"],
+  "properties": {
+    "schemaVersion": { "const": 1 },
+    "binding": {
+      "type": "object", "additionalProperties": false,
+      "required": ["githubHost", "authenticatedLogin", "repository", "prNumber", "headSha", "discovery"],
+      "properties": {
+        "githubHost": { "type": "string", "minLength": 1 },
+        "authenticatedLogin": { "type": "string", "minLength": 1 },
+        "repository": { "type": "string", "pattern": "^[^/\\s]+/[^/\\s]+$" },
+        "prNumber": { "type": "integer", "minimum": 1 },
+        "headSha": { "$ref": "#/$defs/sha" },
+        "baseSha": { "$ref": "#/$defs/sha" },
+        "discovery": {
+          "type": "object", "additionalProperties": false,
+          "required": ["source", "verified"],
+          "properties": {
+            "source": { "const": "github-pr-discovery" },
+            "verified": { "const": true }
+          }
+        }
+      }
+    },
+    "generatedAt": { "type": "string", "format": "date-time" },
+    "assertions": {
+      "type": "object", "additionalProperties": false,
+      "required": ["source", "advisory", "receipt", "githubActions", "satisfiesRequiredChecks", "releaseEligibilityChanged", "alphaPosture"],
+      "properties": {
+        "source": { "const": "local" }, "advisory": { "const": true }, "receipt": { "const": false },
+        "githubActions": { "const": false }, "satisfiesRequiredChecks": { "const": false },
+        "releaseEligibilityChanged": { "const": false }, "alphaPosture": { "const": "alpha-early-access" }
+      }
+    },
+    "aggregateOutcome": { "$ref": "#/$defs/outcome" },
+    "checks": { "type": "array", "minItems": 1, "items": { "$ref": "#/$defs/check" } },
+    "evidenceHash": { "type": "string", "pattern": "^[a-f0-9]{64}$" }
+  },
+  "$defs": {
+    "sha": { "type": "string", "pattern": "^[a-f0-9]{40}$" },
+    "outcome": { "enum": ["pass", "fail", "blocked"] },
+    "check": {
+      "type": "object", "additionalProperties": false,
+      "required": ["id", "argv", "outcome", "exitCode", "durationMs", "excerpt", "redactions", "truncated"],
+      "properties": {
+        "id": { "type": "string", "minLength": 1 },
+        "argv": {
+          "type": "array", "minItems": 1,
+          "items": {
+            "type": "string", "minLength": 1,
+            "not": { "pattern": "(?:^--?(?:api[-_]?key|auth(?:orization)?|credential|gh[-_]?token|password|private[-_]?key|secret|token)(?:=|$)|(?:api[-_]?key|auth(?:orization)?|credential|gh[-_]?token|password|private[-_]?key|secret|token)\\s*[:=]|bearer\\s+|gh[pousr]_[a-z0-9_]+|github_pat_[a-z0-9_]+|AKIA[0-9A-Z]{16})" }
+          }
+        },
+        "outcome": { "$ref": "#/$defs/outcome" }, "reasonCode": { "type": "string", "minLength": 1 },
+        "exitCode": { "type": ["integer", "null"] }, "durationMs": { "type": "integer", "minimum": 0 },
+        "excerpt": { "type": "string", "maxLength": 1600 }, "redactions": { "type": "integer", "minimum": 0 }, "truncated": { "type": "boolean" }
+      }
+    }
+  }
+}
