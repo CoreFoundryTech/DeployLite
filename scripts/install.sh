@@ -10,6 +10,8 @@ STATE_DIR="${INSTALL_DIR}/.state"
 DEFAULT_LOG_FILE="/var/log/deploylite/install.log"
 INSTALL_LOG="${DEPLOYLITE_INSTALL_LOG:-$DEFAULT_LOG_FILE}"
 INSTALL_LOG_DIR="${DEPLOYLITE_INSTALL_LOG_DIR:-$(dirname "$INSTALL_LOG")}"
+APT_TIMEOUT_SECONDS="${DEPLOYLITE_APT_TIMEOUT_SECONDS:-180}"
+COMPOSE_TIMEOUT_SECONDS="${DEPLOYLITE_COMPOSE_TIMEOUT_SECONDS:-600}"
 INTERACTIVE=1
 NOOP=0
 CHANGED_STEPS=()
@@ -70,6 +72,9 @@ Options:
 
 Environment:
   DEPLOYLITE_PUBLIC_HOST=<hostname>    Installation host (default: deploylite.com).
+  DEPLOYLITE_EXPECTED_PUBLIC_IP=<IPv4>  Override the detected local public IP for DNS verification.
+  DEPLOYLITE_APT_TIMEOUT_SECONDS=<n>    Bound apt operations (default: 180).
+  DEPLOYLITE_COMPOSE_TIMEOUT_SECONDS=<n> Bound Compose pull/build/up operations (default: 600).
   DEPLOYLITE_INSTALL_DIR=<path>        Install directory (default: /opt/deploylite).
   DEPLOYLITE_INSTALL_LOG=<path>        Install log file (default: /var/log/deploylite/install.log).
   DEPLOYLITE_INSTALL_LOG_DIR=<path>    Install log directory (default: parent of DEPLOYLITE_INSTALL_LOG).
@@ -253,6 +258,7 @@ preflight() {
   if [[ "${EUID}" -ne 0 ]] && ! command_exists sudo; then
     fail "Root or sudo is required. Re-run as root or install sudo." 2
   fi
+  command_exists timeout || fail "timeout is required to bound apt and Compose operations." 2
   port_available 80 || fail "Port 80 is already in use. Stop the conflicting service before installing." 2
   port_available 443 || fail "Port 443 is already in use. Stop the conflicting service before installing." 2
 }
@@ -269,17 +275,30 @@ install_docker() {
   command_exists apt-get || fail "Docker is missing and automatic install requires apt-get." 2
   info "Installing Docker Engine and Compose plugin through Docker's official apt repository."
   install_docker_apt_repository
-  as_root apt-get update
-  as_root apt-get install -y docker-ce docker-ce-cli containerd.io docker-buildx-plugin docker-compose-plugin
+  apt_bounded update
+  apt_bounded install -y docker-ce docker-ce-cli containerd.io docker-buildx-plugin docker-compose-plugin
   command_exists docker || fail "Docker installation did not provide docker CLI." 2
   as_root docker compose version >/dev/null 2>&1 || fail "Docker Compose plugin is unavailable after install." 2
   record_change "docker-installed-or-updated"
 }
 
+install_curl() {
+  if command_exists curl; then
+    info "curl is available for local reachability checks."
+    return 0
+  fi
+  command_exists apt-get || fail "curl is required and automatic install requires apt-get." 2
+  info "Installing curl for local reachability checks."
+  apt_bounded update
+  apt_bounded install -y ca-certificates curl
+  command_exists curl || fail "curl installation did not provide curl." 2
+  record_change "curl-installed"
+}
+
 install_docker_apt_repository() {
   local codename arch signed_by repo_file
-  command_exists curl || as_root apt-get install -y ca-certificates curl gnupg
-  command_exists gpg || as_root apt-get install -y gnupg
+  command_exists curl || fail "curl is required before configuring the Docker apt repository." 2
+  command_exists gpg || { apt_bounded install -y gnupg; command_exists gpg || fail "gnupg installation did not provide gpg." 2; }
   # shellcheck disable=SC1091
   . /etc/os-release
   codename="${VERSION_CODENAME:-}"
@@ -321,12 +340,40 @@ install_compose_file() {
   rm -f "$tmp" "$tls_tmp"
 }
 
+apt_bounded() {
+  local status
+  if as_root timeout --foreground "${APT_TIMEOUT_SECONDS}s" apt-get \
+    -o DPkg::Lock::Timeout="${APT_TIMEOUT_SECONDS}" \
+    -o Acquire::http::Timeout="${APT_TIMEOUT_SECONDS}" \
+    -o Acquire::https::Timeout="${APT_TIMEOUT_SECONDS}" "$@"; then
+    return 0
+  else
+    status=$?
+  fi
+  if [[ "$status" -eq 124 || "$status" -eq 137 ]]; then
+    fail "Timed out after ${APT_TIMEOUT_SECONDS}s during apt-get $*." 1
+  fi
+  fail "apt-get $* failed with status ${status}." "$status"
+}
+
 compose() { as_root docker compose -f "$COMPOSE_FILE" -f "$TLS_COMPOSE_FILE" --project-directory "$INSTALL_DIR" "$@"; }
-compose_down_safe() { compose down --remove-orphans; }
+compose_bounded() {
+  local status
+  if as_root timeout --foreground "${COMPOSE_TIMEOUT_SECONDS}s" docker compose -f "$COMPOSE_FILE" -f "$TLS_COMPOSE_FILE" --project-directory "$INSTALL_DIR" "$@"; then
+    return 0
+  else
+    status=$?
+  fi
+  if [[ "$status" -eq 124 || "$status" -eq 137 ]]; then
+    fail "Timed out after ${COMPOSE_TIMEOUT_SECONDS}s during docker compose $*." 1
+  fi
+  fail "docker compose $* failed with status ${status}." "$status"
+}
+compose_down_safe() { compose_bounded down --remove-orphans; }
 
 validate_compose() {
   info "Validating the secure bootstrap Compose profile."
-  compose --profile bootstrap config --no-interpolate >/dev/null
+  compose_bounded --profile bootstrap config --no-interpolate >/dev/null
 }
 
 generate_secret() {
@@ -338,7 +385,8 @@ prepare_runtime_env() {
   local tmp host database_password secret_key
   if [[ -f "$RUNTIME_ENV_FILE" ]]; then
     as_root chmod 600 "$RUNTIME_ENV_FILE"
-    info "Existing internal runtime secrets preserved."
+    validate_runtime_env
+    info "Existing internal runtime secrets validated and preserved."
     return 0
   fi
   host="${DEPLOYLITE_PUBLIC_HOST:-deploylite.com}"
@@ -354,13 +402,65 @@ prepare_runtime_env() {
   info "Generated internal runtime secrets with restricted permissions."
 }
 
+read_runtime_env_value() {
+  local key="$1" value
+  value="$(awk -F= -v key="$key" '$0 ~ "^" key "=" { count++; sub("^[^=]*=", ""); print } END { if (count != 1) exit 1 }' "$RUNTIME_ENV_FILE")" \
+    || fail "${RUNTIME_ENV_FILE} must contain exactly one ${key}= value." 2
+  [[ -n "$value" ]] || fail "${RUNTIME_ENV_FILE} contains an empty ${key} value." 2
+  printf '%s' "$value"
+}
+
+validate_runtime_env() {
+  local host expected_host database_password secret_key
+  host="$(read_runtime_env_value DEPLOYLITE_PUBLIC_HOST)"
+  expected_host="${DEPLOYLITE_PUBLIC_HOST:-$host}"
+  [[ "$host" == "$expected_host" ]] || fail "Existing ${RUNTIME_ENV_FILE} host does not match DEPLOYLITE_PUBLIC_HOST." 2
+  [[ "$host" =~ ^[A-Za-z0-9]([A-Za-z0-9.-]*[A-Za-z0-9])?$ ]] || fail "DEPLOYLITE_PUBLIC_HOST must be a hostname." 2
+  database_password="$(read_runtime_env_value POSTGRES_PASSWORD)"
+  secret_key="$(read_runtime_env_value DEPLOYLITE_SECRET_KEY)"
+  [[ "$database_password" =~ ^[A-Za-z0-9+/]{64}$ ]] || fail "Existing POSTGRES_PASSWORD has an invalid generated-secret format." 2
+  [[ "$secret_key" =~ ^[A-Za-z0-9+/]{64}$ ]] || fail "Existing DEPLOYLITE_SECRET_KEY has an invalid generated-secret format." 2
+}
+
+verify_local_reachability() {
+  local host expected_ip resolved_ips headers body
+  host="${DEPLOYLITE_PUBLIC_HOST:-deploylite.com}"
+  expected_ip="${DEPLOYLITE_EXPECTED_PUBLIC_IP:-}"
+  if [[ -z "$expected_ip" ]]; then
+    expected_ip="$(curl --fail --silent --show-error --ipv4 --connect-timeout 5 --max-time 15 https://api.ipify.org)" \
+      || fail "Could not determine this host's public IP for DNS verification." 1
+  fi
+  [[ "$expected_ip" =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}$ ]] || fail "Expected local public IP is malformed." 2
+  command_exists getent || fail "getent is required to verify DNS for ${host}." 2
+  resolved_ips="$(getent ahostsv4 "$host" | awk '{print $1}' | sort -u)" \
+    || fail "DNS lookup failed for ${host}." 1
+  [[ "\n${resolved_ips}\n" == *"\n${expected_ip}\n"* ]] \
+    || fail "DNS for ${host} does not resolve to this host's expected public IP." 1
+
+  headers="$(mktemp)"
+  body="$(mktemp)"
+  if ! curl --fail --silent --show-error --location --connect-timeout 10 --max-time 120 \
+    --dump-header "$headers" --output "$body" "https://${host}/"; then
+    rm -f "$headers" "$body"
+    fail "HTTPS bootstrap page did not become reachable for ${host}." 1
+  fi
+  grep -Eiq '^x-deploylite-bootstrap:[[:space:]]*ready[[:space:]]*$' "$headers" \
+    || { rm -f "$headers" "$body"; fail "HTTPS response for ${host} did not contain the local bootstrap marker header." 1; }
+  grep -Fqi 'DeployLite' "$body" \
+    || { rm -f "$headers" "$body"; fail "HTTPS response for ${host} did not contain the local bootstrap marker body." 1; }
+  rm -f "$headers" "$body"
+}
+
 start_bootstrap() {
-  info "Starting the secure bootstrap control plane; waiting up to 120 seconds for health checks."
-  compose --profile bootstrap up -d --wait --wait-timeout 120
   CREATED_RUNTIME=1
-  info "Waiting up to 120 seconds for the ACME-provisioned HTTPS first-owner page."
-  curl --fail --silent --show-error --connect-timeout 10 --max-time 120 "https://${DEPLOYLITE_PUBLIC_HOST:-deploylite.com}/" >/dev/null \
-    || fail "HTTPS bootstrap page did not become reachable. Verify DNS for ${DEPLOYLITE_PUBLIC_HOST:-deploylite.com} and retry." 1
+  info "Pulling bootstrap images; timeout is ${COMPOSE_TIMEOUT_SECONDS}s."
+  compose_bounded --profile bootstrap pull --ignore-buildable
+  info "Building bootstrap images; timeout is ${COMPOSE_TIMEOUT_SECONDS}s."
+  compose_bounded --profile bootstrap build
+  info "Starting the secure bootstrap control plane; timeout is ${COMPOSE_TIMEOUT_SECONDS}s."
+  compose_bounded --profile bootstrap up -d --wait --wait-timeout 120
+  info "Verifying local DNS and the HTTPS first-owner response."
+  verify_local_reachability
   info "Bootstrap control plane is running behind HTTPS. Create the first owner at https://${DEPLOYLITE_PUBLIC_HOST:-deploylite.com}."
 }
 
@@ -378,6 +478,7 @@ main() {
     return 0
   fi
   preflight
+  install_curl
   install_docker
   prepare_install_dir
   prepare_runtime_env

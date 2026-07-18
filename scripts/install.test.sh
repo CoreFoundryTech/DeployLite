@@ -48,7 +48,7 @@ test_unsupported_host_fails_without_mutation() {
   detect_os() { fail 'Unsupported host: expected Ubuntu 20.04/22.04/24.04 or Debian 11/12.' 2; }
   detect_arch() { :; }
   port_available() { :; }
-  command_exists() { [[ "$1" == "sudo" ]]; }
+  command_exists() { [[ "$1" == "sudo" || "$1" == "timeout" ]]; }
   output="$(preflight 2>&1)" && status=0 || status=$?
   [[ "$status" -eq 2 ]]
   assert_contains "$output" 'Unsupported host'
@@ -60,7 +60,7 @@ test_occupied_port_fails_actionably() {
   local output status
   detect_os() { :; }
   detect_arch() { :; }
-  command_exists() { [[ "$1" == "sudo" ]]; }
+  command_exists() { [[ "$1" == "sudo" || "$1" == "timeout" ]]; }
   port_available() { [[ "$1" != "80" ]]; }
   output="$(preflight 2>&1)" && status=0 || status=$?
   [[ "$status" -eq 2 ]]
@@ -71,17 +71,26 @@ test_install_docker_uses_docker_apt_repo_when_missing() {
   local calls=() docker_ready=0
   command_exists() {
     case "$1" in
-      apt-get|curl|gpg) return 0 ;;
+      apt-get|curl|gpg|timeout) return 0 ;;
       docker) [[ "$docker_ready" == "1" ]] ;;
       *) return 1 ;;
     esac
   }
   install_docker_apt_repository() { calls+=("install_docker_apt_repository"); }
-  as_root() { calls+=("$*"); [[ "$*" == apt-get\ install* ]] && docker_ready=1; return 0; }
+  as_root() { calls+=("$*"); [[ "$*" == *apt-get*install* ]] && docker_ready=1; return 0; }
   install_docker
   [[ " ${calls[*]} " == *" install_docker_apt_repository "* ]]
-  [[ " ${calls[*]} " == *" apt-get update "* ]]
-  [[ " ${calls[*]} " == *" apt-get install -y docker-ce docker-ce-cli containerd.io docker-buildx-plugin docker-compose-plugin "* ]]
+  [[ " ${calls[*]} " == *" apt-get -o DPkg::Lock::Timeout=180 -o Acquire::http::Timeout=180 -o Acquire::https::Timeout=180 update "* ]]
+  [[ " ${calls[*]} " == *" apt-get -o DPkg::Lock::Timeout=180 -o Acquire::http::Timeout=180 -o Acquire::https::Timeout=180 install -y docker-ce docker-ce-cli containerd.io docker-buildx-plugin docker-compose-plugin "* ]]
+}
+
+test_install_curl_is_separate_from_docker_detection() {
+  local calls=() curl_ready=0
+  command_exists() { [[ "$1" == "apt-get" || "$1" == "timeout" || ("$1" == "curl" && "$curl_ready" == "1") ]]; }
+  as_root() { calls+=("$*"); [[ "$*" == *apt-get*install*curl* ]] && curl_ready=1; return 0; }
+  install_curl
+  [[ " ${calls[*]} " == *" apt-get -o DPkg::Lock::Timeout=180 -o Acquire::http::Timeout=180 -o Acquire::https::Timeout=180 update "* ]] || return 1
+  [[ " ${calls[*]} " == *" apt-get -o DPkg::Lock::Timeout=180 -o Acquire::http::Timeout=180 -o Acquire::https::Timeout=180 install -y ca-certificates curl "* ]] || return 1
 }
 
 test_prepare_install_dir_copies_tls_overlay() {
@@ -165,11 +174,68 @@ test_redact_stream_removes_postgres_passwords_and_key_value_secrets() {
 
 test_validate_compose_omits_runtime_profile() {
   local compose_calls=""
-  compose() { compose_calls="$*"; }
+  compose_bounded() { compose_calls="$*"; }
   validate_compose >/dev/null
   assert_contains "$compose_calls" 'config' || return 1
   assert_contains "$compose_calls" '--no-interpolate' || return 1
   assert_contains "$compose_calls" '--profile bootstrap' || return 1
+}
+
+test_prepare_runtime_env_rejects_stale_or_inconsistent_values() {
+  local tmp output status
+  tmp="$(mktemp -d)"
+  INSTALL_DIR="$tmp/install"
+  RUNTIME_ENV_FILE="$INSTALL_DIR/.env"
+  mkdir -p "$INSTALL_DIR"
+  printf 'DEPLOYLITE_PUBLIC_HOST=old.example.test\nPOSTGRES_PASSWORD=short\nDEPLOYLITE_SECRET_KEY=%064d\n' 0 >"$RUNTIME_ENV_FILE"
+  as_root() { "$@"; }
+  DEPLOYLITE_PUBLIC_HOST="new.example.test"
+  output="$(prepare_runtime_env 2>&1)" && status=0 || status=$?
+  [[ "$status" -eq 2 ]] || return 1
+  assert_contains "$output" 'host does not match' || return 1
+  rm -rf "$tmp"
+}
+
+test_prepare_runtime_env_rejects_malformed_secret_values() {
+  local tmp output status
+  tmp="$(mktemp -d)"
+  INSTALL_DIR="$tmp/install"
+  RUNTIME_ENV_FILE="$INSTALL_DIR/.env"
+  mkdir -p "$INSTALL_DIR"
+  printf 'DEPLOYLITE_PUBLIC_HOST=deploylite.com\nPOSTGRES_PASSWORD=short\nDEPLOYLITE_SECRET_KEY=also-short\n' >"$RUNTIME_ENV_FILE"
+  as_root() { "$@"; }
+  unset DEPLOYLITE_PUBLIC_HOST
+  output="$(prepare_runtime_env 2>&1)" && status=0 || status=$?
+  [[ "$status" -eq 2 ]] || return 1
+  assert_contains "$output" 'POSTGRES_PASSWORD has an invalid generated-secret format' || return 1
+  rm -rf "$tmp"
+}
+
+test_verify_local_reachability_checks_dns_header_and_body() {
+  local tmp headers_path body_path
+  DEPLOYLITE_PUBLIC_HOST="local.example.test"
+  DEPLOYLITE_EXPECTED_PUBLIC_IP="203.0.113.10"
+  command_exists() { [[ "$1" == "curl" || "$1" == "getent" ]]; }
+  getent() { printf '203.0.113.10 STREAM local.example.test\n'; }
+  curl() {
+    if [[ "$*" == *'api.ipify.org'* ]]; then
+      printf '203.0.113.10'
+      return 0
+    fi
+    while (( $# > 0 )); do
+      case "$1" in
+        --dump-header|--output) shift; printf '%s\n' "$1" >>/tmp/deploylite-curl-paths.test;;
+      esac
+      shift
+    done
+    headers_path="$(sed -n '1p' /tmp/deploylite-curl-paths.test)"
+    body_path="$(sed -n '2p' /tmp/deploylite-curl-paths.test)"
+    printf 'HTTP/2 200\nX-DeployLite-Bootstrap: ready\n\n' >"$headers_path"
+    printf '<html>DeployLite first owner</html>\n' >"$body_path"
+  }
+  : >/tmp/deploylite-curl-paths.test
+  verify_local_reachability
+  rm -f /tmp/deploylite-curl-paths.test "$headers_path" "$body_path"
 }
 
 test_prepare_runtime_env_uses_restricted_file_without_secret_output() {
@@ -191,20 +257,21 @@ test_prepare_runtime_env_uses_restricted_file_without_secret_output() {
 }
 
 test_start_bootstrap_is_bounded_and_never_activates_runtime() {
-  local compose_calls="" curl_calls=""
-  compose() { compose_calls="$*"; }
-  curl() { curl_calls="$*"; }
+  local compose_calls=""
+  compose_bounded() { compose_calls+="|$*"; }
+  verify_local_reachability() { :; }
   start_bootstrap >/dev/null
+  assert_contains "$compose_calls" '--profile bootstrap pull' || return 1
+  assert_contains "$compose_calls" '--profile bootstrap build' || return 1
   assert_contains "$compose_calls" '--profile bootstrap up -d --wait --wait-timeout 120' || return 1
   assert_not_contains "$compose_calls" '--profile runtime' || return 1
-  assert_contains "$curl_calls" '--max-time 120' || return 1
-  assert_contains "$curl_calls" 'https://deploylite.com/' || return 1
 }
 
 run_test 'redaction masks secrets' test_redaction_masks_database_url_and_secret_assignments
 run_test 'unsupported host fails before mutation' test_unsupported_host_fails_without_mutation
 run_test 'occupied port fails actionably' test_occupied_port_fails_actionably
 run_test 'missing Docker triggers Docker apt repository install path' test_install_docker_uses_docker_apt_repo_when_missing
+run_test 'curl installation is independent of Docker detection' test_install_curl_is_separate_from_docker_detection
 run_test 'copies TLS Compose overlay' test_prepare_install_dir_copies_tls_overlay
 run_test 'installed compose keeps valid build context' test_installed_compose_uses_source_tree_build_context
 run_test 'prompt_value returns default in noninteractive mode' test_prompt_value_returns_default_in_noninteractive_mode
@@ -214,7 +281,10 @@ run_test 'prompt_value returns default when piped empty in interactive no-tty mo
 run_test 'redact_stream removes postgres passwords and key=value secrets' test_redact_stream_removes_postgres_passwords_and_key_value_secrets
 run_test 'validates the bootstrap Compose profile' test_validate_compose_omits_runtime_profile
 run_test 'generates silent restricted internal runtime secrets' test_prepare_runtime_env_uses_restricted_file_without_secret_output
-run_test 'starts only the bounded bootstrap control plane' test_start_bootstrap_is_bounded_and_never_activates_runtime
+run_test 'rejects stale or inconsistent runtime secrets' test_prepare_runtime_env_rejects_stale_or_inconsistent_values
+run_test 'rejects malformed runtime secret values' test_prepare_runtime_env_rejects_malformed_secret_values
+run_test 'verifies local DNS and HTTPS response markers' test_verify_local_reachability_checks_dns_header_and_body
+run_test 'pulls, builds, and starts only the bounded bootstrap control plane' test_start_bootstrap_is_bounded_and_never_activates_runtime
 
 printf '\n%d passed, %d failed\n' "$PASS" "$FAIL"
 [[ "$FAIL" -eq 0 ]]

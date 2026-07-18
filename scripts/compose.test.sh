@@ -10,11 +10,13 @@ contains() { [[ "$rendered" == *"$1"* ]] || { printf 'missing: %s\n' "$1"; retur
 contains "DEPLOYLITE_CORS_ORIGIN: https://\${DEPLOYLITE_PUBLIC_HOST:-deploylite.invalid}"
 contains 'profiles:'
 contains 'bootstrap'
-contains 'DEPLOYLITE_SECRET_KEY: ${DEPLOYLITE_SECRET_KEY:?DEPLOYLITE_SECRET_KEY is required}'
+contains "DEPLOYLITE_SECRET_KEY: \${DEPLOYLITE_SECRET_KEY:?DEPLOYLITE_SECRET_KEY is required}"
 contains -- '--entrypoints.web.http.redirections.entrypoint.scheme=https'
 contains 'source: traefik-acme'
 contains 'target: /acme'
-contains 'Host(`${DEPLOYLITE_PUBLIC_HOST:-deploylite.com}`)'
+contains "Host(\`\${DEPLOYLITE_PUBLIC_HOST:-deploylite.com}\`)"
+contains 'X-DeployLite-Bootstrap=ready'
+contains 'deploylite-bootstrap-marker'
 contains 'DEPLOYLITE_SESSION_COOKIE_SECURE: "true"'
 if [[ "$rendered" == *'"3001:3001"'* || "$rendered" == *'"80:3000"'* ]]; then
   printf 'API or web must not publish host ports\n'

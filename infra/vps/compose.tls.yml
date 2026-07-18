@@ -26,6 +26,8 @@ services:
       - traefik.http.routers.deploylite-web.entrypoints=websecure
       - traefik.http.routers.deploylite-web.tls.certresolver=le
       - traefik.http.services.deploylite-web.loadbalancer.server.port=3000
+      - traefik.http.middlewares.deploylite-bootstrap-marker.headers.customresponseheaders.X-DeployLite-Bootstrap=ready
+      - traefik.http.routers.deploylite-web.middlewares=deploylite-bootstrap-marker
 
 volumes:
   traefik-acme:
