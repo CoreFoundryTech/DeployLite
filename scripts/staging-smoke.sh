@@ -52,10 +52,17 @@ evidence_file="${evidence_file:-${RUNNER_TEMP:-$tmpdir}/staging-smoke-evidence.j
 case "$evidence_file" in "$root"/*|"${RUNNER_TEMP:-$tmpdir}"/*|"$tmpdir"/*|"${TMPDIR:-/tmp}"/*) ;; *) blocked 'evidence path must stay in the checkout or runner temp directory.' ;; esac
 
 redact() {
-  sed -E \
-    -e "s|${STAGING_SSH_PRIVATE_KEY//|/\\|}|[REDACTED]|g" \
-    -e "s|${STAGING_SSH_HOST_KEY//|/\\|}|[REDACTED]|g" \
-    -e "s|${STAGING_SMOKE_TOKEN//|/\\|}|[REDACTED]|g"
+  python3 -c '
+import os
+import sys
+
+output = sys.stdin.read()
+for name in ("STAGING_SSH_PRIVATE_KEY", "STAGING_SSH_HOST_KEY", "STAGING_SMOKE_TOKEN"):
+    secret = os.environ.get(name, "")
+    if secret:
+        output = output.replace(secret, "[REDACTED]")
+sys.stdout.write(output)
+'
 }
 record() {
   local status="$1"
@@ -77,13 +84,16 @@ chmod 600 "$tmpdir/id_ed25519" "$tmpdir/known_hosts"
 
 ip="$(getent ahostsv4 "$STAGING_TARGET" | awk 'NR==1 { print $1 }')"
 [[ -n "$ip" ]] || fail 'DNS resolution returned no IPv4 address.'
-ssh -i "$tmpdir/id_ed25519" -o BatchMode=yes -o StrictHostKeyChecking=yes -o UserKnownHostsFile="$tmpdir/known_hosts" \
-  "${STAGING_SSH_USER:-deploylite}@${STAGING_TARGET}" "test \"\$(cat /etc/deploylite-smoke-target)\" = \"$STAGING_TARGET\"" \
+timeout --foreground 30s ssh -i "$tmpdir/id_ed25519" -o BatchMode=yes -o ConnectTimeout=10 -o StrictHostKeyChecking=yes \
+  -o HostKeyAlias="$STAGING_TARGET" -o UserKnownHostsFile="$tmpdir/known_hosts" \
+  "${STAGING_SSH_USER:-deploylite}@${ip}" "test \"\$(cat /etc/deploylite-smoke-target)\" = \"$STAGING_TARGET\"" \
   > >(redact) 2> >(redact >&2) || fail 'non-production sentinel check failed.'
-curl --fail --silent --show-error --proto '=https' --tlsv1.2 --max-time 20 \
+timeout --foreground 30s curl --fail --silent --show-error --proto '=https' --tlsv1.2 --connect-timeout 10 --max-time 20 \
+  --resolve "$STAGING_TARGET:443:$ip" \
   -H "Authorization: Bearer $STAGING_SMOKE_TOKEN" "https://$STAGING_TARGET/health" \
   > >(redact) 2> >(redact >&2) || fail 'TLS health check failed.'
-curl --fail --silent --show-error --head --proto '=https' --tlsv1.2 --max-time 20 \
+timeout --foreground 30s curl --fail --silent --show-error --head --proto '=https' --tlsv1.2 --connect-timeout 10 --max-time 20 \
+  --resolve "$STAGING_TARGET:443:$ip" \
   -H "Authorization: Bearer $STAGING_SMOKE_TOKEN" "https://$STAGING_TARGET/" \
   | redact | grep -qi '^server: traefik' || fail 'routing check did not identify Traefik.'
 record pass

@@ -35,6 +35,8 @@ jobs:
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.1.1
       - name: Run credential-safe non-production smoke
+        env:
+          STAGING_EVIDENCE_FILE: ${{ runner.temp }}/staging-smoke-evidence.json
         run: bash scripts/staging-smoke.sh --execute --evidence "$STAGING_EVIDENCE_FILE"
       - name: Upload redacted smoke evidence
         if: always()
