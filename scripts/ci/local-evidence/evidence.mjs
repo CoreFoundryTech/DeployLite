@@ -18,6 +18,9 @@ export const ADVISORY_ASSERTIONS = Object.freeze({
 
 const sha = /^[a-f0-9]{40}$/;
 const unsafeArgument = /(?:[;&|`$()]|^\w+=|^HEAD$|^refs\/|\.(?:md|json|ya?ml)$)/i;
+const secretOption = /^--?(?:api[-_]?key|auth(?:orization)?|credential|gh[-_]?token|password|private[-_]?key|secret|token)(?:=|$)/i;
+const secretValue = /(?:\b(?:api[-_]?key|auth(?:orization)?|credential|gh[-_]?token|password|private[-_]?key|secret|token)\b\s*[:=]|\bbearer\s+|\bgh[pousr]_[a-z0-9_]+\b|\bgithub_pat_[a-z0-9_]+\b|\bAKIA[0-9A-Z]{16}\b)/i;
+const trustedDiscoveries = new WeakSet();
 
 function assert(condition, message) {
   if (!condition) throw new TypeError(message);
@@ -35,11 +38,31 @@ export function assertBinding(binding) {
   return Object.freeze({ githubHost, authenticatedLogin, repository, prNumber, headSha, ...(baseSha ? { baseSha } : {}) });
 }
 
+/**
+ * Test seam for a discovery adapter that has already read and verified the
+ * authenticated GitHub host/login, repository, PR number, and head SHA.
+ * Evidence creation only accepts instances made by this boundary.
+ */
+export function createTrustedDiscovery(binding, { source = "github-pr-discovery", verified = true } = {}) {
+  assert(source === "github-pr-discovery" && verified === true, "discovery must be verified by GitHub PR discovery");
+  const trusted = Object.freeze({
+    binding: Object.freeze({ ...assertBinding(binding), discovery: Object.freeze({ source, verified }) })
+  });
+  trustedDiscoveries.add(trusted);
+  return trusted;
+}
+
 export function assertCataloguedCheck({ id, argv }) {
   assert(CATALOGUE_IDS.has(id), `check ${id} is not catalogued`);
   assert(Array.isArray(argv) && argv.length > 0 && argv.every((part) => typeof part === "string" && part.length > 0), "argv must be a non-empty string array");
   assert(argv.every((part) => !unsafeArgument.test(part)), "argv must not contain shell, environment, ref, or documentation/config arguments");
   return Object.freeze({ id, argv: Object.freeze([...argv]) });
+}
+
+function assertSafeArgv(argv, knownValues) {
+  const knownSecrets = [...knownValues].filter((value) => typeof value === "string" && value.length > 0);
+  const containsKnownSecret = (argument) => knownSecrets.some((secret) => argument.includes(secret));
+  assert(!argv.some((argument) => secretOption.test(argument) || secretValue.test(argument) || containsKnownSecret(argument)), "secret-bearing argv must be rejected before evidence serialization");
 }
 
 export function aggregateOutcome(checks) {
@@ -78,10 +101,13 @@ export function canonicalJson(value) {
   return JSON.stringify(sort(value));
 }
 
-export function createEvidence({ binding, checks, generatedAt = "1970-01-01T00:00:00.000Z", knownValues = [] }) {
-  const immutableBinding = assertBinding(binding);
+export function createEvidence({ discovery, checks, generatedAt = "1970-01-01T00:00:00.000Z", knownValues = [] }) {
+  assert(trustedDiscoveries.has(discovery), "trusted discovery binding is required for evidence creation");
+  const immutableBinding = discovery.binding;
+  assert(Array.isArray(checks), "checks must be an array");
   const normalizedChecks = checks.map(({ id, argv, outcome, reasonCode, excerpt = "", durationMs = 0, exitCode = null }) => {
     const command = assertCataloguedCheck({ id, argv });
+    assertSafeArgv(command.argv, knownValues);
     assert(OUTCOMES.includes(outcome), "check outcome must be pass, fail, or blocked");
     assert(reasonCode === undefined || (typeof reasonCode === "string" && reasonCode.length > 0), "reasonCode must be a non-empty string when provided");
     assert(Number.isInteger(durationMs) && durationMs >= 0, "durationMs must be a non-negative integer");
