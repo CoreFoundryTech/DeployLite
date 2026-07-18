@@ -1,0 +1,96 @@
+{
+  "$schema": "https://docs.renovatebot.com/renovate-schema.json",
+  "extends": ["config:recommended"],
+  "dependencyDashboard": true,
+  "prConcurrentLimit": 3,
+  "branchConcurrentLimit": 3,
+  "prHourlyLimit": 1,
+  "schedule": ["before 5am on monday"],
+  "timezone": "Etc/UTC",
+  "automerge": false,
+  "platformAutomerge": false,
+  "separateMajorMinor": true,
+  "separateMultipleMajor": true,
+  "labels": ["dependencies", "release-baseline"],
+  "reviewers": ["CoreFoundryTech"],
+  "prBodyNotes": [
+    "DeployLite remains Alpha/early access.",
+    "This update requires applicable baseline CI evidence and reviewer approval; it must not be auto-merged.",
+    "Record validation and rollback impact in release evidence before any release decision."
+  ],
+  "customManagers": [
+    {
+      "customType": "regex",
+      "managerFilePatterns": ["/^\\.node-version$/"],
+      "matchStrings": ["^(?<currentValue>\\d+\\.\\d+\\.\\d+)$"],
+      "depNameTemplate": "node",
+      "datasourceTemplate": "node-version",
+      "versioningTemplate": "node"
+    }
+  ],
+  "packageRules": [
+    {
+      "description": "Keep npm patch and minor updates reviewable within the npm ecosystem",
+      "matchManagers": ["npm"],
+      "matchUpdateTypes": ["patch", "minor"],
+      "groupName": "npm non-major dependencies",
+      "groupSlug": "npm-non-major"
+    },
+    {
+      "description": "Keep GitHub Action SHA and non-major updates isolated from application dependencies",
+      "matchManagers": ["github-actions"],
+      "matchUpdateTypes": ["digest", "patch", "minor"],
+      "groupName": "github-actions non-major dependencies",
+      "groupSlug": "github-actions-non-major"
+    },
+    {
+      "description": "Keep Dockerfile base-image patch and digest updates isolated",
+      "matchManagers": ["dockerfile"],
+      "matchUpdateTypes": ["digest", "patch", "minor"],
+      "groupName": "dockerfile images non-major",
+      "groupSlug": "dockerfile-images-non-major"
+    },
+    {
+      "description": "Keep Compose image patch and digest updates isolated from Dockerfiles",
+      "matchManagers": ["docker-compose"],
+      "excludePackageNames": ["traefik"],
+      "matchUpdateTypes": ["digest", "patch", "minor"],
+      "groupName": "compose images non-major",
+      "groupSlug": "compose-images-non-major"
+    },
+    {
+      "description": "Keep Traefik updates isolated for Docker 29 compatibility review",
+      "matchManagers": ["docker-compose"],
+      "matchPackageNames": ["traefik"],
+      "matchUpdateTypes": ["digest", "patch", "minor"],
+      "allowedVersions": ">=3.6.7 <4",
+      "groupName": "traefik non-major",
+      "groupSlug": "traefik-non-major"
+    },
+    {
+      "description": "Keep Node runtime updates isolated from Docker image updates",
+      "matchManagers": ["custom.regex"],
+      "matchPackageNames": ["node"],
+      "matchUpdateTypes": ["patch", "minor"],
+      "allowedVersions": ">=24.12.0 <25",
+      "groupName": "node non-major",
+      "groupSlug": "node-non-major"
+    },
+    {
+      "description": "Keep Corepack pnpm updates isolated from npm dependency updates",
+      "matchManagers": ["npm"],
+      "matchDepTypes": ["packageManager"],
+      "matchPackageNames": ["pnpm"],
+      "matchUpdateTypes": ["patch", "minor"],
+      "allowedVersions": ">=9.15.4 <10",
+      "groupName": "pnpm non-major",
+      "groupSlug": "pnpm-non-major"
+    },
+    {
+      "description": "Require manual dashboard approval before any major update PR is created",
+      "matchUpdateTypes": ["major"],
+      "dependencyDashboardApproval": true,
+      "automerge": false
+    }
+  ]
+}
