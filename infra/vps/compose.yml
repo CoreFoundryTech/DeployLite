@@ -3,7 +3,7 @@ name: deploylite
 services:
   traefik:
     # v3.6.7 ships a Docker v28.3.3 client (API 1.51), compatible with Docker 29.
-    image: traefik:v3.6.7
+    image: traefik:v3.6.7@sha256:a9890c898f379c1905ee5b28342f6b408dc863f08db2dab20e46c267d1ff463a
     restart: unless-stopped
     ports:
       - "80:80"
@@ -12,7 +12,7 @@ services:
       - deploylite
   postgres:
     profiles: [bootstrap, runtime]
-    image: postgres:16-alpine
+    image: postgres:16-alpine@sha256:57c72fd2a128e416c7fcc499958864df5301e940bca0a56f58fddf30ffc07777
     restart: unless-stopped
     environment:
       POSTGRES_DB: ${POSTGRES_DB:-deploylite}
