@@ -15,7 +15,8 @@
     "test": "pnpm -r --if-present test",
     "lint": "pnpm -r --if-present lint",
     "check": "pnpm build && pnpm lint && pnpm typecheck && pnpm test",
-    "runtime:contract": "bash scripts/runtime-contract.test.sh"
+    "runtime:contract": "bash scripts/runtime-contract.test.sh",
+    "ci:evidence:check": "node scripts/ci/collect-evidence.mjs --check-only"
   },
   "devDependencies": {
     "@types/react": "^19.0.2",

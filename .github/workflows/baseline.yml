@@ -1,0 +1,102 @@
+name: Release baseline gates
+
+on:
+  pull_request:
+  push:
+    branches: [main, feat/platform-release-baseline]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: baseline-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  quality:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.1.1
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
+        with:
+          node-version: 24.12.0
+          cache: pnpm
+      - run: corepack enable
+      - run: pnpm install --frozen-lockfile
+      - run: pnpm runtime:contract
+      - run: pnpm lint
+      - run: pnpm typecheck
+      - run: pnpm test
+      - run: pnpm build
+
+  postgres-integration:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    services:
+      postgres:
+        image: postgres:16-alpine@sha256:57c72fd2a128e416c7fcc499958864df5301e940bca0a56f58fddf30ffc07777
+        env:
+          POSTGRES_DB: deploylite
+          POSTGRES_USER: deploylite
+          POSTGRES_PASSWORD: deploylite-ci-only
+        ports: ["5432:5432"]
+        options: >-
+          --health-cmd "pg_isready -U deploylite -d deploylite" --health-interval 5s --health-timeout 5s --health-retries 20
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.1.1
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
+        with: { node-version: 24.12.0, cache: pnpm }
+      - run: corepack enable && pnpm install --frozen-lockfile
+      - run: pnpm --filter @deploylite/db db:migrate
+        env: { DATABASE_URL: postgres://deploylite:deploylite-ci-only@localhost:5432/deploylite }
+      - run: pnpm --filter @deploylite/db db:verify:integration && pnpm --filter @deploylite/api db:verify:integration
+        env: { DATABASE_URL: postgres://deploylite:deploylite-ci-only@localhost:5432/deploylite }
+
+  compose-and-supply-chain:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    outputs:
+      api_digest: ${{ steps.images.outputs.api_digest }}
+      web_digest: ${{ steps.images.outputs.web_digest }}
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.1.1
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
+        with: { node-version: 24.12.0, cache: pnpm }
+      - run: corepack enable && pnpm install --frozen-lockfile
+      - run: pnpm ci:evidence:check && bash scripts/compose.test.sh
+      - uses: aquasecurity/trivy-action@915b19bbe73b92a6cf82a1bc12b087c9a19a5fe2 # v0.28.0
+        with: { scan-type: fs, scan-ref: ., severity: HIGH,CRITICAL, exit-code: "1", ignore-unfixed: "false" }
+      - run: docker build --file apps/api/Dockerfile --tag deploylite-api:ci . && docker build --file apps/web/Dockerfile --tag deploylite-web:ci .
+      - id: images
+        run: |
+          printf 'api_digest=%s\n' "$(docker image inspect deploylite-api:ci --format '{{.Id}}')" >> "$GITHUB_OUTPUT"
+          printf 'web_digest=%s\n' "$(docker image inspect deploylite-web:ci --format '{{.Id}}')" >> "$GITHUB_OUTPUT"
+          docker sbom --format cyclonedx-json --output api.sbom.json deploylite-api:ci
+          docker sbom --format cyclonedx-json --output web.sbom.json deploylite-web:ci
+      - uses: aquasecurity/trivy-action@915b19bbe73b92a6cf82a1bc12b087c9a19a5fe2 # v0.28.0
+        with: { image-ref: deploylite-api:ci, format: json, output: api.trivy.json, severity: HIGH,CRITICAL, exit-code: "1", ignore-unfixed: "false" }
+      - uses: aquasecurity/trivy-action@915b19bbe73b92a6cf82a1bc12b087c9a19a5fe2 # v0.28.0
+        with: { image-ref: deploylite-web:ci, format: json, output: web.trivy.json, severity: HIGH,CRITICAL, exit-code: "1", ignore-unfixed: "false" }
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        if: always()
+        with: { name: supply-chain-reports, path: "*.{sbom,trivy}.json", if-no-files-found: warn, retention-days: 30 }
+
+  baseline-gate:
+    if: always()
+    needs: [quality, postgres-integration, compose-and-supply-chain]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.1.1
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
+        with: { node-version: 24.12.0 }
+      - name: Collect pass evidence
+        if: needs.quality.result == 'success' && needs.postgres-integration.result == 'success' && needs.compose-and-supply-chain.result == 'success'
+        run: |
+          node scripts/ci/collect-evidence.mjs --output artifacts/baseline-evidence.json --commit "$GITHUB_SHA" --lock-hash "$(sha256sum pnpm-lock.yaml | cut -d' ' -f1)" --compose-digest "sha256:$(cat infra/vps/compose.yml infra/vps/compose.tls.yml | sha256sum | cut -d' ' -f1)" --image "deploylite-api:ci,${{ needs.compose-and-supply-chain.outputs.api_digest }},linux/amd64,$GITHUB_RUN_ID" --image "deploylite-web:ci,${{ needs.compose-and-supply-chain.outputs.web_digest }},linux/amd64,$GITHUB_RUN_ID" --check quality:pass --check postgres-integration:pass --check compose-and-supply-chain:pass
+      - name: Block incomplete or failing gates
+        run: test "${{ needs.quality.result }}:${{ needs.postgres-integration.result }}:${{ needs.compose-and-supply-chain.result }}" = "success:success:success"
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        if: always()
+        with: { name: baseline-evidence, path: artifacts/baseline-evidence.json, if-no-files-found: warn, retention-days: 30 }
