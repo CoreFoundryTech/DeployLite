@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { runCheck, sanitizedEnvironment } from "./process.mjs";
+import { spawnBounded, runCheck, sanitizedEnvironment } from "./process.mjs";
 
 const check = { id: "test", argv: ["pnpm", "test"], timeoutMs: 25, capability: "pnpm" };
 
@@ -26,4 +26,20 @@ test("fixed argv uses no shell and reports actual failures", async () => {
   const result = await runCheck(check, { cwd: "/tmp/run", available: new Set(["pnpm"]), spawn: async (input) => { received = input; return { exitCode: 2, output: "failed" }; } });
   assert.deepEqual(received, { command: "pnpm", args: ["test"], cwd: "/tmp/run", env: sanitizedEnvironment(process.env), timeoutMs: 25, shell: false });
   assert.equal(result.outcome, "fail");
+});
+
+test("bounded execution settles as timeout when a child ignores SIGTERM", async () => {
+  const started = Date.now();
+  const result = await spawnBounded({
+    command: process.execPath,
+    args: ["--input-type=module", "--eval", "process.on('SIGTERM', () => process.stdout.write('ignored-sigterm\\n')); process.stdout.write('ready\\n'); setInterval(() => {}, 1_000)"],
+    cwd: "/tmp",
+    env: sanitizedEnvironment(process.env),
+    timeoutMs: 100,
+    shell: false
+  });
+
+  assert.equal(result.event, "timeout");
+  assert.match(result.output, /ready\nignored-sigterm\n/);
+  assert.ok(Date.now() - started < 750, "timeout escalation must settle promptly");
 });

@@ -2,6 +2,7 @@ import { spawn as spawnChild } from "node:child_process";
 
 const cleanPath = (env) => typeof env.PATH === "string" && env.PATH ? env.PATH : "/usr/bin:/bin";
 const OUTPUT_LIMIT = 16_384;
+const TERMINATION_GRACE_MS = 50;
 
 export function sanitizedEnvironment(env = process.env) {
   return Object.freeze({ CI: "true", HOME: "/nonexistent", NO_COLOR: "1", PATH: cleanPath(env) });
@@ -12,12 +13,31 @@ export function spawnBounded({ command, args, cwd, env, timeoutMs, shell }) {
     const child = spawnChild(command, args, { cwd, env, shell, stdio: ["ignore", "pipe", "pipe"] });
     let output = "";
     let timedOut = false;
+    let settled = false;
     const append = (chunk) => { output = `${output}${chunk}`.slice(0, OUTPUT_LIMIT); };
-    const timer = setTimeout(() => { timedOut = true; child.kill("SIGTERM"); }, timeoutMs);
+    let escalationTimer;
+    const settle = (result) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      clearTimeout(escalationTimer);
+      resolve(result);
+    };
+    const terminate = (signal) => {
+      try { child.kill(signal); } catch { /* The child has already exited or cannot be signalled. */ }
+    };
+    const timer = setTimeout(() => {
+      timedOut = true;
+      terminate("SIGTERM");
+      escalationTimer = setTimeout(() => {
+        terminate("SIGKILL");
+        settle({ event: "timeout", output });
+      }, TERMINATION_GRACE_MS);
+    }, timeoutMs);
     child.stdout.on("data", append);
     child.stderr.on("data", append);
-    child.on("error", () => { clearTimeout(timer); resolve({ event: "error", output }); });
-    child.on("close", (exitCode) => { clearTimeout(timer); resolve(timedOut ? { event: "timeout", output } : { exitCode, output }); });
+    child.on("error", () => settle({ event: "error", output }));
+    child.on("close", (exitCode) => settle(timedOut ? { event: "timeout", output } : { exitCode, output }));
   });
 }
 
