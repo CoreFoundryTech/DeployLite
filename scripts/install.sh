@@ -5,6 +5,7 @@ INSTALL_DIR="${DEPLOYLITE_INSTALL_DIR:-/opt/deploylite}"
 REPO_ROOT="${DEPLOYLITE_REPO_ROOT:-$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)}"
 COMPOSE_FILE="${INSTALL_DIR}/compose.yml"
 TLS_COMPOSE_FILE="${INSTALL_DIR}/compose.tls.yml"
+RUNTIME_ENV_FILE="${INSTALL_DIR}/.env"
 STATE_DIR="${INSTALL_DIR}/.state"
 DEFAULT_LOG_FILE="/var/log/deploylite/install.log"
 INSTALL_LOG="${DEPLOYLITE_INSTALL_LOG:-$DEFAULT_LOG_FILE}"
@@ -68,7 +69,7 @@ Options:
   --help, -h          Show this help and exit.
 
 Environment:
-  DEPLOYLITE_PUBLIC_HOST=<hostname>    Future HTTPS host; not persisted by this installer.
+  DEPLOYLITE_PUBLIC_HOST=<hostname>    Installation host (default: deploylite.com).
   DEPLOYLITE_INSTALL_DIR=<path>        Install directory (default: /opt/deploylite).
   DEPLOYLITE_INSTALL_LOG=<path>        Install log file (default: /var/log/deploylite/install.log).
   DEPLOYLITE_INSTALL_LOG_DIR=<path>    Install log directory (default: parent of DEPLOYLITE_INSTALL_LOG).
@@ -324,8 +325,43 @@ compose() { as_root docker compose -f "$COMPOSE_FILE" -f "$TLS_COMPOSE_FILE" --p
 compose_down_safe() { compose down --remove-orphans; }
 
 validate_compose() {
-  info "Validating base and Traefik Compose configuration without the runtime profile."
-  compose config --no-interpolate >/dev/null
+  info "Validating the secure bootstrap Compose profile."
+  compose --profile bootstrap config --no-interpolate >/dev/null
+}
+
+generate_secret() {
+  command_exists openssl || fail "openssl is required to generate internal runtime secrets." 2
+  openssl rand -base64 48 | tr -d '\n'
+}
+
+prepare_runtime_env() {
+  local tmp host database_password secret_key
+  if [[ -f "$RUNTIME_ENV_FILE" ]]; then
+    as_root chmod 600 "$RUNTIME_ENV_FILE"
+    info "Existing internal runtime secrets preserved."
+    return 0
+  fi
+  host="${DEPLOYLITE_PUBLIC_HOST:-deploylite.com}"
+  [[ "$host" =~ ^[A-Za-z0-9.-]+$ ]] || fail "DEPLOYLITE_PUBLIC_HOST must be a hostname." 2
+  database_password="$(generate_secret)"
+  secret_key="$(generate_secret)"
+  tmp="$(mktemp)"
+  umask 077
+  printf 'DEPLOYLITE_PUBLIC_HOST=%s\nPOSTGRES_PASSWORD=%s\nDEPLOYLITE_SECRET_KEY=%s\n' "$host" "$database_password" "$secret_key" >"$tmp"
+  as_root install -m 600 "$tmp" "$RUNTIME_ENV_FILE"
+  rm -f "$tmp"
+  record_change "internal-runtime-secrets-generated"
+  info "Generated internal runtime secrets with restricted permissions."
+}
+
+start_bootstrap() {
+  info "Starting the secure bootstrap control plane; waiting up to 120 seconds for health checks."
+  compose --profile bootstrap up -d --wait --wait-timeout 120
+  CREATED_RUNTIME=1
+  info "Waiting up to 120 seconds for the ACME-provisioned HTTPS first-owner page."
+  curl --fail --silent --show-error --connect-timeout 10 --max-time 120 "https://${DEPLOYLITE_PUBLIC_HOST:-deploylite.com}/" >/dev/null \
+    || fail "HTTPS bootstrap page did not become reachable. Verify DNS for ${DEPLOYLITE_PUBLIC_HOST:-deploylite.com} and retry." 1
+  info "Bootstrap control plane is running behind HTTPS. Create the first owner at https://${DEPLOYLITE_PUBLIC_HOST:-deploylite.com}."
 }
 
 main() {
@@ -344,8 +380,10 @@ main() {
   preflight
   install_docker
   prepare_install_dir
+  prepare_runtime_env
   validate_compose
-  info "Prerequisites and Compose templates are ready. Web-owned runtime configuration is required before enabling the runtime profile."
+  start_bootstrap
+  info "First-owner setup and web configuration are available only through the HTTPS control plane. Runtime activation remains an explicit admin action."
 }
 
 if [[ "${DEPLOYLITE_INSTALL_TESTING:-0}" != "1" ]]; then

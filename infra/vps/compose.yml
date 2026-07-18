@@ -10,7 +10,7 @@ services:
     networks:
       - deploylite
   postgres:
-    profiles: [runtime]
+    profiles: [bootstrap, runtime]
     image: postgres:16-alpine
     restart: unless-stopped
     environment:
@@ -28,7 +28,7 @@ services:
       retries: 20
 
   migrate:
-    profiles: [runtime]
+    profiles: [bootstrap, runtime]
     build:
       context: ../..
       dockerfile: apps/api/Dockerfile
@@ -44,7 +44,7 @@ services:
       - deploylite
 
   api:
-    profiles: [runtime]
+    profiles: [bootstrap, runtime]
     build:
       context: ../..
       dockerfile: apps/api/Dockerfile
@@ -66,6 +66,7 @@ services:
       DEPLOYLITE_SESSION_COOKIE_NAME: ${DEPLOYLITE_SESSION_COOKIE_NAME:-deploylite_session}
       DEPLOYLITE_SESSION_COOKIE_SECURE: "true"
       DEPLOYLITE_BCRYPT_COST: ${DEPLOYLITE_BCRYPT_COST:-12}
+      DEPLOYLITE_SECRET_KEY: ${DEPLOYLITE_SECRET_KEY:?DEPLOYLITE_SECRET_KEY is required}
     networks:
       - deploylite
     healthcheck:
@@ -75,7 +76,7 @@ services:
       retries: 12
 
   web:
-    profiles: [runtime]
+    profiles: [bootstrap, runtime]
     build:
       context: ../..
       dockerfile: apps/web/Dockerfile

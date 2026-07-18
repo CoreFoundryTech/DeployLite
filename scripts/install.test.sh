@@ -169,7 +169,36 @@ test_validate_compose_omits_runtime_profile() {
   validate_compose >/dev/null
   assert_contains "$compose_calls" 'config' || return 1
   assert_contains "$compose_calls" '--no-interpolate' || return 1
-  assert_not_contains "$compose_calls" '--profile' || return 1
+  assert_contains "$compose_calls" '--profile bootstrap' || return 1
+}
+
+test_prepare_runtime_env_uses_restricted_file_without_secret_output() {
+  local tmp output mode contents
+  tmp="$(mktemp -d)"
+  INSTALL_DIR="$tmp/install"
+  RUNTIME_ENV_FILE="$INSTALL_DIR/.env"
+  mkdir -p "$INSTALL_DIR"
+  as_root() { "$@"; }
+  command_exists() { [[ "$1" == "openssl" ]]; }
+  openssl() { printf 'generated-secret\n'; }
+  output="$(prepare_runtime_env)"
+  mode="$(stat -f '%Lp' "$RUNTIME_ENV_FILE")"
+  contents="$(<"$RUNTIME_ENV_FILE")"
+  [[ "$mode" == "600" ]] || return 1
+  assert_contains "$contents" 'DEPLOYLITE_PUBLIC_HOST=deploylite.com' || return 1
+  assert_not_contains "$output" 'generated-secret' || return 1
+  rm -rf "$tmp"
+}
+
+test_start_bootstrap_is_bounded_and_never_activates_runtime() {
+  local compose_calls="" curl_calls=""
+  compose() { compose_calls="$*"; }
+  curl() { curl_calls="$*"; }
+  start_bootstrap >/dev/null
+  assert_contains "$compose_calls" '--profile bootstrap up -d --wait --wait-timeout 120' || return 1
+  assert_not_contains "$compose_calls" '--profile runtime' || return 1
+  assert_contains "$curl_calls" '--max-time 120' || return 1
+  assert_contains "$curl_calls" 'https://deploylite.com/' || return 1
 }
 
 run_test 'redaction masks secrets' test_redaction_masks_database_url_and_secret_assignments
@@ -183,7 +212,9 @@ run_test 'explicit noninteractive mode disables TUI' test_parse_args_supports_ex
 run_test 'prompt_value returns piped value in interactive no-tty mode' test_prompt_value_returns_piped_value_in_interactive_no_tty_mode
 run_test 'prompt_value returns default when piped empty in interactive no-tty mode' test_prompt_value_returns_default_when_piped_empty_in_interactive_no_tty_mode
 run_test 'redact_stream removes postgres passwords and key=value secrets' test_redact_stream_removes_postgres_passwords_and_key_value_secrets
-run_test 'validates Compose without the runtime profile' test_validate_compose_omits_runtime_profile
+run_test 'validates the bootstrap Compose profile' test_validate_compose_omits_runtime_profile
+run_test 'generates silent restricted internal runtime secrets' test_prepare_runtime_env_uses_restricted_file_without_secret_output
+run_test 'starts only the bounded bootstrap control plane' test_start_bootstrap_is_bounded_and_never_activates_runtime
 
 printf '\n%d passed, %d failed\n' "$PASS" "$FAIL"
 [[ "$FAIL" -eq 0 ]]
