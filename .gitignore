@@ -22,3 +22,6 @@ coverage/
 # Local/private planning documents
 PRD - DeployLite.pdf
 *.rtf
+
+# Local-only advisory evidence
+/artifacts/advisory/

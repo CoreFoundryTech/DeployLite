@@ -10,7 +10,9 @@
     "typecheck": "pnpm -r --if-present typecheck",
     "test": "pnpm -r --if-present test",
     "lint": "pnpm -r --if-present lint",
-    "check": "pnpm build && pnpm lint && pnpm typecheck && pnpm test"
+    "check": "pnpm build && pnpm lint && pnpm typecheck && pnpm test",
+    "ci:local:evidence": "node scripts/ci/local-ci-evidence-bridge.mjs",
+    "ci:local:evidence:test": "node --test scripts/ci/local-evidence/*.test.mjs"
   },
   "devDependencies": {
     "@types/react": "^19.0.2",
