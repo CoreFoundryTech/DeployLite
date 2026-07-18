@@ -21,29 +21,39 @@ export function renderAdvisoryComment({ binding, evidenceHash, aggregateOutcome 
 }
 
 export function createGitHubClient({ run = defaultRun } = {}) {
+  const activeRepository = async () => {
+    const repo = parse(await run(["repo", "view", "--json", "nameWithOwner,url"]));
+    if (!repositoryPattern.test(repo.nameWithOwner)) fail("current repository is unreadable");
+    let githubHost;
+    try { githubHost = new URL(repo.url).hostname; } catch { fail("current repository is unreadable"); }
+    if (!githubHost) fail("current repository is unreadable");
+    return Object.freeze({ repository: repo.nameWithOwner, githubHost });
+  };
   const account = async (host) => {
     const login = (await run(["api", "--hostname", host, "user", "--jq", ".login"])).trim();
     if (!login) fail("authenticated GitHub identity is unavailable");
     return login;
   };
   const pull = async (binding) => {
-    const value = parse(await run(["pr", "view", String(binding.prNumber), "--repo", binding.repository, "--json", "headRefOid,baseRefOid"]));
+    const value = parse(await run(["pr", "view", String(binding.prNumber), "--repo", binding.repository, "--json", "number,headRefOid,baseRefOid"]));
+    if (!Number.isInteger(value.number) || value.number !== binding.prNumber) fail("remote PR identity changed or is unreadable");
     if (!SHA.test(value.headRefOid) || value.headRefOid !== binding.headSha) fail("remote PR head SHA changed or is unreadable");
     return value;
   };
   return Object.freeze({
     async discover(prNumber) {
       if (!Number.isInteger(prNumber) || prNumber < 1) fail("PR number must be a positive integer");
-      const repo = parse(await run(["repo", "view", "--json", "nameWithOwner,url"]));
-      if (!repositoryPattern.test(repo.nameWithOwner)) fail("current repository is unreadable");
-      const host = new URL(repo.url).hostname;
-      const authenticatedLogin = await account(host);
-      const pr = parse(await run(["pr", "view", String(prNumber), "--repo", repo.nameWithOwner, "--json", "headRefOid,baseRefOid"]));
-      return assertBinding({ githubHost: host, authenticatedLogin, repository: repo.nameWithOwner, prNumber, headSha: pr.headRefOid, baseSha: pr.baseRefOid });
+      const active = await activeRepository();
+      const authenticatedLogin = await account(active.githubHost);
+      const pr = parse(await run(["pr", "view", String(prNumber), "--repo", active.repository, "--json", "number,headRefOid,baseRefOid"]));
+      if (!Number.isInteger(pr.number) || pr.number !== prNumber) fail("remote PR identity changed or is unreadable");
+      return assertBinding({ githubHost: active.githubHost, authenticatedLogin, repository: active.repository, prNumber, headSha: pr.headRefOid, baseSha: pr.baseRefOid });
     },
     async revalidate(binding) {
       binding = assertBinding(binding);
       if (await account(binding.githubHost) !== binding.authenticatedLogin) fail("authenticated GitHub identity drifted");
+      const active = await activeRepository();
+      if (active.repository !== binding.repository || active.githubHost !== binding.githubHost) fail("active repository drifted");
       await pull(binding);
     },
     async createEvidence({ binding, checks, generatedAt = new Date().toISOString(), knownValues = [] }) {
@@ -57,6 +67,7 @@ export function createGitHubClient({ run = defaultRun } = {}) {
       const comments = parse(await run(["api", "--paginate", endpoint(binding, "/comments")]));
       const existing = comments.find((comment) => comment.user?.login === binding.authenticatedLogin && comment.body?.includes(markerFor(binding)));
       if (!post) return { action: existing ? "would-update" : "would-create" };
+      await this.revalidate(binding);
       if (existing) {
         await run(["api", "--method", "PATCH", `repos/${binding.repository}/issues/comments/${existing.id}`, "-f", `body=${body}`]);
         return { action: "update", commentId: existing.id };

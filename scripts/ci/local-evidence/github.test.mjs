@@ -5,15 +5,15 @@ import { createGitHubClient, markerFor, renderAdvisoryComment } from "./github.m
 const sha = "a".repeat(40);
 const binding = Object.freeze({ githubHost: "github.com", authenticatedLogin: "maintainer", repository: "CoreFoundryTech/DeployLite", prNumber: 92, headSha: sha, baseSha: "b".repeat(40) });
 
-function fakeGh({ login = "maintainer", headSha = sha, comments = [] } = {}) {
+function fakeGh({ login = "maintainer", repository = binding.repository, headSha = sha, comments = [] } = {}) {
   const calls = [];
   return {
     calls,
     async run(args) {
       calls.push(args);
-      if (args[0] === "repo") return JSON.stringify({ nameWithOwner: binding.repository, url: "https://github.com/CoreFoundryTech/DeployLite" });
+      if (args[0] === "repo") return JSON.stringify({ nameWithOwner: repository, url: `https://github.com/${repository}` });
       if (args[0] === "api" && args.includes("user")) return login;
-      if (args[0] === "pr") return JSON.stringify({ headRefOid: headSha, baseRefOid: binding.baseSha });
+      if (args[0] === "pr") return JSON.stringify({ number: binding.prNumber, headRefOid: headSha, baseRefOid: binding.baseSha });
       if (args.some((part) => part.includes("comments"))) return JSON.stringify(comments);
       return "";
     }
@@ -28,6 +28,12 @@ test("RED contract blocks identity drift and stale heads before a write", async 
   const stale = fakeGh({ headSha: "c".repeat(40) });
   await assert.rejects(() => createGitHubClient(stale).revalidate(binding), /head SHA/i);
   assert.equal(stale.calls.some((args) => args.includes("--method")), false);
+});
+
+test("RED contract blocks active repository drift before a write", async () => {
+  const repositoryDrift = fakeGh({ repository: "CoreFoundryTech/other-repository" });
+  await assert.rejects(() => createGitHubClient(repositoryDrift).revalidate(binding), /repository/i);
+  assert.equal(repositoryDrift.calls.some((args) => args.includes("--method")), false);
 });
 
 test("RED contract paginates comments and updates exactly one matching marker", async () => {
