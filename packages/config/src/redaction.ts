@@ -1,5 +1,6 @@
 const SECRET_KEY_PATTERN = /(token|secret|password|passwd|api[_-]?key|authorization|cookie|credential)/i;
 const SECRET_VALUE_PATTERN = /\b((?:sk|pk|ghp|glpat|dop|dl)_[A-Za-z0-9_\-]{8,}|[A-Za-z0-9+/]{32,}={0,2})\b/g;
+const URL_USERINFO_PATTERN = /\b([a-z][a-z0-9+.-]*:\/\/)[^/?#\s]*@/gi;
 const SAFE_VALUE_KEY_PATTERN = /(fingerprint|checksum|hash|etag|digest|signature|hex|digest|sha\d*|md\d*)$/i;
 const SAFE_HEX_VALUE_PATTERN = /^[0-9a-f]+$/i;
 const SAFE_UUID_VALUE_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
@@ -14,7 +15,7 @@ function isKnownSafeValue(key: string, value: string): boolean {
 
 export function redactSecrets<T>(value: T): T {
   if (typeof value === "string") {
-    return value.replace(SECRET_VALUE_PATTERN, REDACTED) as T;
+    return value.replace(URL_USERINFO_PATTERN, `$1${REDACTED}@`).replace(SECRET_VALUE_PATTERN, REDACTED) as T;
   }
 
   if (Array.isArray(value)) {
