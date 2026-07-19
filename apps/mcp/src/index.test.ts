@@ -280,12 +280,12 @@ describe("DeployLite MCP project and audit visibility", () => {
     expect(result.structuredContent).toMatchObject({ latestDeployment: { id: "dep_tie_z", status: "running" }, readiness: { status: "attention", reason: "latest_deployment_running" } });
   });
 
-  it("uses the legacy lexical ordering for the entire collection when any timestamp is malformed", async () => {
+  it("skips a lexically greatest malformed timestamp so both MCP outputs remain schema-valid and deterministic", async () => {
     const configuredProject = { ...projectA, buildCommand: "pnpm build", runCommand: "pnpm start", port: 3000, imageTag: "alpha:latest" };
     const deployments = [
       { id: "dep_lexical", projectId: "project_a", agentId: "agent_a", status: "failed", commitSha: "abcdef1", startedAt: "2026-01-03T00:00:00.000Z", finishedAt: "2026-01-03T00:01:00.000Z" },
       { id: "dep_instant", projectId: "project_a", agentId: "agent_a", status: "succeeded", commitSha: "abcdef2", startedAt: "2026-01-02T23:30:00.000-01:00", finishedAt: "2026-01-03T00:31:00.000Z" },
-      { id: "dep_malformed", projectId: "project_a", agentId: "agent_a", status: "queued", commitSha: "abcdef3", startedAt: "!malformed", finishedAt: null }
+      { id: "dep_malformed", projectId: "project_a", agentId: "agent_a", status: "queued", commitSha: "abcdef3", startedAt: "zzzz-malformed", finishedAt: null }
     ] as unknown as Deployment[];
     const before = structuredClone(deployments);
     const { tools } = contextToolsFor([{ permission: "project.read", scope: "platform" }], [configuredProject], deployments);
@@ -293,9 +293,27 @@ describe("DeployLite MCP project and audit visibility", () => {
     const first = await tools.deploylite_get_project_context({ projectId: "project_a" });
     const second = await tools.deploylite_get_project_context({ projectId: "project_a" });
 
-    expect(first.structuredContent).toMatchObject({ latestDeployment: { id: "dep_lexical", status: "failed" }, readiness: { status: "attention", reason: "latest_deployment_failed" } });
+    expect(first.structuredContent).toMatchObject({ latestDeployment: { id: "dep_instant", status: "succeeded", startedAt: "2026-01-02T23:30:00.000-01:00" }, readiness: { status: "ready", reason: "latest_deployment_succeeded" } });
+    expect(first.content[0]?.text).toBe(JSON.stringify(first.structuredContent));
+    expect(first.content[0]?.text).not.toContain("zzzz-malformed");
     expect(first).toEqual(second);
     expect(deployments).toEqual(before);
+  });
+
+  it("returns deterministic no-deployment readiness when every candidate timestamp is malformed", async () => {
+    const configuredProject = { ...projectA, buildCommand: "pnpm build", runCommand: "pnpm start", port: 3000, imageTag: "alpha:latest" };
+    const deployments = [
+      { id: "dep_malformed_z", projectId: "project_a", agentId: "agent_a", status: "queued", commitSha: "abcdef1", startedAt: "zzzz-malformed", finishedAt: null },
+      { id: "dep_malformed_a", projectId: "project_a", agentId: "agent_a", status: "failed", commitSha: "abcdef2", startedAt: "aaaa-malformed", finishedAt: null }
+    ] as unknown as Deployment[];
+    const { tools } = contextToolsFor([{ permission: "project.read", scope: "platform" }], [configuredProject], deployments);
+
+    const first = await tools.deploylite_get_project_context({ projectId: "project_a" });
+    const second = await tools.deploylite_get_project_context({ projectId: "project_a" });
+
+    expect(first.structuredContent).toMatchObject({ latestDeployment: null, readiness: { status: "not_configured", reason: "no_deployment" } });
+    expect(first.content[0]?.text).toBe(JSON.stringify(first.structuredContent));
+    expect(first).toEqual(second);
   });
 
   it("uses an allow-list plus redaction for byte-stable dual output without mutating source fixtures", async () => {
