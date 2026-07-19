@@ -353,10 +353,21 @@ function safeDeployment(deployment: Deployment): z.infer<typeof safeDeploymentSc
   };
 }
 
+function compareDeploymentsLexically(left: Deployment, right: Deployment): number {
+  return right.startedAt.localeCompare(left.startedAt) || right.id.localeCompare(left.id);
+}
+
 function latestProjectDeployment(deployments: readonly Deployment[], projectId: string): Deployment | null {
-  return deployments
-    .filter((deployment) => deployment.projectId === projectId)
-    .sort((left, right) => right.startedAt.localeCompare(left.startedAt) || right.id.localeCompare(left.id))[0] ?? null;
+  const candidates = deployments.filter((deployment) => deployment.projectId === projectId);
+  const candidatesByInstant = candidates.map((deployment) => ({ deployment, epochMs: Date.parse(deployment.startedAt) }));
+
+  if (candidatesByInstant.some(({ epochMs }) => !Number.isFinite(epochMs))) {
+    return candidates.sort(compareDeploymentsLexically)[0] ?? null;
+  }
+
+  return candidatesByInstant
+    .sort((left, right) => right.epochMs - left.epochMs || right.deployment.id.localeCompare(left.deployment.id))[0]
+    ?.deployment ?? null;
 }
 
 function projectReadiness(project: Project, deployment: Deployment | null): z.infer<typeof projectContextOutputSchema.shape.readiness> {

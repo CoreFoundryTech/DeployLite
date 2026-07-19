@@ -250,6 +250,54 @@ describe("DeployLite MCP project and audit visibility", () => {
     }
   });
 
+  it("orders valid offset timestamps by their actual instant without mutating source deployments", async () => {
+    const configuredProject = { ...projectA, buildCommand: "pnpm build", runCommand: "pnpm start", port: 3000, imageTag: "alpha:latest" };
+    const deployments: Deployment[] = [
+      { id: "dep_earlier", projectId: "project_a", agentId: "agent_a", status: "failed", commitSha: "abcdef1", startedAt: "2026-01-03T00:00:00.000Z", finishedAt: "2026-01-03T00:01:00.000Z" },
+      { id: "dep_later", projectId: "project_a", agentId: "agent_a", status: "succeeded", commitSha: "abcdef2", startedAt: "2026-01-02T23:30:00.000-01:00", finishedAt: "2026-01-03T00:31:00.000Z" }
+    ];
+    const before = structuredClone(deployments);
+    const { tools } = contextToolsFor([{ permission: "project.read", scope: "platform" }], [configuredProject], deployments);
+
+    const first = await tools.deploylite_get_project_context({ projectId: "project_a" });
+    const second = await tools.deploylite_get_project_context({ projectId: "project_a" });
+
+    expect(first.structuredContent).toMatchObject({ latestDeployment: { id: "dep_later", status: "succeeded" }, readiness: { status: "ready", reason: "latest_deployment_succeeded" } });
+    expect(first).toEqual(second);
+    expect(deployments).toEqual(before);
+  });
+
+  it("uses descending IDs when different offsets resolve to the same instant", async () => {
+    const configuredProject = { ...projectA, buildCommand: "pnpm build", runCommand: "pnpm start", port: 3000, imageTag: "alpha:latest" };
+    const deployments: Deployment[] = [
+      { id: "dep_tie_a", projectId: "project_a", agentId: "agent_a", status: "queued", commitSha: "abcdef1", startedAt: "2026-01-03T01:00:00.000Z", finishedAt: null },
+      { id: "dep_tie_z", projectId: "project_a", agentId: "agent_a", status: "running", commitSha: "abcdef2", startedAt: "2026-01-03T00:00:00.000-01:00", finishedAt: null }
+    ];
+    const { tools } = contextToolsFor([{ permission: "project.read", scope: "platform" }], [configuredProject], deployments);
+
+    const result = await tools.deploylite_get_project_context({ projectId: "project_a" });
+
+    expect(result.structuredContent).toMatchObject({ latestDeployment: { id: "dep_tie_z", status: "running" }, readiness: { status: "attention", reason: "latest_deployment_running" } });
+  });
+
+  it("uses the legacy lexical ordering for the entire collection when any timestamp is malformed", async () => {
+    const configuredProject = { ...projectA, buildCommand: "pnpm build", runCommand: "pnpm start", port: 3000, imageTag: "alpha:latest" };
+    const deployments = [
+      { id: "dep_lexical", projectId: "project_a", agentId: "agent_a", status: "failed", commitSha: "abcdef1", startedAt: "2026-01-03T00:00:00.000Z", finishedAt: "2026-01-03T00:01:00.000Z" },
+      { id: "dep_instant", projectId: "project_a", agentId: "agent_a", status: "succeeded", commitSha: "abcdef2", startedAt: "2026-01-02T23:30:00.000-01:00", finishedAt: "2026-01-03T00:31:00.000Z" },
+      { id: "dep_malformed", projectId: "project_a", agentId: "agent_a", status: "queued", commitSha: "abcdef3", startedAt: "!malformed", finishedAt: null }
+    ] as unknown as Deployment[];
+    const before = structuredClone(deployments);
+    const { tools } = contextToolsFor([{ permission: "project.read", scope: "platform" }], [configuredProject], deployments);
+
+    const first = await tools.deploylite_get_project_context({ projectId: "project_a" });
+    const second = await tools.deploylite_get_project_context({ projectId: "project_a" });
+
+    expect(first.structuredContent).toMatchObject({ latestDeployment: { id: "dep_lexical", status: "failed" }, readiness: { status: "attention", reason: "latest_deployment_failed" } });
+    expect(first).toEqual(second);
+    expect(deployments).toEqual(before);
+  });
+
   it("uses an allow-list plus redaction for byte-stable dual output without mutating source fixtures", async () => {
     const sourceProject = { ...projectA, buildCommand: "printenv SECRET", runCommand: "node --token=secret", imageTag: "https://image-user:image-password@example.test/image" };
     const sourceDeployments: Array<Deployment & { credential: string }> = [{ id: "dep_a", projectId: "project_a", agentId: "agent_a", status: "succeeded", commitSha: "abcdef1", startedAt: "2026-01-02T00:00:00.000Z", finishedAt: "2026-01-02T00:01:00.000Z", credential: "do-not-leak" }];
