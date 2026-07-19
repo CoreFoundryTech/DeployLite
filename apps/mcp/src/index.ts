@@ -484,10 +484,10 @@ export function createMockDeployLiteApiClient(requestId = SCAFFOLD_REQUEST_ID): 
     {
       id: "project_mock_1",
       name: "Mock Project",
-      repoUrl: "https://credential@example.test/mock-project.git",
+      repoUrl: "https://fixture-repo-user:fixture-repo-pass@fixture-repo-more@example.test/mock-project.git",
       defaultBranch: "main",
-      buildCommand: "pnpm build --token=mock-secret",
-      runCommand: "pnpm start --password=mock-secret",
+      buildCommand: "pnpm build --token=fixture-command-token",
+      runCommand: "pnpm start --password=fixture-command-password",
       port: 3000,
       description: "Deterministic mock project.",
       imageTag: "mock:latest"
@@ -504,7 +504,7 @@ export function createMockDeployLiteApiClient(requestId = SCAFFOLD_REQUEST_ID): 
       requestId: context.requestId,
       correlationId: context.correlationId,
       timestamp: "2026-01-01T00:00:02.000Z",
-      metadata: { token: "mock-secret", unknown: "not-for-mcp" }
+      metadata: { token: "fixture_audit_token", unknown: "fixture-audit-metadata" }
     }
   ];
   const logs: LogEvent[] = [
@@ -523,7 +523,7 @@ export function createMockDeployLiteApiClient(requestId = SCAFFOLD_REQUEST_ID): 
       deploymentId: "dep_mock_1",
       sequence: 2,
       level: "info",
-      message: "Using token dl_1234567890abcdef for mock fixture",
+      message: "Using token dl_fixture_mcp_token_12345678 for mock fixture",
       timestamp: "2026-01-01T00:00:01.000Z",
       redactionApplied: true,
       ...context

@@ -1,4 +1,5 @@
 import { describe, expect, it, vi } from "vitest";
+import { readFile } from "node:fs/promises";
 import type { Deployment, Project } from "@deploylite/contracts";
 import {
   createDeployLiteMcpTools,
@@ -39,8 +40,20 @@ describe("DeployLite MCP read-only scaffold", () => {
     });
   });
 
+  it("uses explicit non-secret markers in MCP mock fixtures", async () => {
+    const source = await readFile(new URL("./index.ts", import.meta.url), "utf8");
+
+    for (const legacyLiteral of ["credential@example.test", "--token=mock-secret", "--password=mock-secret", 'token: "mock-secret"', "dl_1234567890abcdef"]) {
+      expect(source).not.toContain(legacyLiteral);
+    }
+    for (const fixtureMarker of ["fixture-repo-user", "fixture-command-token", "fixture-command-password", "fixture_audit_token", "dl_fixture_mcp_token_12345678"]) {
+      expect(source).toContain(fixtureMarker);
+    }
+  });
+
   it("redacts secret-like deployment log output and keeps reconnect shape", async () => {
     const result = await deployLiteMcpTools.deploylite_get_deployment_logs({ deploymentId: "dep_mock_1", afterSequence: 1 });
+    const logContent = result.structuredContent as { events: Array<{ message: string }> };
     const serialized = JSON.stringify(result);
 
     expect(result.structuredContent).toMatchObject({
@@ -50,7 +63,9 @@ describe("DeployLite MCP read-only scaffold", () => {
       safety: { readOnly: true, destructive: false, redacted: true }
     });
     expect(serialized).toContain("[REDACTED]");
-    expect(serialized).not.toContain("dl_1234567890abcdef");
+    expect(logContent.events[0]?.message).toBe("Using token [REDACTED] for mock fixture");
+    expect(result.content[0]?.text).toContain("[REDACTED]");
+    expect(serialized).not.toContain("dl_fixture_mcp_token_12345678");
   });
 
   it("uses API-shaped deployment filters without mutating data", async () => {
@@ -75,19 +90,19 @@ describe("DeployLite MCP read-only scaffold", () => {
 describe("DeployLite MCP project and audit visibility", () => {
   const projectA = {
     id: "project_a",
-    name: "Álpha https://name-user:name@password@example.test/name",
-    repoUrl: "https://repo-user:repo-password@example.test/alpha.git",
-    defaultBranch: "https://branch-user:branch@password@example.test/main",
-    buildCommand: "printenv SECRET",
-    runCommand: "node server.js --token=secret",
+    name: "Álpha https://fixture-name-user:fixture-name-pass@fixture-name-more@example.test/name",
+    repoUrl: "https://fixture-repo-user:fixture-repo-pass@fixture-repo-more@example.test/alpha.git",
+    defaultBranch: "https://fixture-branch-user:fixture-branch-pass@fixture-branch-more@example.test/main",
+    buildCommand: "printenv FIXTURE_COMMAND_SECRET",
+    runCommand: "node server.js --token=fixture-command-token",
     port: 3000,
-    description: "https://description-user:description@password@example.test/description",
-    imageTag: "https://image-user:image@password@example.test/image",
-    unknown: "must-not-leak"
+    description: "https://fixture-description-user:fixture-description-pass@fixture-description-more@example.test/description",
+    imageTag: "https://fixture-image-user:fixture-image-pass@fixture-image-more@example.test/image",
+    unknown: "fixture-project-unknown"
   };
   const projectB = { ...projectA, id: "project_b", name: "beta", repoUrl: "https://example.test/beta.git" };
   const auditEvents = [
-    { id: "audit_b", actorId: "actor_1", action: "project.updated", projectId: "project_a", targetType: "project", targetId: "project_a", requestId: "raw_request", correlationId: "raw_correlation", timestamp: "2026-01-02T00:00:00.000Z", metadata: { password: "do-not-leak", unknown: "must-not-leak" } },
+    { id: "audit_b", actorId: "actor_1", action: "project.updated", projectId: "project_a", targetType: "project", targetId: "project_a", requestId: "raw_request", correlationId: "raw_correlation", timestamp: "2026-01-02T00:00:00.000Z", metadata: { password: "fixture-audit-password", unknown: "fixture-audit-metadata" } },
     { id: "audit_a", actorId: "actor_1", action: "project.updated", projectId: "project_a", targetType: "project", targetId: "project_a", requestId: "raw_request", correlationId: "raw_correlation", timestamp: "2026-01-02T00:00:00.000Z" },
     { id: "audit_other", actorId: "actor_2", action: "project.deleted", projectId: "project_b", targetType: "project", targetId: "project_b", requestId: "raw_request", correlationId: "raw_correlation", timestamp: "2026-01-01T00:00:00.000Z" }
   ];
@@ -139,7 +154,7 @@ describe("DeployLite MCP project and audit visibility", () => {
     expect(auditContent.events.map((event) => event.id)).toEqual(["audit_a"]);
     expect(auditContent).toMatchObject({ requestId: "mcp_mock_request_1", correlationId: "mcp_mock_request_1", total: 2, offset: 0, limit: 1 });
     const serialized = JSON.stringify([projects.structuredContent, projects.content, audits.structuredContent, audits.content]);
-    for (const value of ["credential", "printenv", "node server", "must-not-leak", "do-not-leak", "metadata", "repoUrl", "buildCommand", "runCommand"]) {
+    for (const value of ["fixture-repo-user", "fixture-repo-pass", "FIXTURE_COMMAND_SECRET", "fixture-command-token", "fixture-project-unknown", "fixture-audit-password", "fixture-audit-metadata", "metadata", "repoUrl", "buildCommand", "runCommand"]) {
       expect(serialized).not.toContain(value);
     }
   });
@@ -149,6 +164,7 @@ describe("DeployLite MCP project and audit visibility", () => {
 
     const result = await tools.deploylite_list_projects({});
     const project = (result.structuredContent as { projects: Array<Record<string, unknown>> }).projects.find(({ id }) => id === "project_a");
+    const text = result.content[0]?.text;
     const serialized = JSON.stringify([result.structuredContent, result.content]);
 
     expect(project).toMatchObject({
@@ -157,8 +173,12 @@ describe("DeployLite MCP project and audit visibility", () => {
       description: "https://[REDACTED]@example.test/description",
       imageTag: "https://[REDACTED]@example.test/image"
     });
-    for (const value of ["name-user", "name-password", "branch-user", "branch-password", "description-user", "description-password", "image-user", "image-password", "repo-user", "repo-password"]) {
+    for (const destination of ["https://[REDACTED]@example.test/name", "https://[REDACTED]@example.test/main", "https://[REDACTED]@example.test/description", "https://[REDACTED]@example.test/image"]) {
+      expect(text).toContain(destination);
+    }
+    for (const value of ["fixture-name-user", "fixture-name-pass", "fixture-name-more", "fixture-branch-user", "fixture-branch-pass", "fixture-branch-more", "fixture-description-user", "fixture-description-pass", "fixture-description-more", "fixture-image-user", "fixture-image-pass", "fixture-image-more", "fixture-repo-user", "fixture-repo-pass", "fixture-repo-more"]) {
       expect(serialized).not.toContain(value);
+      expect(text).not.toContain(value);
     }
   });
 
