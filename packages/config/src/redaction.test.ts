@@ -31,9 +31,17 @@ describe("redaction helpers", () => {
     );
   });
 
+  it("redacts all multi-at URL userinfo while preserving the authority destination", () => {
+    const value = "Pull https://deploy:super@secret@example.test:8443/path?ref=main and ssh://git@service@example.test/repo.git";
+
+    expect(redactSecrets(value)).toBe(
+      "Pull https://[REDACTED]@example.test:8443/path?ref=main and ssh://[REDACTED]@example.test/repo.git"
+    );
+  });
+
   it("preserves non-URL text containing an at sign", () => {
-    expect(redactSecrets("Contact deploy@example.test; this is not a URL.")).toBe(
-      "Contact deploy@example.test; this is not a URL."
+    expect(redactSecrets("Contact deploy@example.test and deploy@support@example.test; this is not a URL.")).toBe(
+      "Contact deploy@example.test and deploy@support@example.test; this is not a URL."
     );
   });
 

@@ -72,14 +72,14 @@ describe("DeployLite MCP read-only scaffold", () => {
 describe("DeployLite MCP project and audit visibility", () => {
   const projectA = {
     id: "project_a",
-    name: "Álpha https://name-user:name-password@example.test/name",
+    name: "Álpha https://name-user:name@password@example.test/name",
     repoUrl: "https://repo-user:repo-password@example.test/alpha.git",
-    defaultBranch: "https://branch-user:branch-password@example.test/main",
+    defaultBranch: "https://branch-user:branch@password@example.test/main",
     buildCommand: "printenv SECRET",
     runCommand: "node server.js --token=secret",
     port: 3000,
-    description: "https://description-user:description-password@example.test/description",
-    imageTag: "https://image-user:image-password@example.test/image",
+    description: "https://description-user:description@password@example.test/description",
+    imageTag: "https://image-user:image@password@example.test/image",
     unknown: "must-not-leak"
   };
   const projectB = { ...projectA, id: "project_b", name: "beta", repoUrl: "https://example.test/beta.git" };
