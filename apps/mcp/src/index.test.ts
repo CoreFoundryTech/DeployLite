@@ -70,7 +70,18 @@ describe("DeployLite MCP read-only scaffold", () => {
 });
 
 describe("DeployLite MCP project and audit visibility", () => {
-  const projectA = { id: "project_a", name: "Álpha", repoUrl: "https://user:credential@example.test/alpha.git", defaultBranch: "main", buildCommand: "printenv SECRET", runCommand: "node server.js --token=secret", port: 3000, description: "safe description", imageTag: "alpha:latest", unknown: "must-not-leak" };
+  const projectA = {
+    id: "project_a",
+    name: "Álpha https://name-user:name-password@example.test/name",
+    repoUrl: "https://repo-user:repo-password@example.test/alpha.git",
+    defaultBranch: "https://branch-user:branch-password@example.test/main",
+    buildCommand: "printenv SECRET",
+    runCommand: "node server.js --token=secret",
+    port: 3000,
+    description: "https://description-user:description-password@example.test/description",
+    imageTag: "https://image-user:image-password@example.test/image",
+    unknown: "must-not-leak"
+  };
   const projectB = { ...projectA, id: "project_b", name: "beta", repoUrl: "https://example.test/beta.git" };
   const auditEvents = [
     { id: "audit_b", actorId: "actor_1", action: "project.updated", projectId: "project_a", targetType: "project", targetId: "project_a", requestId: "raw_request", correlationId: "raw_correlation", timestamp: "2026-01-02T00:00:00.000Z", metadata: { password: "do-not-leak", unknown: "must-not-leak" } },
@@ -126,6 +137,24 @@ describe("DeployLite MCP project and audit visibility", () => {
     expect(auditContent).toMatchObject({ requestId: "mcp_mock_request_1", correlationId: "mcp_mock_request_1", total: 2, offset: 0, limit: 1 });
     const serialized = JSON.stringify([projects.structuredContent, projects.content, audits.structuredContent, audits.content]);
     for (const value of ["credential", "printenv", "node server", "must-not-leak", "do-not-leak", "metadata", "repoUrl", "buildCommand", "runCommand"]) {
+      expect(serialized).not.toContain(value);
+    }
+  });
+
+  it("redacts URL userinfo from every retained free-form project field in both MCP representations", async () => {
+    const { tools } = toolsFor([{ permission: "project.read", scope: "platform" }]);
+
+    const result = await tools.deploylite_list_projects({});
+    const project = (result.structuredContent as { projects: Array<Record<string, unknown>> }).projects.find(({ id }) => id === "project_a");
+    const serialized = JSON.stringify([result.structuredContent, result.content]);
+
+    expect(project).toMatchObject({
+      name: "Álpha https://[REDACTED]@example.test/name",
+      defaultBranch: "https://[REDACTED]@example.test/main",
+      description: "https://[REDACTED]@example.test/description",
+      imageTag: "https://[REDACTED]@example.test/image"
+    });
+    for (const value of ["name-user", "name-password", "branch-user", "branch-password", "description-user", "description-password", "image-user", "image-password", "repo-user", "repo-password"]) {
       expect(serialized).not.toContain(value);
     }
   });
