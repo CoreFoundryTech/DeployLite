@@ -46,11 +46,15 @@ describe("project launch hub helpers", () => {
       detail: "Set a run command and port before triggering useful deploys."
     });
 
-    expect(summarizeProjectRuntime(createProject({ runCommand: "", port: 0 }))).toEqual({
+    const expectedInvalidRuntime = {
       configured: false,
       label: "Needs command",
       detail: "Set a run command and port before triggering useful deploys."
-    });
+    };
+
+    expect(summarizeProjectRuntime(createProject({ runCommand: "", port: 3000 }))).toEqual(expectedInvalidRuntime);
+    expect(summarizeProjectRuntime(createProject({ runCommand: "node server.js", port: 0 }))).toEqual(expectedInvalidRuntime);
+    expect(summarizeProjectRuntime(createProject({ port: 65536 }))).toEqual(expectedInvalidRuntime);
   });
 
   it("selects the latest target-project deployment by actual start time", () => {
@@ -84,6 +88,7 @@ describe("project launch hub helpers", () => {
   it("selects configure, deploy, and inspect-log actions with exact targets", () => {
     const project = createProject();
     const failedDeployment = createDeployment({ id: "deployment-failed", status: "failed" });
+    const canceledDeployment = createDeployment({ id: "deployment-canceled", status: "canceled" });
 
     expect(summarizeProjectNextAction(createProject({ runCommand: null }), failedDeployment)).toEqual({
       label: "Configure runtime",
@@ -100,23 +105,44 @@ describe("project launch hub helpers", () => {
       ctaKey: "inspect-latest-logs",
       href: "/deployments/deployment-failed"
     });
+    expect(summarizeProjectNextAction(project, canceledDeployment)).toEqual({
+      label: "Inspect latest logs",
+      ctaKey: "inspect-latest-logs",
+      href: "/deployments/deployment-canceled"
+    });
   });
 
-  it("composes the complete launch summary from independent helper contracts", () => {
+  it("composes the complete launch summary from independently constructed expected fields", () => {
     const project = createProject();
     const deployment = createDeployment({ id: "deployment-succeeded", status: "succeeded" });
     const deployments = [createDeployment({ id: "other", projectId: "project-other" }), deployment];
-
-    expect(summarizeProjectLaunch(project, deployments)).toEqual({
+    const expectedRuntime = {
+      configured: true,
+      label: "Configured",
+      detail: "node server.js → port 3000"
+    };
+    const expectedLatest = {
+      deployment,
+      statusLabel: "succeeded",
+      statusTone: "ready" as const
+    };
+    const expectedNextAction = {
+      label: "Inspect latest logs",
+      ctaKey: "inspect-latest-logs" as const,
+      href: "/deployments/deployment-succeeded"
+    };
+    const expectedSummary = {
       project,
-      runtime: summarizeProjectRuntime(project),
-      latest: summarizeProjectLatest(deployment),
-      nextAction: summarizeProjectNextAction(project, deployment),
+      runtime: expectedRuntime,
+      latest: expectedLatest,
+      nextAction: expectedNextAction,
       hasLatestDeployment: true,
       logsHref: "/deployments/deployment-succeeded",
       configureHref: "/projects/project-alpha#env-metadata",
       deployHref: "/projects/project-alpha#deploy-actions"
-    });
+    };
+
+    expect(summarizeProjectLaunch(project, deployments)).toEqual(expectedSummary);
   });
 
   it("is deterministic, preserves input values, and has no transport dependency", () => {
