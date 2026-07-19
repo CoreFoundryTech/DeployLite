@@ -354,9 +354,14 @@ function safeDeployment(deployment: Deployment): z.infer<typeof safeDeploymentSc
 }
 
 function latestProjectDeployment(deployments: readonly Deployment[], projectId: string): Deployment | null {
-  return deployments
+  const candidatesByInstant = deployments
     .filter((deployment) => deployment.projectId === projectId)
-    .sort((left, right) => right.startedAt.localeCompare(left.startedAt) || right.id.localeCompare(left.id))[0] ?? null;
+    .map((deployment) => ({ deployment, epochMs: Date.parse(deployment.startedAt) }))
+    .filter(({ deployment, epochMs }) => Number.isFinite(epochMs) && safeDeploymentSchema.safeParse(safeDeployment(deployment)).success);
+
+  return candidatesByInstant
+    .sort((left, right) => right.epochMs - left.epochMs || right.deployment.id.localeCompare(left.deployment.id))[0]
+    ?.deployment ?? null;
 }
 
 function projectReadiness(project: Project, deployment: Deployment | null): z.infer<typeof projectContextOutputSchema.shape.readiness> {
