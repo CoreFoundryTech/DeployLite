@@ -164,6 +164,7 @@ describe("DeployLite MCP project and audit visibility", () => {
 
     const result = await tools.deploylite_list_projects({});
     const project = (result.structuredContent as { projects: Array<Record<string, unknown>> }).projects.find(({ id }) => id === "project_a");
+    const text = result.content[0]?.text;
     const serialized = JSON.stringify([result.structuredContent, result.content]);
 
     expect(project).toMatchObject({
@@ -172,8 +173,12 @@ describe("DeployLite MCP project and audit visibility", () => {
       description: "https://[REDACTED]@example.test/description",
       imageTag: "https://[REDACTED]@example.test/image"
     });
+    for (const destination of ["https://[REDACTED]@example.test/name", "https://[REDACTED]@example.test/main", "https://[REDACTED]@example.test/description", "https://[REDACTED]@example.test/image"]) {
+      expect(text).toContain(destination);
+    }
     for (const value of ["fixture-name-user", "fixture-name-pass", "fixture-name-more", "fixture-branch-user", "fixture-branch-pass", "fixture-branch-more", "fixture-description-user", "fixture-description-pass", "fixture-description-more", "fixture-image-user", "fixture-image-pass", "fixture-image-more", "fixture-repo-user", "fixture-repo-pass", "fixture-repo-more"]) {
       expect(serialized).not.toContain(value);
+      expect(text).not.toContain(value);
     }
   });
 
