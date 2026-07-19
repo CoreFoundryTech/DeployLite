@@ -76,6 +76,7 @@ export type DeployLiteMcpTools = {
   deploylite_get_deployment_logs(input: unknown): Promise<ReturnType<typeof mcpToolResultSchema.parse>>;
   deploylite_list_projects(input: unknown): Promise<ReturnType<typeof mcpToolResultSchema.parse>>;
   deploylite_list_audit_events(input?: unknown): Promise<ReturnType<typeof mcpToolResultSchema.parse>>;
+  deploylite_get_project_context(input: unknown): Promise<ReturnType<typeof mcpToolResultSchema.parse>>;
 };
 
 const toolAnnotations: McpToolAnnotations = {
@@ -97,6 +98,10 @@ const listDeploymentsInputSchema = z.object({
 const nonBlankExactString = z.string().min(1).refine((value) => value.trim() === value, "Filters must not include surrounding whitespace.");
 
 const listProjectsInputSchema = z.object({}).strict();
+
+const projectContextInputSchema = z.object({
+  projectId: z.string().regex(/^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$/)
+}).strict();
 
 const listAuditEventsInputSchema = z.object({
   projectId: nonBlankExactString.optional(),
@@ -157,6 +162,25 @@ const safeAuditEventSchema = z.object({
   timestamp: z.string().datetime({ offset: true })
 });
 
+const safeDeploymentSchema = z.object({
+  id: z.string().min(1),
+  status: deploymentSchema.shape.status,
+  commitSha: z.string().regex(/^[a-f0-9]{7,40}$/),
+  startedAt: z.string().datetime({ offset: true }),
+  finishedAt: z.string().datetime({ offset: true }).nullable()
+});
+
+const projectContextOutputSchema = requestContextSchema.extend({
+  project: safeProjectSchema,
+  latestDeployment: safeDeploymentSchema.nullable(),
+  readiness: z.object({
+    status: z.enum(["ready", "attention", "not_configured"]),
+    reason: z.string().min(1),
+    mode: z.literal("mock-only"),
+    advisory: z.literal("non-executing; not production-health evidence")
+  })
+});
+
 const listProjectsOutputSchema = requestContextSchema.extend({
   projects: z.array(safeProjectSchema),
   safety: z.object({ readOnly: z.literal(true), destructive: z.literal(false), redacted: z.literal(true), mode: z.literal("mock-only") })
@@ -179,6 +203,8 @@ export type ListProjectsInput = z.infer<typeof listProjectsInputSchema>;
 export type ListAuditEventsInput = z.infer<typeof listAuditEventsInputSchema>;
 export type ListProjectsOutput = z.infer<typeof listProjectsOutputSchema>;
 export type ListAuditEventsOutput = z.infer<typeof listAuditEventsOutputSchema>;
+export type ProjectContextInput = z.infer<typeof projectContextInputSchema>;
+export type ProjectContextOutput = z.infer<typeof projectContextOutputSchema>;
 
 export const deployLiteMcpToolDefinitions = {
   getServerStatus: {
@@ -220,6 +246,14 @@ export const deployLiteMcpToolDefinitions = {
     inputSchema: listAuditEventsInputSchema,
     outputSchema: listAuditEventsOutputSchema,
     annotations: toolAnnotations
+  },
+  getProjectContext: {
+    name: "deploylite_get_project_context",
+    title: "Get DeployLite project context",
+    description: "Read-only, non-destructive mock-only project context with authorized safe fields and advisory readiness.",
+    inputSchema: projectContextInputSchema,
+    outputSchema: projectContextOutputSchema,
+    annotations: toolAnnotations
   }
 } satisfies Record<string, McpToolDefinition<z.ZodTypeAny, z.ZodTypeAny>>;
 
@@ -242,6 +276,15 @@ export class McpReadForbiddenError extends Error {
   constructor(readonly requestId: string, readonly correlationId: string) {
     super("FORBIDDEN");
     this.name = "McpReadForbiddenError";
+  }
+}
+
+export class McpReadNotFoundError extends Error {
+  readonly code = "NOT_FOUND";
+
+  constructor(readonly requestId: string, readonly correlationId: string) {
+    super("NOT_FOUND");
+    this.name = "McpReadNotFoundError";
   }
 }
 
@@ -300,6 +343,37 @@ function safeAuditEvent(event: McpAuditEvent): z.infer<typeof safeAuditEventSche
   };
 }
 
+function safeDeployment(deployment: Deployment): z.infer<typeof safeDeploymentSchema> {
+  return {
+    id: deployment.id,
+    status: deployment.status,
+    commitSha: deployment.commitSha,
+    startedAt: deployment.startedAt,
+    finishedAt: deployment.finishedAt
+  };
+}
+
+function latestProjectDeployment(deployments: readonly Deployment[], projectId: string): Deployment | null {
+  return deployments
+    .filter((deployment) => deployment.projectId === projectId)
+    .sort((left, right) => right.startedAt.localeCompare(left.startedAt) || right.id.localeCompare(left.id))[0] ?? null;
+}
+
+function projectReadiness(project: Project, deployment: Deployment | null): z.infer<typeof projectContextOutputSchema.shape.readiness> {
+  const configured = project.buildCommand !== null && project.runCommand !== null && project.port !== null && project.imageTag !== null;
+  const reason = !configured
+    ? "incomplete_configuration"
+    : !deployment
+      ? "no_deployment"
+      : `latest_deployment_${deployment.status}`;
+  return {
+    status: !configured || !deployment ? "not_configured" : deployment.status === "succeeded" ? "ready" : "attention",
+    reason,
+    mode: "mock-only",
+    advisory: "non-executing; not production-health evidence"
+  };
+}
+
 export function createDeployLiteMcpTools(
   apiClient: DeployLiteApiClient,
   options: { readContext?: McpReadContext; authorizer?: McpReadAuthorizer; requestId?: string } = {}
@@ -354,6 +428,22 @@ export function createDeployLiteMcpTools(
         offset: parsedInput.offset,
         limit: parsedInput.limit,
         safety: { readOnly: true, destructive: false, redacted: true, mode: "mock-only" }
+      });
+      return mcpToolResultSchema.parse(asToolResponse(output));
+    },
+    deploylite_get_project_context: async (input: unknown) => {
+      const parsedInput = projectContextInputSchema.parse(input);
+      const scopes = authorizer.projectScopes(readContext, responseContext);
+      if (scopes !== "platform" && !scopes.has(parsedInput.projectId)) deny(responseContext);
+      const project = (await apiClient.listProjects()).find(({ id }) => id === parsedInput.projectId);
+      if (!project) throw new McpReadNotFoundError(responseContext.requestId, responseContext.correlationId);
+      const deployments = (await apiClient.listDeployments({})).deployments;
+      const latestDeployment = latestProjectDeployment(deployments, project.id);
+      const output = projectContextOutputSchema.parse({
+        ...responseContext,
+        project: safeProject(project),
+        latestDeployment: latestDeployment ? safeDeployment(latestDeployment) : null,
+        readiness: projectReadiness(project, latestDeployment)
       });
       return mcpToolResultSchema.parse(asToolResponse(output));
     }

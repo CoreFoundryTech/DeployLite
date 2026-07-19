@@ -1,10 +1,12 @@
 import { describe, expect, it, vi } from "vitest";
+import type { Deployment, Project } from "@deploylite/contracts";
 import {
   createDeployLiteMcpTools,
   createMockDeployLiteApiClient,
   deployLiteMcpToolDefinitions,
   deployLiteMcpTools,
-  type DeployLiteApiClient
+  type DeployLiteApiClient,
+  type McpReadAuthorizer
 } from "./index.js";
 
 describe("DeployLite MCP read-only scaffold", () => {
@@ -16,9 +18,10 @@ describe("DeployLite MCP read-only scaffold", () => {
       "deploylite_list_deployments",
       "deploylite_get_deployment_logs",
       "deploylite_list_projects",
-      "deploylite_list_audit_events"
+      "deploylite_list_audit_events",
+      "deploylite_get_project_context"
     ]);
-    expect(tools).toHaveLength(5);
+    expect(tools).toHaveLength(6);
     for (const tool of tools) {
       expect(tool.annotations).toMatchObject({ readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: false });
       expect(tool.description).toMatch(/Read-only|read-only/);
@@ -170,5 +173,99 @@ describe("DeployLite MCP project and audit visibility", () => {
     expect(first.structuredContent.total).toBe(3);
     expect(defaultPage.structuredContent).toMatchObject({ offset: 0, limit: 50, total: 3 });
     expect(client.listAuditEvents).toHaveBeenCalledTimes(3);
+  });
+
+  function contextToolsFor(
+    grants: Array<{ permission: "project.read" | "audit.read"; scope: "platform" | "project"; projectId?: string }>,
+    projects: Project[] = [projectA],
+    deployments: Deployment[] = [
+      { id: "dep_a", projectId: "project_a", agentId: "agent_a", status: "succeeded", commitSha: "abcdef1", startedAt: "2026-01-02T00:00:00.000Z", finishedAt: "2026-01-02T00:01:00.000Z" }
+    ],
+    authorizer?: McpReadAuthorizer
+  ) {
+    const client: DeployLiteApiClient = {
+      getServerStatus: vi.fn(),
+      listDeployments: vi.fn().mockResolvedValue({ deployments }),
+      getDeploymentLogs: vi.fn(),
+      listProjects: vi.fn().mockResolvedValue(projects),
+      listAuditEvents: vi.fn()
+    };
+    return { client, tools: createDeployLiteMcpTools(client, { readContext: { actorId: "actor_1", grants }, ...(authorizer ? { authorizer } : {}) }) };
+  }
+
+  it("accepts only an exact valid projectId before authorization or reads", async () => {
+    const authorizer: McpReadAuthorizer = { projectScopes: vi.fn(() => "platform" as const), assertAuditScope: vi.fn() };
+    const invalid = contextToolsFor([{ permission: "project.read", scope: "platform" }], undefined, undefined, authorizer);
+    for (const input of [{}, { projectId: "" }, { projectId: " project_a" }, { projectId: "project/a" }, { projectId: "project_a", extra: true }]) {
+      await expect(invalid.tools.deploylite_get_project_context(input)).rejects.toMatchObject({ name: "ZodError" });
+    }
+    expect(invalid.client.listProjects).not.toHaveBeenCalled();
+    expect(invalid.client.listDeployments).not.toHaveBeenCalled();
+    expect(authorizer.projectScopes).not.toHaveBeenCalled();
+
+    const valid = contextToolsFor([{ permission: "project.read", scope: "platform" }]);
+    await expect(valid.tools.deploylite_get_project_context({ projectId: "project_a" })).resolves.toMatchObject({ structuredContent: { project: { id: "project_a" } } });
+    expect(valid.client.listProjects).toHaveBeenCalledTimes(1);
+    expect(valid.client.listDeployments).toHaveBeenCalledTimes(1);
+  });
+
+  it("denies cross-project reads before all client reads and stops missing projects before deployment reads", async () => {
+    const denied = contextToolsFor([{ permission: "project.read", scope: "project", projectId: "project_b" }]);
+    await expect(denied.tools.deploylite_get_project_context({ projectId: "project_a" })).rejects.toMatchObject({ code: "FORBIDDEN", requestId: "mcp_mock_request_1", correlationId: "mcp_mock_request_1" });
+    expect(denied.client.listProjects).not.toHaveBeenCalled();
+    expect(denied.client.listDeployments).not.toHaveBeenCalled();
+
+    const scoped = contextToolsFor([{ permission: "project.read", scope: "project", projectId: "project_a" }]);
+    await expect(scoped.tools.deploylite_get_project_context({ projectId: "project_a" })).resolves.toMatchObject({ structuredContent: { project: { id: "project_a" } } });
+    expect(scoped.client.listProjects).toHaveBeenCalledTimes(1);
+    expect(scoped.client.listDeployments).toHaveBeenCalledTimes(1);
+
+    const missing = contextToolsFor([{ permission: "project.read", scope: "platform" }]);
+    await expect(missing.tools.deploylite_get_project_context({ projectId: "project_missing" })).rejects.toMatchObject({ code: "NOT_FOUND", requestId: "mcp_mock_request_1", correlationId: "mcp_mock_request_1" });
+    expect(missing.client.listProjects).toHaveBeenCalledTimes(1);
+    expect(missing.client.listDeployments).not.toHaveBeenCalled();
+  });
+
+  it("selects the latest deployment deterministically and maps advisory readiness exactly", async () => {
+    const configuredProject = { ...projectA, buildCommand: "pnpm build", runCommand: "pnpm start", port: 3000, imageTag: "alpha:latest" };
+    const deployments: Deployment[] = [
+      { id: "dep_a", projectId: "project_a", agentId: "agent_a", status: "failed", commitSha: "abcdef1", startedAt: "2026-01-03T00:00:00.000Z", finishedAt: "2026-01-03T00:01:00.000Z" },
+      { id: "dep_z", projectId: "project_a", agentId: "agent_a", status: "succeeded", commitSha: "abcdef2", startedAt: "2026-01-03T00:00:00.000Z", finishedAt: "2026-01-03T00:01:00.000Z" }
+    ];
+    const { tools } = contextToolsFor([{ permission: "project.read", scope: "platform" }], [configuredProject], deployments);
+    const result = await tools.deploylite_get_project_context({ projectId: "project_a" });
+    expect(result.structuredContent).toMatchObject({ latestDeployment: { id: "dep_z", status: "succeeded" }, readiness: { status: "ready", reason: "latest_deployment_succeeded", mode: "mock-only", advisory: "non-executing; not production-health evidence" } });
+
+    const readinessCases: Array<[Project, Deployment["status"] | undefined, "ready" | "attention" | "not_configured", string]> = [
+      [{ ...configuredProject, buildCommand: null }, "succeeded", "not_configured", "incomplete_configuration"],
+      [configuredProject, undefined, "not_configured", "no_deployment"],
+      [configuredProject, "queued", "attention", "latest_deployment_queued"],
+      [configuredProject, "running", "attention", "latest_deployment_running"],
+      [configuredProject, "failed", "attention", "latest_deployment_failed"],
+      [configuredProject, "canceled", "attention", "latest_deployment_canceled"]
+    ];
+    for (const [project, status, expected, reason] of readinessCases) {
+      const { tools: readinessTools } = contextToolsFor([{ permission: "project.read", scope: "platform" }], [project], status ? [{ ...deployments[0]!, status }] : []);
+      await expect(readinessTools.deploylite_get_project_context({ projectId: "project_a" })).resolves.toMatchObject({ structuredContent: { readiness: { status: expected, reason, mode: "mock-only", advisory: "non-executing; not production-health evidence" } } });
+    }
+  });
+
+  it("uses an allow-list plus redaction for byte-stable dual output without mutating source fixtures", async () => {
+    const sourceProject = { ...projectA, buildCommand: "printenv SECRET", runCommand: "node --token=secret", imageTag: "https://image-user:image-password@example.test/image" };
+    const sourceDeployments: Array<Deployment & { credential: string }> = [{ id: "dep_a", projectId: "project_a", agentId: "agent_a", status: "succeeded", commitSha: "abcdef1", startedAt: "2026-01-02T00:00:00.000Z", finishedAt: "2026-01-02T00:01:00.000Z", credential: "do-not-leak" }];
+    const before = structuredClone({ sourceProject, sourceDeployments });
+    const { client, tools } = contextToolsFor([{ permission: "project.read", scope: "platform" }], [sourceProject], sourceDeployments);
+    const first = await tools.deploylite_get_project_context({ projectId: "project_a" });
+    const second = await tools.deploylite_get_project_context({ projectId: "project_a" });
+    const serialized = JSON.stringify([first.structuredContent, first.content]);
+
+    expect(first.structuredContent).toEqual(second.structuredContent);
+    expect(first.content).toEqual(second.content);
+    expect(first.content[0]?.text).toBe(JSON.stringify(first.structuredContent));
+    expect(client.listDeployments).toHaveBeenCalledWith({});
+    expect({ sourceProject, sourceDeployments }).toEqual(before);
+    for (const value of ["repoUrl", "buildCommand", "runCommand", "credential", "do-not-leak", "printenv", "node --token", "image-user", "image-password", "must-not-leak"]) {
+      expect(serialized).not.toContain(value);
+    }
   });
 });
