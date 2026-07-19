@@ -43,7 +43,7 @@ export function getLatestDeploymentForProject(deployments: Deployment[], project
 
 export function summarizeProjectRuntime(project: Project): ProjectLaunchRuntime {
   const hasCommand = typeof project.runCommand === "string" && project.runCommand.length > 0;
-  const hasPort = typeof project.port === "number" && project.port > 0;
+  const hasPort = typeof project.port === "number" && project.port > 0 && project.port <= 65535;
   const configured = hasCommand && hasPort;
 
   if (configured) {
